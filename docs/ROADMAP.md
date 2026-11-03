@@ -561,6 +561,9 @@ Gaps found while using the app for real projects.
 - [ ] Linux GPU choice on a desktop with monitors on two GPUs, and on an Intel + NVIDIA laptop:
       covered by unit tests on fake `/sys/class/drm` folders, not run on such a machine yet (#571)
 
+- [ ] Create atomic-write temporary files exclusively and only clean up files owned by the current write.
+      — claimed: Afloat16, branch bugfix/r2.9-atomic-temp-creation-20261103b
+
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress
 Keep a build that works at hand: pin it, and open it from the sidebar whatever the builder does
