@@ -45,6 +45,7 @@ const fn a(ui: &'static str, does: &'static str, headless: Headless) -> Action {
 const ACTIONS: &[Action] = &[
     // ---- Projects: making something --------------------------------------------------------
     a("start_make",          "start a new project from the Home prompt",       Cli("rebuild <target> <request> --build-with --backend --generate-assets")),
+    a("New project › Work on my project", "edit a project the person already has, in place", Cli("rebuild <target> <request> --project-folder --existing")),
     a("set_backend_enabled", "turn an AI on or off",                           Cli("ai on <name> / ai off <name>")),
     a("remove_backend",      "remove an AI and its key",                       Cli("ai remove <name>")),
     a("set_agent_program",   "run an agent app from a program it isn't found as", Cli("ai program <name> <path>")),
@@ -112,7 +113,10 @@ const ACTIONS: &[Action] = &[
     a("set_model",           "change the model an AI uses",                    Cli("ai model <name> <model>")),
     a("set_effort",          "change how hard a Claude AI thinks",             Cli("ai effort <name> <level>")),
     a("pick_agent_model",    "list an agent's visible models and thinking depths", Tool(&["ai_models_list"])),
+    a("reload_agent_model",  "reload model-specific thinking choices",         Tool(&["ai_models_list"])),
     a("set_agent_model",     "choose an agent's model and thinking depth",     Tool(&["ai_model_set"])),
+    a("pick_model_options",  "discover context and reasoning for a model",     Tool(&["ai_model_options_show"])),
+    a("set_model_options",   "save a model's context and reasoning choices",   Tool(&["ai_model_options_set"])),
     a("choose_backend",      "pick the AI brain",                              Cli("chat <question> --backend")),
     a("set_role",            "choose which AI builds or extracts",             Cli("ai extractor <name>")),
 
@@ -137,6 +141,7 @@ const ACTIONS: &[Action] = &[
 /// `CraftApp` methods that aren't person-facing actions: callbacks, polling, drawing, helpers.
 #[rustfmt::skip]
 const PLUMBING: &[(&str, &str)] = &[
+    ("load_agent_model_catalog", "worker dispatch shared by the model picker and its reload action"),
     ("stuck_banner", "draws what the lock watchdog found; `sync::problems` and its log are the headless side"),
     ("act", "runs a button's tool on a worker (play, preview, open folder)"),
     ("waiting_question", "finds the question an answer is for"),

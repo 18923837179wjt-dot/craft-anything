@@ -359,6 +359,26 @@ Owner: maintainers · Status: in progress
 
 ### R2.2 More coding agents
 Owner: open · Status: in progress
+- [x] GitHub Copilot through its own CLI login and ACP, without credential import:
+      discovery, MCP-only tool restrictions, model selection and fresh read-only questions;
+      unit tests and CLI 1.0.105 with an isolated home and loopback model, all five access modes
+      — claimed: qu-gg, branch `feature/r2.2-copilot-integration` (recorded during PR preparation)
+- [x] Review hardening: cap target handoff at 128 while preserving the active target; propagate
+      context-discovery cancellation, normalize CLI-only efforts for Claude requests, and name
+      the configured agent in shared picker warnings, with focused regressions and translations
+- [x] Local agent chats share a saved investigation and open-target metadata with MCP; background
+      refresh makes recorded findings visible in the workbench Evidence pane. `core_finding_edit`
+      corrects a finding with checked evidence and an optional revision guard, preserving confidence
+      when omitted. Builder refresh failures warn instead of ending the turn; shared ACP errors
+      use the current agent and its sign-in guidance. Engine, process-level MCP and headless
+      rendering tests cover sharing, mode boundaries and finding ids; regressions cover confidence
+      preservation, explicit overrides and agent-specific errors
+- [x] Serialize project-backed investigation load, revision check, mutation and all rendered
+      writes under one bounded, cancellable interprocess lock. Refuse malformed state rather
+      than replacing it; separate-process regressions retain concurrent appends and reject one
+      of two updates based on the same revision
+- [ ] Refresh externally changed investigation/evidence records incrementally, avoiding repeated
+      full reloads under the session lock while retaining mid-turn findings visibility
 - [x] Offer OpenCode locally and over SSH with its own visible chat models and supported thinking
       depths (Low, Medium, High, Xhigh, Max) in settings and headless clients. Choices are validated
       before saving; explicit choices are refused at execution until native MCP support is available.
@@ -503,6 +523,12 @@ Owner: open · Status: in progress
 - [x] The website check's missing-site note names every place `site_dir` accepts (dist/, build/,
       out/, or a plain index.html with no package.json) and the app's real place, "app/" or "the
       project folder" (#494)
+- [ ] A project edited in place (Work on my project, or `rebuild --existing edit`) gets its stack
+      from the request's words, as a new one does: a request that reads as a game asks for Unity
+      unless it names another engine, even when the folder is a Godot project, and a run with no
+      stack picks the kind's default (`kinds.choose`); `stacks::used_in` reads only package.json,
+      after the first turn. Read the stack from the folder's own files first (`project.godot`,
+      `Cargo.toml`, `pyproject.toml`, `package.json`…)
 
 ### R2.8 Clean room means clean room
 Owner: maintainers · Status: in progress
@@ -512,6 +538,11 @@ Owner: maintainers · Status: in progress
 ### R2.9 Everyday use: typing, projects, settings
 Owner: maintainers · Status: in progress
 Gaps found while using the app for real projects.
+- [x] Agent paragraphs with glossary terms and long file links wrap together without pushing
+      their card or later messages under the sidebar (#523); Project and Ask bounds checked at two sizes
+      — claimed: carl-dourado, branch hotfix/r2.9-523-message-width
+- [x] Create atomic-write temporary files exclusively and only clean up files owned by the current write.
+      — claimed: Afloat16, branch bugfix/r2.9-atomic-temp-creation-20261103b
 - [x] A prompt brought back with Up keeps its pictures (their paths are absolute, so they don't
       come back after the project is moved)
 - [ ] Change a project's builder from its page (a tool, so the CLI and MCP can too) — in PR #245
@@ -560,9 +591,12 @@ Gaps found while using the app for real projects.
       — claimed: Nghiathan13, branch bugfix/r2.9-linux-gpu-choice
 - [ ] Linux GPU choice on a desktop with monitors on two GPUs, and on an Intel + NVIDIA laptop:
       covered by unit tests on fake `/sys/class/drm` folders, not run on such a machine yet (#571)
-
-- [x] Create atomic-write temporary files exclusively and only clean up files owned by the current write.
-      — claimed: Afloat16, branch bugfix/r2.9-atomic-temp-creation-20261103b
+- [x] "Work on my project" on New project, beside "Make my own version" and "Just look inside":
+      pick the folder of a project you already have, say what to change, and its files are edited
+      in place, with nothing asked; the project takes the folder's name, an empty folder is
+      refused and a folder that's already a project opens. Until now that was only reachable
+      through "Choose a folder…" under Make's Start, on a screen that asks what to recreate
+      — claimed: xerenon, branch feature/r2.9-work-on-my-project; PR #686
 
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress
@@ -628,6 +662,8 @@ Owner: open · Status: in progress
       PAX sizes across other metadata records; CRC cpio checks member data; source maps decode
       percent-escaped data URLs and report indexed-map columns in the generated file
       (#606–#615, by Afloat16)
+- [x] Bound and cancel CRC cpio verification across firmware probes, and reject non-hex checksum
+      fields — claimed: Afloat16, branch bugfix/r3.12-bound-cpio-crc-scans-20261103
 
 ### R3.13 Web inspection correctness
 Owner: open · Status: in progress
