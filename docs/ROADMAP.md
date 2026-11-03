@@ -563,6 +563,7 @@ Gaps found while using the app for real projects.
 
 - [ ] Create atomic-write temporary files exclusively and only clean up files owned by the current write.
       — claimed: Afloat16, branch bugfix/r2.9-atomic-temp-creation-20261103b
+      Implementation and regression fixtures added; automated validation remains pending.
 
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress
