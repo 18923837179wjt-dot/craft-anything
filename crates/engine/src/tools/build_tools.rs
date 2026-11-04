@@ -42,7 +42,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "build_files_list",
             "List project files",
-            "List files and folders in the project being built (default: app/), a few levels deep. Paths are relative to the project folder; build output and dependencies (node_modules, target, dist…) are skipped.",
+            "List files and folders in the app: app/ usually, or the project folder when the app is edited in place. A few levels deep; paths are relative to the project folder; build output and dependencies (node_modules, target, dist…) are skipped.",
             "Shows the files being built.",
             Effects::READ_ONLY,
             schema_of::<ListParams>,
@@ -99,7 +99,8 @@ pub fn specs() -> Vec<ToolSpec> {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListParams {
-    /// A folder relative to the project (default `app`).
+    /// A folder relative to the project (default: the app folder; for a project edited in
+    /// place, the project folder itself).
     #[serde(default)]
     pub path: Option<String>,
     /// How many levels down (default 4, at most 8).
@@ -217,7 +218,8 @@ fn refused(why: String) -> ToolError {
 fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: ListParams = parse_params(params)?;
     let ws = workspace(ctx)?;
-    let root = in_project(&ws, p.path.as_deref().unwrap_or("app"))?;
+    let default = if ws.manifest.app_in_root { "." } else { "app" };
+    let root = in_project(&ws, p.path.as_deref().unwrap_or(default))?;
     let depth = p.depth.unwrap_or(4).min(8);
     const SKIP: [&str; 8] = ["node_modules", "target", "dist", "build", ".git", "Library", "Temp", "Intermediate"];
     let mut entries = Vec::new();
@@ -232,6 +234,11 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
                 break;
             }
             let path = e.path();
+            // Craft Anything's own records are not the app, even when the app is the project
+            // folder; the brief names them and the builder must leave them alone.
+            if ws.is_own_record(&path) {
+                continue;
+            }
             let name = e.file_name().to_string_lossy().into_owned();
             // A link is listed but never followed: it may lead out of the project.
             if e.file_type().is_ok_and(|t| t.is_symlink()) {
@@ -246,7 +253,8 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
             }
         }
     }
-    Ok(ToolOutput::Value(json!({"root": shown(&ws, &root), "entries": entries, "truncated": truncated})))
+    let label = if root == ws.root { ".".to_string() } else { shown(&ws, &root) };
+    Ok(ToolOutput::Value(json!({"root": label, "entries": entries, "truncated": truncated})))
 }
 
 fn build_file_read(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
@@ -362,7 +370,7 @@ fn build_command_run(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
 mod tests {
     use super::*;
     use crate::inbox::InboxDir;
-    use crate::workspace::TargetRef;
+    use crate::workspace::{ExistingFiles, TargetRef};
     use crate::{CallOptions, Caller, Consent, Engine};
     use std::sync::Arc;
 
@@ -395,6 +403,30 @@ mod tests {
         assert!(call(&e, "build_file_edit", json!({"path": "app/src/main.rs", "old_text": "nope", "new_text": "x"})).is_err());
         assert!(call(&e, "build_file_read", json!({"path": "../../etc/passwd"})).is_err());
         assert!(call(&e, "build_file_write", json!({"path": "../outside.txt", "content": "x"})).is_err());
+    }
+
+    /// "Work on my project" keeps the app in the project root: the default listing must be that
+    /// root, not a missing or nested `app/`, and not Craft Anything's own records.
+    #[test]
+    fn a_project_edited_in_place_is_listed_from_its_own_folder() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("main.py"), "print('hi')\n").unwrap();
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/app.py"), "x = 1\n").unwrap();
+        // A nested app/ would be the wrong default: the app itself is the root.
+        std::fs::create_dir_all(d.path().join("app")).unwrap();
+        std::fs::write(d.path().join("app/other.txt"), "not the app\n").unwrap();
+        let mut s = crate::testing::session();
+        let ws = Workspace::create_at(d.path(), "Mine", "Add a page", TargetRef::None, Some(ExistingFiles::Edit)).unwrap();
+        s.ext.insert(Arc::new(InboxDir(ws.inbox_dir())));
+        let e = Engine::new(s);
+
+        let list = call(&e, "build_files_list", json!({})).unwrap();
+        assert_eq!(list["root"], ".");
+        let entries = list["entries"].to_string();
+        assert!(entries.contains("main.py") && entries.contains("src/app.py"), "{list}");
+        assert!(entries.contains("app/other.txt"), "a real nested folder is still part of the root: {list}");
+        assert!(!entries.contains("craft.json"), "Craft Anything's own records are not app files: {list}");
     }
 
     /// A link to a folder; false where this system won't let a test make one.
