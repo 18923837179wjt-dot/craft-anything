@@ -23,16 +23,28 @@ const EDGE: f32 = 5.0;
 /// Room left of the app mark for macOS's window buttons.
 const NATIVE_BUTTONS_WIDTH: f32 = 84.0;
 
-/// `size` in the system's points, as egui points. Zooming out (Cmd −) shrinks our points but not
-/// macOS's window buttons, so what makes room for them grows to keep its size on screen; zooming
-/// in already leaves room.
-fn native(ctx: &egui::Context, size: f32) -> f32 {
-    if NATIVE_FRAME { size / ctx.zoom_factor().min(1.0) } else { size }
-}
-
-/// The title bar's height at the current zoom.
-pub fn height(ctx: &egui::Context) -> f32 {
-    native(ctx, HEIGHT)
+/// The title bar across the top of the window. On macOS it keeps its size when the app is
+/// zoomed (Cmd − / Cmd =), like the system's window buttons beside it: it is drawn on a layer of
+/// its own, scaled back by the zoom, and only the rest of the window zooms.
+pub fn bar(app: &mut CraftApp, ui: &mut Ui) {
+    let ctx = ui.ctx().clone();
+    let t = Tokens::get(&ctx);
+    let zoom = if NATIVE_FRAME { ctx.zoom_factor() } else { 1.0 };
+    egui::Panel::top("titlebar").exact_size(HEIGHT / zoom).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
+        if !NATIVE_FRAME {
+            crate::guard_ui(ui, "title bar", |ui| show(app, ui));
+            return;
+        }
+        // The same rect in unzoomed points, which the layer's transform maps back onto the panel.
+        let rect = egui::Rect::from_min_size(ui.max_rect().min * zoom, ui.max_rect().size() * zoom);
+        let area = egui::Area::new(egui::Id::new("titlebar-unzoomed")).order(egui::Order::Middle).fixed_pos(rect.min).constrain(false).show(&ctx, |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.set_min_size(rect.size());
+                crate::guard_ui(ui, "title bar", |ui| show(app, ui));
+            });
+        });
+        ctx.set_transform_layer(area.response.layer_id, egui::emath::TSTransform::from_scaling(1.0 / zoom));
+    });
 }
 
 fn maximized(ctx: &egui::Context) -> bool {
@@ -95,7 +107,7 @@ pub fn resize_edges(ctx: &egui::Context) {
 /// A thin vertical rule between title bar cells.
 fn rule(ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
-    let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, height(ui.ctx())), egui::Sense::hover());
+    let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, HEIGHT), egui::Sense::hover());
     ui.painter().vline(r.center().x, r.y_range(), egui::Stroke::new(1.0, t.separator));
 }
 
@@ -140,7 +152,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
         ui.spacing_mut().item_spacing.x = 10.0;
         // Full screen hides macOS's buttons, so the bar doesn't keep their room.
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        ui.add_space(if NATIVE_FRAME && !fullscreen { native(&ctx, NATIVE_BUTTONS_WIDTH) } else { 12.0 });
+        ui.add_space(if NATIVE_FRAME && !fullscreen { NATIVE_BUTTONS_WIDTH } else { 12.0 });
         if ui.add(crate::app_icon(22.0).sense(egui::Sense::click())).on_hover_text(tr("Home")).clicked() {
             app.state.screen = Screen::Home;
         }
