@@ -705,6 +705,9 @@ Gaps found while using the app for real projects.
       ended 30 s later. Not run on a Mac
 - [ ] Find why a site capture lost its browser ("the WebSocket is closed", 419 ms into
       `web_site_capture` for a second page, seen once; the same capture passed 41 s earlier)
+- [x] Delete a private browser's temporary profile when it closes or fails to start (#810) — PR #822
+- [ ] Stop private browsers that outlive the app after an abrupt exit, and investigate the Brave
+      Helper crash (#810); both still need macOS reproduction
 - [ ] Claude Code's Ultracode switch (a setting, not an effort level; the effort environment
       variable we use can't turn it on)
 - [x] A model the list doesn't offer (`opusplan`, `[1m]` variants, one another harness serves) can
@@ -806,6 +809,11 @@ Owner: open · Status: in progress
       it's there
 - [ ] `native_publisher_show` hashes the file minus the signature fields, not section by section;
       a file with unusual gaps between sections can read as different
+- [x] Enforce stand-in per-body and total byte budgets on the text that is actually retained after redaction;
+      deduplicate consecutive samples before charging the capture budget.
+      — claimed: Afloat16, branch bugfix/r3.11-standin-redacted-budget-20261103b
+      Revision `d601bc4e` passed [full Linux CI](https://github.com/storytold/craft-anything/actions/runs/41788735130):
+      all four retained-budget regressions and six deduplication regressions passed.
 
 ### R3.12 Format parser correctness
 Owner: open · Status: in progress
