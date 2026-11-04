@@ -208,7 +208,9 @@ fn in_project(ws: &Workspace, rel: &str) -> Result<PathBuf, ToolError> {
 }
 
 fn shown(ws: &Workspace, p: &Path) -> String {
-    p.strip_prefix(&ws.root).unwrap_or(p).to_string_lossy().replace('\\', "/")
+    let root = resolve(&ws.root, ".").unwrap_or_else(|| ws.root.clone());
+    let rel = p.strip_prefix(&root).unwrap_or(p);
+    if rel.as_os_str().is_empty() { ".".to_string() } else { rel.to_string_lossy().replace('\\', "/") }
 }
 
 fn refused(why: String) -> ToolError {
@@ -222,7 +224,7 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     let root = in_project(&ws, p.path.as_deref().unwrap_or(default))?;
     // The builder is told to read capture/README.md and capture.json, so an explicit listing of
     // capture/ (or a folder inside it) is allowed; the root listing still hides it.
-    let listing_capture = inside(&ws.capture_dir(), &root);
+    let listing_capture = really_inside(&ws.capture_dir(), &root);
     let depth = p.depth.unwrap_or(4).min(8);
     const SKIP: [&str; 9] = ["node_modules", "target", "vendor", "dist", "build", ".git", "Library", "Temp", "Intermediate"];
     let mut entries = Vec::new();
@@ -257,8 +259,7 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
             }
         }
     }
-    let label = if root == ws.root { ".".to_string() } else { shown(&ws, &root) };
-    Ok(ToolOutput::Value(json!({"root": label, "entries": entries, "truncated": truncated})))
+    Ok(ToolOutput::Value(json!({"root": shown(&ws, &root), "entries": entries, "truncated": truncated})))
 }
 
 fn build_file_read(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
@@ -462,6 +463,29 @@ mod tests {
         let nested = call(&e, "build_files_list", json!({"path": "app"})).unwrap();
         assert_eq!(nested["root"], "app");
         assert!(nested["entries"].to_string().contains("app/other.txt"), "{nested}");
+    }
+
+    /// A project path with `..` must not make listing paths absolute or hide an explicit capture.
+    #[test]
+    fn an_explicit_capture_listing_handles_a_project_path_with_dot_dot() {
+        let base = tempfile::tempdir().unwrap();
+        let project = base.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let dotted = project.join("..").join("project");
+        let mut s = crate::testing::session();
+        let ws = Workspace::create_at(&dotted, "Mine", "Look at the evidence", TargetRef::None, None).unwrap();
+        std::fs::create_dir_all(ws.capture_dir()).unwrap();
+        std::fs::write(ws.capture_dir().join("README.md"), "evidence\n").unwrap();
+        assert!(ws.is_own_record(&ws.capture_dir().join("README.md")), "capture is an own record");
+        s.ext.insert(Arc::new(InboxDir(ws.inbox_dir())));
+        let e = Engine::new(s);
+
+        let capture = call(&e, "build_files_list", json!({"path": "capture"})).unwrap();
+        assert_eq!(capture["root"], "capture");
+        let entries = capture["entries"].to_string();
+        assert!(entries.contains("capture/README.md"), "{capture}");
+        let absolute = base.path().to_string_lossy().into_owned();
+        assert!(!entries.contains(&absolute), "paths stay relative: {capture}");
     }
 
     /// A link to a folder; false where this system won't let a test make one.
