@@ -395,6 +395,7 @@ mod tests {
         call(&e, "build_file_edit", json!({"path": "app/src/main.rs", "old_text": "\"hi\"", "new_text": "\"hello\""})).unwrap();
         assert!(std::fs::read_to_string(ws.app_dir().join("src/main.rs")).unwrap().contains("hello"));
         let list = call(&e, "build_files_list", json!({})).unwrap();
+        assert_eq!(list["root"], "app");
         assert!(list["entries"].to_string().contains("app/src/main.rs"), "{list}");
         let page = call(&e, "build_file_read", json!({"path": "app/src/main.rs", "offset": 1, "limit": 1})).unwrap();
         assert_eq!(page["text"], "    println!(\"hello\");\n");
@@ -418,6 +419,9 @@ mod tests {
         std::fs::write(d.path().join("app/other.txt"), "not the app\n").unwrap();
         let mut s = crate::testing::session();
         let ws = Workspace::create_at(d.path(), "Mine", "Add a page", TargetRef::None, Some(ExistingFiles::Edit)).unwrap();
+        // checks/ isn't a Craft Anything record the builder must avoid: it keeps its own notes there.
+        std::fs::create_dir_all(d.path().join("checks")).unwrap();
+        std::fs::write(d.path().join("checks/notes.md"), "note\n").unwrap();
         s.ext.insert(Arc::new(InboxDir(ws.inbox_dir())));
         let e = Engine::new(s);
 
@@ -426,7 +430,13 @@ mod tests {
         let entries = list["entries"].to_string();
         assert!(entries.contains("main.py") && entries.contains("src/app.py"), "{list}");
         assert!(entries.contains("app/other.txt"), "a real nested folder is still part of the root: {list}");
+        assert!(entries.contains("checks/notes.md"), "the builder's own check notes stay visible: {list}");
         assert!(!entries.contains("craft.json"), "Craft Anything's own records are not app files: {list}");
+
+        // An explicit nested folder is still listed by that path.
+        let nested = call(&e, "build_files_list", json!({"path": "app"})).unwrap();
+        assert_eq!(nested["root"], "app");
+        assert!(nested["entries"].to_string().contains("app/other.txt"), "{nested}");
     }
 
     /// A link to a folder; false where this system won't let a test make one.
