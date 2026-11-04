@@ -399,7 +399,9 @@ with the step they arrived in.
 permissions could let another process retain a readable descriptor before a later chmod. Set
 mode 0600 in the first Unix open for private files. Temporary names must also stay short and
 independent of the destination name: adding a prefix and suffix can exceed the component limit
-even when the destination name is valid. Keep the temporary file in the destination directory.
+even when the destination name is valid. Keep the temporary file in the destination directory,
+but exclude the destination component before creating a candidate, including case and trailing
+dot/space aliases. Probe a supported long name in tests instead of assuming a fixed filename limit.
 
 **Two writers to one file.** The app and the rebuild run both wrote `feed.json`. Give each persisted
 file one owner; when another writer is unavoidable (an answer given from the CLI while a run is

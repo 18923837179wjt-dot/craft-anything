@@ -68,10 +68,21 @@ fn atomic_writes_preserve_colliding_files_and_links() {
     after.sort();
     assert_eq!(after, before);
 
-    // Creating the destination first proves its long name is valid on this filesystem.
+    // Probe at most 255 names, retaining the longest this filesystem can create.
     let long_dir = tempfile::tempdir().unwrap();
-    let long_target = long_dir.path().join("s".repeat(250));
-    std::fs::write(&long_target, b"original long-name settings").unwrap();
+    let mut long_target = None;
+    for length in (1..=255).rev() {
+        let path = long_dir.path().join("s".repeat(length));
+        match std::fs::write(&path, b"original long-name settings") {
+            Ok(()) => {
+                long_target = Some(path);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidFilename => continue,
+            Err(error) => panic!("could not create the long-name fixture: {error}"),
+        }
+    }
+    let long_target = long_target.expect("the test filesystem must support a destination filename");
     write_atomic(&long_target, b"replacement long-name settings").unwrap();
     assert_eq!(std::fs::read(&long_target).unwrap(), b"replacement long-name settings");
     assert_eq!(std::fs::read_dir(long_dir.path()).unwrap().count(), 1);
