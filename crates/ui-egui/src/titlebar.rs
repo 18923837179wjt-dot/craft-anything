@@ -144,9 +144,9 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
     }
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0 * s;
-        // Full screen hides macOS's buttons, so the bar doesn't keep their room.
-        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        ui.add_space(if NATIVE_FRAME && !fullscreen { NATIVE_BUTTONS_WIDTH } else { 12.0 } * s);
+        // Room for macOS's buttons, kept in full screen too: they slide back in when the pointer
+        // reaches the top of the screen, and land there instead of over the app mark.
+        ui.add_space(if NATIVE_FRAME { NATIVE_BUTTONS_WIDTH } else { 12.0 } * s);
         if ui.add(crate::app_icon(22.0 * s).sense(egui::Sense::click())).on_hover_text(tr("Home")).clicked() {
             app.state.screen = Screen::Home;
         }
