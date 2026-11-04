@@ -18,6 +18,7 @@ fn packet(message: &[u8]) -> Vec<u8> {
     eth(0x0800, &ipv4_pkt(17, [192, 0, 2, 2], [192, 0, 2, 1], &udp(53, 51000, message)))
 }
 
+/// Truncated literal names and compression pointers must stay inside RDLENGTH.
 #[test]
 fn answer_names_cannot_borrow_bytes_past_rdata() {
     for record_type in [2, 5, 12, 15] {
@@ -34,6 +35,7 @@ fn answer_names_cannot_borrow_bytes_past_rdata() {
     }
 }
 
+/// An incomplete pointer is malformed, rather than a successful empty answer.
 #[test]
 fn malformed_name_rdata_is_not_reported_as_an_empty_answer() {
     for record_type in [2, 5, 12, 15] {
@@ -44,6 +46,7 @@ fn malformed_name_rdata_is_not_reported_as_an_empty_answer() {
     }
 }
 
+/// An MX name cannot borrow either of its required preference bytes from trailing data.
 #[test]
 fn an_mx_exchange_cannot_skip_a_missing_preference() {
     for declared in [0, 1] {
@@ -53,6 +56,7 @@ fn an_mx_exchange_cannot_skip_a_missing_preference() {
     }
 }
 
+/// A terminator before the declared boundary must not hide unused RDATA bytes.
 #[test]
 fn a_name_must_account_for_all_of_its_rdata() {
     for record_type in [2, 5, 12, 15] {
@@ -63,6 +67,7 @@ fn a_name_must_account_for_all_of_its_rdata() {
     }
 }
 
+/// Literal, root, backward-pointer and label-plus-pointer names remain valid controls.
 #[test]
 fn complete_and_compressed_names_remain_supported() {
     for record_type in [2, 5, 12, 15] {
