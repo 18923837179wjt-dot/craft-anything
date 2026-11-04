@@ -817,6 +817,7 @@ Owner: open · Status: in progress
 
 - [ ] Keep stand-in response samples distinct when headers, content types or body-availability metadata differ.
       — claimed: Afloat16, branch bugfix/r3.11-standin-sample-metadata-20261103b
+      Implementation and regression fixtures added; automated validation remains pending.
 
 ### R3.12 Format parser correctness
 Owner: open · Status: in progress
