@@ -31,6 +31,7 @@ fn wait(h: &mut Harness<'static, CraftApp>, done: impl Fn(&CraftApp) -> bool) ->
     false
 }
 
+/// First run goes from the welcome to the AI step, with the window controls there throughout.
 #[test]
 fn first_run_walks_through_four_screens() {
     let mut h = harness(|| demo::app(demo::engine(Mode::Beginner, false)));

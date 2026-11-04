@@ -114,6 +114,8 @@ fn window_button(ui: &mut Ui, icon: &str, tip: &str, close: bool) -> egui::Respo
     resp.on_hover_text(tr(tip))
 }
 
+/// Draws the bar: the app mark and what's open on the left, the switches, settings and (off
+/// macOS) the window buttons on the right. Empty parts move the window; a double-click zooms it.
 pub fn show(app: &mut CraftApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let ctx = ui.ctx().clone();
