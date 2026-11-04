@@ -42,7 +42,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "build_files_list",
             "List project files",
-            "List files and folders in the app: app/ usually, or the project folder when the app is edited in place. A few levels deep; paths are relative to the project folder; build output and dependencies (node_modules, target, dist…) are skipped.",
+            "List files and folders in the app: app/ usually, or the project folder when the app is edited in place. A few levels deep; paths are relative to the project folder; build output and dependencies (node_modules, target, vendor, dist…) are skipped.",
             "Shows the files being built.",
             Effects::READ_ONLY,
             schema_of::<ListParams>,
@@ -224,7 +224,7 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     // capture/ (or a folder inside it) is allowed; the root listing still hides it.
     let listing_capture = inside(&ws.capture_dir(), &root);
     let depth = p.depth.unwrap_or(4).min(8);
-    const SKIP: [&str; 8] = ["node_modules", "target", "dist", "build", ".git", "Library", "Temp", "Intermediate"];
+    const SKIP: [&str; 9] = ["node_modules", "target", "vendor", "dist", "build", ".git", "Library", "Temp", "Intermediate"];
     let mut entries = Vec::new();
     let mut stack = vec![(root.clone(), 0usize)];
     let mut truncated = false;
@@ -430,6 +430,11 @@ mod tests {
         std::fs::create_dir_all(d.path().join("capture/pages")).unwrap();
         std::fs::write(d.path().join("capture/README.md"), "evidence\n").unwrap();
         std::fs::write(d.path().join("capture/pages/index.html"), "<p>evidence</p>\n").unwrap();
+        // A dependency tree bigger than the entry cap must not crowd out the app's own files.
+        std::fs::create_dir_all(d.path().join("vendor")).unwrap();
+        for i in 0..MAX_ENTRIES + 10 {
+            std::fs::write(d.path().join("vendor").join(format!("f{i:04}.txt")), b"x").unwrap();
+        }
         s.ext.insert(Arc::new(InboxDir(ws.inbox_dir())));
         let e = Engine::new(s);
 
@@ -441,6 +446,8 @@ mod tests {
         assert!(entries.contains("checks/notes.md"), "the builder's own check notes stay visible: {list}");
         assert!(!entries.contains("craft.json"), "Craft Anything's own records are not app files: {list}");
         assert!(!entries.contains("capture/"), "capture stays out of the default root listing: {list}");
+        assert!(entries.contains("vendor/"), "the dependency folder is listed but not walked: {list}");
+        assert_eq!(list["truncated"], false, "vendor must not consume the entry cap: {list}");
 
         // The brief tells the builder to read capture/, so an explicit listing is allowed.
         let capture = call(&e, "build_files_list", json!({"path": "capture"})).unwrap();
