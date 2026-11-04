@@ -5,6 +5,7 @@ fn packet(message: &[u8]) -> Vec<u8> {
     eth(0x0800, &ipv4_pkt(17, [192, 0, 2, 1], [192, 0, 2, 2], &udp(51000, 53, message)))
 }
 
+/// Neither a missing class nor a one-byte class can complete a DNS question.
 #[test]
 fn a_question_missing_any_class_byte_is_incomplete() {
     let complete = dns_query();
@@ -38,6 +39,7 @@ fn incomplete_questions_do_not_enter_the_query_inventory() {
     assert!(summary.dns_queries.is_empty());
 }
 
+/// Class validation requires both bytes without restricting valid class values.
 #[test]
 fn complete_class_fields_are_accepted() {
     for class in [1u16, 3, 255] {
