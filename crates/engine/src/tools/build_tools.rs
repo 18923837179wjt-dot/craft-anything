@@ -220,6 +220,9 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     let ws = workspace(ctx)?;
     let default = if ws.manifest.app_in_root { "." } else { "app" };
     let root = in_project(&ws, p.path.as_deref().unwrap_or(default))?;
+    // The builder is told to read capture/README.md and capture.json, so an explicit listing of
+    // capture/ (or a folder inside it) is allowed; the root listing still hides it.
+    let listing_capture = inside(&ws.capture_dir(), &root);
     let depth = p.depth.unwrap_or(4).min(8);
     const SKIP: [&str; 8] = ["node_modules", "target", "dist", "build", ".git", "Library", "Temp", "Intermediate"];
     let mut entries = Vec::new();
@@ -235,8 +238,9 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
             }
             let path = e.path();
             // Craft Anything's own records are not the app, even when the app is the project
-            // folder; the brief names them and the builder must leave them alone.
-            if ws.is_own_record(&path) {
+            // folder; the brief names them and the builder must leave them alone. Capture is
+            // allowed because the builder is told to read its evidence files.
+            if !listing_capture && ws.is_own_record(&path) {
                 continue;
             }
             let name = e.file_name().to_string_lossy().into_owned();
@@ -422,6 +426,10 @@ mod tests {
         // checks/ isn't a Craft Anything record the builder must avoid: it keeps its own notes there.
         std::fs::create_dir_all(d.path().join("checks")).unwrap();
         std::fs::write(d.path().join("checks/notes.md"), "note\n").unwrap();
+        // capture/ is an own record in the root listing, but the brief tells the builder to read it.
+        std::fs::create_dir_all(d.path().join("capture/pages")).unwrap();
+        std::fs::write(d.path().join("capture/README.md"), "evidence\n").unwrap();
+        std::fs::write(d.path().join("capture/pages/index.html"), "<p>evidence</p>\n").unwrap();
         s.ext.insert(Arc::new(InboxDir(ws.inbox_dir())));
         let e = Engine::new(s);
 
@@ -432,6 +440,16 @@ mod tests {
         assert!(entries.contains("app/other.txt"), "a real nested folder is still part of the root: {list}");
         assert!(entries.contains("checks/notes.md"), "the builder's own check notes stay visible: {list}");
         assert!(!entries.contains("craft.json"), "Craft Anything's own records are not app files: {list}");
+        assert!(!entries.contains("capture/"), "capture stays out of the default root listing: {list}");
+
+        // The brief tells the builder to read capture/, so an explicit listing is allowed.
+        let capture = call(&e, "build_files_list", json!({"path": "capture"})).unwrap();
+        assert_eq!(capture["root"], "capture");
+        assert!(capture["entries"].to_string().contains("capture/README.md"), "{capture}");
+        assert!(capture["entries"].to_string().contains("capture/pages/"), "{capture}");
+        let pages = call(&e, "build_files_list", json!({"path": "capture/pages"})).unwrap();
+        assert_eq!(pages["root"], "capture/pages");
+        assert!(pages["entries"].to_string().contains("capture/pages/index.html"), "{pages}");
 
         // An explicit nested folder is still listed by that path.
         let nested = call(&e, "build_files_list", json!({"path": "app"})).unwrap();
