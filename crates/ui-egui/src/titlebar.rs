@@ -30,6 +30,12 @@ fn scale(ctx: &egui::Context) -> f32 {
     if NATIVE_FRAME { 1.0 / ctx.zoom_factor() } else { 1.0 }
 }
 
+/// A size for `label_text` / `label_galley` that comes out as `size` scaled by `s`: they add a
+/// fixed 1.5 pt to the size they're given.
+fn label(size: f32, s: f32) -> f32 {
+    (size + 1.5) * s - 1.5
+}
+
 /// The title bar across the top of the window.
 pub fn bar(app: &mut CraftApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
@@ -150,7 +156,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
         if ui.add(crate::app_icon(22.0 * s).sense(egui::Sense::click())).on_hover_text(tr("Home")).clicked() {
             app.state.screen = Screen::Home;
         }
-        ui.label(theme::label_text("Craft Anything", 12.0 * s).color(t.text).strong());
+        ui.label(theme::label_text("Craft Anything", label(12.0, s)).color(t.text).strong());
         let in_project = app.state.screen == Screen::Project;
         let project = if in_project { app.workspace.as_ref().map(|w| w.manifest.name.clone()) } else { app.view.project.clone() };
         let target = if in_project { None } else { app.view.active_target().map(|t| (t.name.clone(), t.kind)) };
@@ -158,7 +164,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
             rule(ui);
         }
         if let Some(p) = project {
-            ui.label(theme::label_text(&p, 12.0 * s).color(t.text_dim));
+            ui.label(theme::label_text(&p, label(12.0, s)).color(t.text_dim));
             if target.is_some() {
                 ui.label(RichText::new("/").color(t.text_faint));
             }
@@ -210,7 +216,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
             }
             rule(ui);
             let sel = usize::from(app.mode() == Mode::Experienced);
-            if let Some(i) = widgets::segmented_sized(ui, &["Simple", "Advanced"], sel, (CONTROL - 2.0) * s, 12.0 * s) {
+            if let Some(i) = widgets::segmented_scaled(ui, &["Simple", "Advanced"], sel, CONTROL - 2.0, 12.0, s) {
                 app.set_mode(if i == 0 { Mode::Beginner } else { Mode::Experienced });
             }
             rule(ui);
@@ -235,7 +241,7 @@ fn usage_pill(app: &CraftApp, ui: &mut Ui) {
     }
     let t = Tokens::get(ui.ctx());
     let text = if u.priced { crate::usage::cost_short(u) } else { crate::usage::tokens_words(u.tokens()) };
-    let r = widgets::pill_sized(ui, &text, t.text_dim, t.raised, 11.0 * scale(ui.ctx()));
+    let r = widgets::pill_sized(ui, &text, t.text_dim, t.raised, label(11.0, scale(ui.ctx())));
     r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &text));
     r.on_hover_ui(|ui| {
         ui.label(RichText::new(tr("AI use this session")).font(theme::semibold(theme::SMALL)));
@@ -251,7 +257,7 @@ fn download_pill(ui: &mut Ui, title: &str, fraction: Option<f32>) -> egui::Respo
         None => title.to_string(),
     };
     let s = scale(ui.ctx());
-    let g = widgets::label_galley(ui, &text, 12.0 * s, t.text);
+    let g = widgets::label_galley(ui, &text, label(12.0, s), t.text);
     let size = Vec2::new(g.size().x + (26.0 + 52.0) * s, 26.0 * s);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let h = widgets::hover_t(ui, &resp);
@@ -275,7 +281,7 @@ fn deep_toggle(app: &mut CraftApp, ui: &mut Ui) {
     let missing = app.ghidra_missing();
     let label = tr(if deep { "Deep" } else { "Clean room" });
     let s = scale(ui.ctx());
-    let g = widgets::label_galley(ui, &label, 12.0 * s, t.text);
+    let g = widgets::label_galley(ui, &label, self::label(12.0, s), t.text);
     let size = Vec2::new(g.size().x + 64.0 * s, CONTROL * s);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let fill = if resp.hovered() { t.hover } else { egui::Color32::TRANSPARENT };
@@ -322,7 +328,7 @@ fn backend_picker(app: &mut CraftApp, ui: &mut Ui) {
         spacing.icon_width *= s;
         spacing.icon_spacing *= s;
         egui::ComboBox::from_id_salt("backend-picker")
-            .selected_text(theme::label_text(&current, 12.0 * s).color(if app.state.backend.is_some() { t.text } else { t.text_dim }))
+            .selected_text(theme::label_text(&current, label(12.0, s)).color(if app.state.backend.is_some() { t.text } else { t.text_dim }))
             .icon(move |ui, rect, _, _| icons::paint(ui, rect.expand(2.0 * s), "chevron-down", 14.0 * s, Tokens::get(ui.ctx()).icon))
             .width(190.0 * s)
             .show_ui(ui, |ui| {

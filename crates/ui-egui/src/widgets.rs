@@ -236,21 +236,30 @@ pub fn segmented(ui: &mut Ui, options: &[&str], selected: usize, height: f32) ->
 
 /// [`segmented`] with a given label size (in the [`label_galley`] style), for a bigger switch.
 pub fn segmented_sized(ui: &mut Ui, options: &[&str], selected: usize, height: f32, text: f32) -> Option<usize> {
+    segmented_scaled(ui, options, selected, height, text, 1.0)
+}
+
+/// [`segmented_sized`] with every size in it, padding too, multiplied by `scale` (the macOS
+/// title bar's, which keeps its size when the app zooms).
+pub fn segmented_scaled(ui: &mut Ui, options: &[&str], selected: usize, height: f32, text: f32, scale: f32) -> Option<usize> {
     let t = Tokens::get(ui.ctx());
-    let galleys: Vec<_> = options.iter().map(|o| label_galley(ui, &tr(o), text, t.text)).collect();
-    let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + text * 2.0 + 2.0).collect();
-    let total: f32 = widths.iter().sum::<f32>() + 4.0;
+    // label_text adds a fixed 1.5 pt to the size it's given; scale that too.
+    let label = (text + 1.5) * scale - 1.5;
+    let (height, pad) = (height * scale, 2.0 * scale);
+    let galleys: Vec<_> = options.iter().map(|o| label_galley(ui, &tr(o), label, t.text)).collect();
+    let widths: Vec<f32> = galleys.iter().map(|g| g.size().x + (text * 2.0 + 2.0) * scale).collect();
+    let total: f32 = widths.iter().sum::<f32>() + 2.0 * pad;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(total, height), Sense::hover());
-    ui.painter().rect(rect, t.radius, t.raised, Stroke::new(1.0, t.card_border), egui::StrokeKind::Inside);
-    let mut x = rect.left() + 2.0;
+    ui.painter().rect(rect, t.radius, t.raised, Stroke::new(scale, t.card_border), egui::StrokeKind::Inside);
+    let mut x = rect.left() + pad;
     let mut picked = None;
     for (i, (g, w)) in galleys.into_iter().zip(widths).enumerate() {
-        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), Vec2::new(w, height - 4.0));
+        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + pad), Vec2::new(w, height - 2.0 * pad));
         let resp = ui.interact(seg, ui.id().with(("seg", options.get(i).copied().unwrap_or_default())), Sense::click());
         let on = i == selected;
         resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, on, tr(options.get(i).copied().unwrap_or_default())));
         if on {
-            ui.painter().rect(seg, t.radius_sm, t.card, Stroke::new(1.0, t.card_border), egui::StrokeKind::Inside);
+            ui.painter().rect(seg, t.radius_sm, t.card, Stroke::new(scale, t.card_border), egui::StrokeKind::Inside);
         } else {
             ui.painter().rect_filled(seg, t.radius_sm, theme::mix(Color32::TRANSPARENT, t.hover, hover_t(ui, &resp)));
         }
