@@ -815,7 +815,12 @@ Owner: open · Status: in progress
       Revision `d601bc4e` passed [full Linux CI](https://github.com/storytold/craft-anything/actions/runs/41788735130):
       all four retained-budget regressions and six deduplication regressions passed.
 
-- [x] Keep stand-in response samples distinct when headers, content types or body-availability metadata differ.
+- [ ] Keep stand-in response samples distinct when headers, content types or body-availability metadata differ.
+      Compare header names without case and ignore ordering between different names, preserving each name's value order.
+      At the sample cap, a usable answer can replace an unavailable 304 for the same path, query and request key;
+      other requests keep their missing-body evidence. Refused bodies cannot replace that evidence.
+      The original five regressions passed in [full Linux CI](https://github.com/storytold/craft-anything/actions/runs/41786522177).
+      Nine additional header and capacity regressions are implemented; their automatic checks are pending.
       — claimed: Afloat16, branch bugfix/r3.11-standin-sample-metadata-20261103b
 
 ### R3.12 Format parser correctness
