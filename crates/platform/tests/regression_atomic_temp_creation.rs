@@ -3,15 +3,15 @@ use craft_anything_platform::fs::write_atomic;
 use craft_anything_platform::fs::write_atomic_private;
 use std::path::{Path, PathBuf};
 
-fn temporary(dir: &Path, name: &str, counter: u64) -> PathBuf {
-    dir.join(format!(".{name}.tmp-{}-{counter}", std::process::id()))
+fn temporary(dir: &Path, counter: u64) -> PathBuf {
+    dir.join(format!(".craft-anything.tmp-{}-{counter}", std::process::id()))
 }
 
 #[test]
 fn atomic_writes_preserve_colliding_files_and_links() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("settings.json");
-    let stale: Vec<_> = (0..4).map(|n| temporary(dir.path(), "settings.json", n)).collect();
+    let stale: Vec<_> = (0..4).map(|n| temporary(dir.path(), n)).collect();
     for file in &stale {
         std::fs::write(file, b"existing temporary data").unwrap();
     }
@@ -24,13 +24,14 @@ fn atomic_writes_preserve_colliding_files_and_links() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{PermissionsExt, symlink};
-        let other = dir.path().join("other.txt");
+        let private_dir = tempfile::tempdir().unwrap();
+        let other = private_dir.path().join("other.txt");
         std::fs::write(&other, b"keep this file").unwrap();
-        let links: Vec<_> = (0..16).map(|n| temporary(dir.path(), "private.json", n)).collect();
+        let links: Vec<_> = (0..16).map(|n| temporary(private_dir.path(), n)).collect();
         for link in &links {
             symlink(&other, link).unwrap();
         }
-        let private = dir.path().join("private.json");
+        let private = private_dir.path().join("private.json");
         write_atomic_private(&private, b"private fixture").unwrap();
         assert_eq!(std::fs::read(&other).unwrap(), b"keep this file");
         assert_eq!(std::fs::read(&private).unwrap(), b"private fixture");
@@ -43,9 +44,10 @@ fn atomic_writes_preserve_colliding_files_and_links() {
     }
 
     // A bounded retry must leave both the destination and every colliding file alone.
-    let destination = dir.path().join("crowded.json");
+    let crowded_dir = tempfile::tempdir().unwrap();
+    let destination = crowded_dir.path().join("crowded.json");
     std::fs::write(&destination, b"original settings").unwrap();
-    let occupied: Vec<_> = (0..256).map(|n| temporary(dir.path(), "crowded.json", n)).collect();
+    let occupied: Vec<_> = (0..256).map(|n| temporary(crowded_dir.path(), n)).collect();
     for file in &occupied {
         std::fs::write(file, b"someone else's temporary data").unwrap();
     }
@@ -56,12 +58,21 @@ fn atomic_writes_preserve_colliding_files_and_links() {
     }
 
     // An error after creating our temporary file cleans up only that new file.
-    let blocked = dir.path().join("directory.json");
+    let blocked_dir = tempfile::tempdir().unwrap();
+    let blocked = blocked_dir.path().join("directory.json");
     std::fs::create_dir(&blocked).unwrap();
-    let mut before: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().path()).collect();
+    let mut before: Vec<_> = std::fs::read_dir(blocked_dir.path()).unwrap().map(|entry| entry.unwrap().path()).collect();
     before.sort();
     assert!(write_atomic(&blocked, b"cannot replace a directory").is_err());
-    let mut after: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().path()).collect();
+    let mut after: Vec<_> = std::fs::read_dir(blocked_dir.path()).unwrap().map(|entry| entry.unwrap().path()).collect();
     after.sort();
     assert_eq!(after, before);
+
+    // Creating the destination first proves its long name is valid on this filesystem.
+    let long_dir = tempfile::tempdir().unwrap();
+    let long_target = long_dir.path().join("s".repeat(250));
+    std::fs::write(&long_target, b"original long-name settings").unwrap();
+    write_atomic(&long_target, b"replacement long-name settings").unwrap();
+    assert_eq!(std::fs::read(&long_target).unwrap(), b"replacement long-name settings");
+    assert_eq!(std::fs::read_dir(long_dir.path()).unwrap().count(), 1);
 }

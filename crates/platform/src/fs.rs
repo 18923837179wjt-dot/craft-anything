@@ -25,9 +25,8 @@ fn write_impl(path: &Path, bytes: &[u8], private: bool) -> Result<(), ToolError>
         None => return Err(ToolError::invalid(format!("{} has no parent folder", path.display()))),
     };
     std::fs::create_dir_all(&dir).map_err(|e| ToolError::io(dir.display(), e))?;
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
     let existing_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
-    let (tmp, mut f) = create_temp(&dir, &name)?;
+    let (tmp, mut f) = create_temp(&dir, private)?;
     let result = (|| {
         if private {
             set_private(&tmp)?;
@@ -45,13 +44,24 @@ fn write_impl(path: &Path, bytes: &[u8], private: bool) -> Result<(), ToolError>
     result
 }
 
-/// Reserve a new temporary file before entering the cleanup scope. A collision belongs to
+/// Reserve a short, new temporary file before entering the cleanup scope. A collision belongs to
 /// another write, so it must never be truncated or removed by this call.
-fn create_temp(dir: &Path, name: &str) -> Result<(std::path::PathBuf, std::fs::File), ToolError> {
+fn create_temp(dir: &Path, private: bool) -> Result<(std::path::PathBuf, std::fs::File), ToolError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if private {
+            options.mode(0o600);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = private;
     for _ in 0..64 {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = dir.join(format!(".{name}.tmp-{}-{n}", std::process::id()));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+        let tmp = dir.join(format!(".craft-anything.tmp-{}-{n}", std::process::id()));
+        match options.open(&tmp) {
             Ok(file) => return Ok((tmp, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(ToolError::io(tmp.display(), error)),
@@ -126,6 +136,21 @@ mod tests {
         }
         // no temp files left behind
         assert_eq!(std::fs::read_dir(dir.path().join("sub")).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_file_creation_permissions_respect_private_flag() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_, private) = create_temp(dir.path(), true).unwrap();
+        // Observe the new file directly, before write_impl can call set_private.
+        assert_eq!(private.metadata().unwrap().permissions().mode() & 0o077, 0);
+
+        let regular = std::fs::File::create(dir.path().join("regular")).unwrap();
+        let (_, non_private) = create_temp(dir.path(), false).unwrap();
+        assert_eq!(non_private.metadata().unwrap().permissions().mode() & 0o777, regular.metadata().unwrap().permissions().mode() & 0o777);
     }
 
     #[test]
