@@ -23,30 +23,19 @@ const EDGE: f32 = 5.0;
 /// Room left of the app mark for macOS's window buttons.
 const NATIVE_BUTTONS_WIDTH: f32 = 84.0;
 
-/// The title bar across the top of the window. On macOS it keeps its size when the app is
-/// zoomed (Cmd − / Cmd =), like the system's window buttons beside it: it is drawn on a layer of
-/// its own, scaled back by the zoom, and only the rest of the window zooms.
+/// How much the bar's sizes are scaled: on macOS it keeps its size when the app is zoomed
+/// (Cmd − / Cmd =), like the system's window buttons beside it, so every size in it is divided by
+/// the zoom and only the rest of the window zooms. Sizes, not a scaled layer, keep text sharp.
+fn scale(ctx: &egui::Context) -> f32 {
+    if NATIVE_FRAME { 1.0 / ctx.zoom_factor() } else { 1.0 }
+}
+
+/// The title bar across the top of the window.
 pub fn bar(app: &mut CraftApp, ui: &mut Ui) {
-    let ctx = ui.ctx().clone();
-    let t = Tokens::get(&ctx);
-    let zoom = if NATIVE_FRAME { ctx.zoom_factor() } else { 1.0 };
-    egui::Panel::top("titlebar").exact_size(HEIGHT / zoom).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
-        if !NATIVE_FRAME {
-            crate::guard_ui(ui, "title bar", |ui| show(app, ui));
-            return;
-        }
-        // The same rect in unzoomed points, which the layer's transform maps back onto the panel.
-        let rect = egui::Rect::from_min_size(ui.max_rect().min * zoom, ui.max_rect().size() * zoom);
-        let area = egui::Area::new(egui::Id::new("titlebar-unzoomed")).order(egui::Order::Middle).fixed_pos(rect.min).constrain(false).show(&ctx, |ui| {
-            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                // The layer clips to the zoomed screen by default, which cuts off the bar's right
-                // end when zoomed in.
-                ui.set_clip_rect(rect);
-                ui.set_min_size(rect.size());
-                crate::guard_ui(ui, "title bar", |ui| show(app, ui));
-            });
-        });
-        ctx.set_transform_layer(area.response.layer_id, egui::emath::TSTransform::from_scaling(1.0 / zoom));
+    let t = Tokens::get(ui.ctx());
+    let height = HEIGHT * scale(ui.ctx());
+    egui::Panel::top("titlebar").exact_size(height).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
+        crate::guard_ui(ui, "title bar", |ui| show(app, ui));
     });
 }
 
@@ -110,8 +99,9 @@ pub fn resize_edges(ctx: &egui::Context) {
 /// A thin vertical rule between title bar cells.
 fn rule(ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
-    let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, HEIGHT), egui::Sense::hover());
-    ui.painter().vline(r.center().x, r.y_range(), egui::Stroke::new(1.0, t.separator));
+    let s = scale(ui.ctx());
+    let (r, _) = ui.allocate_exact_size(Vec2::new(s, HEIGHT * s), egui::Sense::hover());
+    ui.painter().vline(r.center().x, r.y_range(), egui::Stroke::new(s, t.separator));
 }
 
 /// One of the window buttons (minimise, maximise, close): a full-height cell.
@@ -134,6 +124,7 @@ fn window_button(ui: &mut Ui, icon: &str, tip: &str, close: bool) -> egui::Respo
 pub fn show(app: &mut CraftApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let ctx = ui.ctx().clone();
+    let s = scale(&ctx);
     let bar = ui.max_rect();
     // Empty parts of the bar move the window and double-click maximises. This is registered
     // before the controls, so they get their own clicks.
@@ -144,22 +135,22 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
     if drag.double_clicked() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized(&ctx)));
     }
-    ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, egui::Stroke::new(1.0, t.separator));
+    ui.painter().hline(bar.x_range(), bar.bottom() - 0.5 * s, egui::Stroke::new(s, t.separator));
     // A download anywhere in the app fills the bottom edge of the bar, on every screen.
     let download = crate::engine_ui::global_download(app);
     if let Some((_, Some(f), _)) = &download {
         let x = bar.left() + bar.width() * f.clamp(0.0, 1.0);
-        ui.painter().line_segment([egui::pos2(bar.left(), bar.bottom() - 1.0), egui::pos2(x, bar.bottom() - 1.0)], egui::Stroke::new(2.0, t.accent));
+        ui.painter().line_segment([egui::pos2(bar.left(), bar.bottom() - s), egui::pos2(x, bar.bottom() - s)], egui::Stroke::new(2.0 * s, t.accent));
     }
     ui.horizontal_centered(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.spacing_mut().item_spacing.x = 10.0 * s;
         // Full screen hides macOS's buttons, so the bar doesn't keep their room.
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        ui.add_space(if NATIVE_FRAME && !fullscreen { NATIVE_BUTTONS_WIDTH } else { 12.0 });
-        if ui.add(crate::app_icon(22.0).sense(egui::Sense::click())).on_hover_text(tr("Home")).clicked() {
+        ui.add_space(if NATIVE_FRAME && !fullscreen { NATIVE_BUTTONS_WIDTH } else { 12.0 } * s);
+        if ui.add(crate::app_icon(22.0 * s).sense(egui::Sense::click())).on_hover_text(tr("Home")).clicked() {
             app.state.screen = Screen::Home;
         }
-        ui.label(theme::label_text("Craft Anything", 12.0).color(t.text).strong());
+        ui.label(theme::label_text("Craft Anything", 12.0 * s).color(t.text).strong());
         let in_project = app.state.screen == Screen::Project;
         let project = if in_project { app.workspace.as_ref().map(|w| w.manifest.name.clone()) } else { app.view.project.clone() };
         let target = if in_project { None } else { app.view.active_target().map(|t| (t.name.clone(), t.kind)) };
@@ -167,14 +158,14 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
             rule(ui);
         }
         if let Some(p) = project {
-            ui.label(theme::label_text(&p, 12.0).color(t.text_dim));
+            ui.label(theme::label_text(&p, 12.0 * s).color(t.text_dim));
             if target.is_some() {
                 ui.label(RichText::new("/").color(t.text_faint));
             }
         }
         if let Some((name, kind)) = target {
-            icons::show(ui, crate::kind_icon(kind), 14.0, t.icon);
-            ui.add(egui::Label::new(RichText::new(name).font(theme::mono(theme::CAPTION)).color(t.text)).truncate()).on_hover_text(tr(kind.plain()));
+            icons::show(ui, crate::kind_icon(kind), 14.0 * s, t.icon);
+            ui.add(egui::Label::new(RichText::new(name).font(theme::mono(theme::CAPTION * s)).color(t.text)).truncate()).on_hover_text(tr(kind.plain()));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -191,9 +182,9 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
                 }
                 rule(ui);
             }
-            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.spacing_mut().item_spacing.x = 10.0 * s;
             // Without window buttons on the right, keep the controls off the window's rounded corner.
-            ui.add_space(if NATIVE_FRAME { 12.0 } else { 4.0 });
+            ui.add_space(if NATIVE_FRAME { 12.0 } else { 4.0 } * s);
             if let Some((title, fraction, message)) = download {
                 if download_pill(ui, &title, fraction).on_hover_text(message).clicked() {
                     app.state.modal = Some(match app.engine_flow.job {
@@ -214,12 +205,12 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
                 usage_pill(app, ui);
                 return;
             }
-            if icons::button(ui, "settings", CONTROL, app.state.settings_open, "Settings").clicked() {
+            if icons::button(ui, "settings", CONTROL * s, app.state.settings_open, "Settings").clicked() {
                 app.state.settings_open = !app.state.settings_open;
             }
             rule(ui);
             let sel = usize::from(app.mode() == Mode::Experienced);
-            if let Some(i) = widgets::segmented(ui, &["Simple", "Advanced"], sel, CONTROL - 2.0) {
+            if let Some(i) = widgets::segmented_sized(ui, &["Simple", "Advanced"], sel, (CONTROL - 2.0) * s, 12.0 * s) {
                 app.set_mode(if i == 0 { Mode::Beginner } else { Mode::Experienced });
             }
             rule(ui);
@@ -228,7 +219,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
             usage_pill(app, ui);
             if app.jobs.busy() {
                 let n = app.jobs.running().filter(|j| j.visible).count();
-                ui.add(crate::widgets::Spinner::new().size(14.0).color(t.accent))
+                ui.add(crate::widgets::Spinner::new().size(14.0 * s).color(t.accent))
                     .on_hover_text(crate::i18n::trf("{n} job(s) running", &[("n", &n.to_string())]));
             }
         });
@@ -244,7 +235,7 @@ fn usage_pill(app: &CraftApp, ui: &mut Ui) {
     }
     let t = Tokens::get(ui.ctx());
     let text = if u.priced { crate::usage::cost_short(u) } else { crate::usage::tokens_words(u.tokens()) };
-    let r = widgets::pill(ui, &text, t.text_dim, t.raised);
+    let r = widgets::pill_sized(ui, &text, t.text_dim, t.raised, 11.0 * scale(ui.ctx()));
     r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &text));
     r.on_hover_ui(|ui| {
         ui.label(RichText::new(tr("AI use this session")).font(theme::semibold(theme::SMALL)));
@@ -259,17 +250,18 @@ fn download_pill(ui: &mut Ui, title: &str, fraction: Option<f32>) -> egui::Respo
         Some(f) => format!("{title} · {:.0}%", f * 100.0),
         None => title.to_string(),
     };
-    let g = widgets::label_galley(ui, &text, 12.0, t.text);
-    let size = Vec2::new(g.size().x + 26.0 + 52.0, 26.0);
+    let s = scale(ui.ctx());
+    let g = widgets::label_galley(ui, &text, 12.0 * s, t.text);
+    let size = Vec2::new(g.size().x + (26.0 + 52.0) * s, 26.0 * s);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let h = widgets::hover_t(ui, &resp);
-    ui.painter().rect(rect, t.radius, crate::theme::mix(t.raised, t.hover, h), egui::Stroke::new(1.0, t.card_border), egui::StrokeKind::Inside);
-    icons::paint(ui, egui::Rect::from_center_size(egui::pos2(rect.left() + 14.0, rect.center().y), Vec2::splat(14.0)), "download", 14.0, t.accent);
-    ui.painter().galley_with_override_text_color(egui::pos2(rect.left() + 26.0, rect.center().y - g.size().y / 2.0), g, t.text);
-    let track = egui::Rect::from_min_size(egui::pos2(rect.right() - 48.0, rect.center().y - 1.5), Vec2::new(38.0, 3.0));
-    ui.painter().rect_filled(track, 1.5, t.separator);
+    ui.painter().rect(rect, t.radius, crate::theme::mix(t.raised, t.hover, h), egui::Stroke::new(s, t.card_border), egui::StrokeKind::Inside);
+    icons::paint(ui, egui::Rect::from_center_size(egui::pos2(rect.left() + 14.0 * s, rect.center().y), Vec2::splat(14.0 * s)), "download", 14.0 * s, t.accent);
+    ui.painter().galley_with_override_text_color(egui::pos2(rect.left() + 26.0 * s, rect.center().y - g.size().y / 2.0), g, t.text);
+    let track = egui::Rect::from_min_size(egui::pos2(rect.right() - 48.0 * s, rect.center().y - 1.5 * s), Vec2::new(38.0, 3.0) * s);
+    ui.painter().rect_filled(track, 1.5 * s, t.separator);
     let f = fraction.unwrap_or_else(|| (ui.input(|i| i.time) * 0.6).fract() as f32).clamp(0.0, 1.0);
-    ui.painter().rect_filled(egui::Rect::from_min_size(track.min, Vec2::new(track.width() * f, track.height())), 1.5, t.accent);
+    ui.painter().rect_filled(egui::Rect::from_min_size(track.min, Vec2::new(track.width() * f, track.height())), 1.5 * s, t.accent);
     widgets::focus_ring(ui, &resp, rect);
     widgets::animate(ui, std::time::Duration::from_millis(250));
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text.clone()));
@@ -282,21 +274,22 @@ fn deep_toggle(app: &mut CraftApp, ui: &mut Ui) {
     let deep = app.settings.deep_mode;
     let missing = app.ghidra_missing();
     let label = tr(if deep { "Deep" } else { "Clean room" });
-    let g = widgets::label_galley(ui, &label, 12.0, t.text);
-    let size = Vec2::new(g.size().x + 64.0, CONTROL);
+    let s = scale(ui.ctx());
+    let g = widgets::label_galley(ui, &label, 12.0 * s, t.text);
+    let size = Vec2::new(g.size().x + 64.0 * s, CONTROL * s);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let fill = if resp.hovered() { t.hover } else { egui::Color32::TRANSPARENT };
-    ui.painter().rect(rect, t.radius, fill, egui::Stroke::new(1.0, t.card_border), egui::StrokeKind::Inside);
-    let icon_rect = egui::Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), Vec2::splat(16.0));
+    ui.painter().rect(rect, t.radius, fill, egui::Stroke::new(s, t.card_border), egui::StrokeKind::Inside);
+    let icon_rect = egui::Rect::from_center_size(egui::pos2(rect.left() + 16.0 * s, rect.center().y), Vec2::splat(16.0 * s));
     let (icon, col) = if deep { ("microscope", t.accent) } else { ("shield-check", t.success) };
-    icons::paint(ui, icon_rect, icon, 15.0, col);
-    ui.painter().galley_with_override_text_color(egui::pos2(rect.left() + 30.0, rect.center().y - g.size().y / 2.0), g, t.text);
+    icons::paint(ui, icon_rect, icon, 15.0 * s, col);
+    ui.painter().galley_with_override_text_color(egui::pos2(rect.left() + 30.0 * s, rect.center().y - g.size().y / 2.0), g, t.text);
     // The little switch.
-    let sw = egui::Rect::from_center_size(egui::pos2(rect.right() - 18.0, rect.center().y), Vec2::new(22.0, 12.0));
+    let sw = egui::Rect::from_center_size(egui::pos2(rect.right() - 18.0 * s, rect.center().y), Vec2::new(22.0, 12.0) * s);
     let how = ui.ctx().animate_bool(resp.id, deep);
-    ui.painter().rect_filled(sw, 6.0, if deep { t.accent } else { t.pressed });
-    let knob_x = egui::lerp(sw.left() + 6.0..=sw.right() - 6.0, how);
-    ui.painter().circle_filled(egui::pos2(knob_x, sw.center().y), 4.5, egui::Color32::WHITE);
+    ui.painter().rect_filled(sw, 6.0 * s, if deep { t.accent } else { t.pressed });
+    let knob_x = egui::lerp(sw.left() + 6.0 * s..=sw.right() - 6.0 * s, how);
+    ui.painter().circle_filled(egui::pos2(knob_x, sw.center().y), 4.5 * s, egui::Color32::WHITE);
     widgets::focus_ring(ui, &resp, rect);
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, !deep, tr("Clean room")));
     let resp = resp.on_hover_ui(|ui| {
@@ -321,11 +314,17 @@ fn backend_picker(app: &mut CraftApp, ui: &mut Ui) {
     let mut choice: Option<Option<String>> = None;
     let mut setup = false;
     ui.scope(|ui| {
-        ui.spacing_mut().interact_size.y = CONTROL;
+        let s = scale(ui.ctx());
+        let spacing = ui.spacing_mut();
+        spacing.interact_size.y = CONTROL * s;
+        // The box takes its padding from the style, which zooms; keep it the bar's size too.
+        spacing.button_padding *= s;
+        spacing.icon_width *= s;
+        spacing.icon_spacing *= s;
         egui::ComboBox::from_id_salt("backend-picker")
-            .selected_text(theme::label_text(&current, 12.0).color(if app.state.backend.is_some() { t.text } else { t.text_dim }))
-            .icon(widgets::combo_icon)
-            .width(190.0)
+            .selected_text(theme::label_text(&current, 12.0 * s).color(if app.state.backend.is_some() { t.text } else { t.text_dim }))
+            .icon(move |ui, rect, _, _| icons::paint(ui, rect.expand(2.0 * s), "chevron-down", 14.0 * s, Tokens::get(ui.ctx()).icon))
+            .width(190.0 * s)
             .show_ui(ui, |ui| {
                 for b in &app.backends {
                     let on = app.state.backend.as_ref() == Some(&b.name);
