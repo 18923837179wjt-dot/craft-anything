@@ -817,6 +817,9 @@ Owner: open · Status: in progress
 
 ### R3.12 Format parser correctness
 Owner: open · Status: in progress
+- [ ] Require a complete DNS question's type and class fields before retaining it, and keep
+      truncated questions out of packet inventories while reporting the incomplete message
+      — claimed: Afloat16, branch bugfix/r3.12-dns-question-class-review-20261104
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
       area and reject unrepresentable widths, base64 (plists, source maps) refuses damaged tails
       and incomplete quanta through one shared decoder, OIDs must be minimally encoded, and string
