@@ -804,7 +804,8 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
             out.incomplete = true;
             break;
         };
-        let Some(qt) = r.u16_be(next) else {
+        // The class is not displayed, but both two-byte fields must be present.
+        let (Some(qt), Some(_class)) = (r.u16_be(next), r.u16_be(next + 2)) else {
             out.incomplete = true;
             break;
         };
