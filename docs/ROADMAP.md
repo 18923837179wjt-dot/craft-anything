@@ -811,8 +811,11 @@ Owner: open · Status: in progress
       Compare header names without case and ignore ordering between different names, preserving each name's value order.
       At the sample cap, a usable answer can replace an unavailable 304 for the same path, query and request key;
       other requests keep their missing-body evidence. Refused bodies cannot replace that evidence.
-      Revision `f79dc0bd` passed [full Linux CI](https://github.com/storytold/craft-anything/actions/runs/41793241151):
+      Compare complete samples before charging retained bytes, using #717's retained-budget accounting.
+      Historical revision `f79dc0bd` passed [full Linux CI](https://github.com/storytold/craft-anything/actions/runs/41793241151):
       all five original metadata regressions and nine header and capacity regressions passed.
+      All 24 combined replay regressions pass locally on the refresh onto `cf414ff4`.
+      See this PR's checks for the refreshed revision's complete gate.
       — claimed: Afloat16, branch bugfix/r3.11-standin-sample-metadata-20261103b
 - [ ] `native_publisher_show` hashes the file minus the signature fields, not section by section;
       a file with unusual gaps between sections can read as different

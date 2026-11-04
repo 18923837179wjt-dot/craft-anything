@@ -186,7 +186,7 @@ fn rejected_replacements_leave_budget_for_other_routes() {
 }
 
 #[test]
-fn a_repeat_at_capacity_preserves_the_304_and_refunds_its_body() {
+fn a_repeat_at_capacity_preserves_the_304_without_charging_its_body() {
     for budget in [2, 4] {
         let opts = BuildOptions { max_samples_per_route: 2, max_total_body_bytes: budget, ..Default::default() };
         let usable = entry("https://example.test/resource", 200, "ok", json!([]));
@@ -197,7 +197,7 @@ fn a_repeat_at_capacity_preserves_the_304_and_refunds_its_body() {
         let standin = capture(entries, &opts);
         let route = standin.routes.iter().find(|route| route.template == "/resource").unwrap();
         assert_eq!((route.requests, route.samples.len()), (3, 2));
-        assert_eq!(route.samples_left_out, if budget == 2 { 1 } else { 0 });
+        assert_eq!(route.samples_left_out, 0);
         assert_eq!(route.samples[0].status, 304);
         assert_eq!(route.samples[1].text.as_deref(), Some("ok"));
         let mut turns = Turns::default();

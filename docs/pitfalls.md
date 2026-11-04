@@ -585,7 +585,8 @@ Compare that way without rewriting the saved headers. Unavailable 304 samples st
 request lacked a cached body. At capacity, replace one only with a usable response for the same
 path, query and request key, then append it in recording order. Keep other requests' evidence,
 count the displaced sample, and do not replace anything with a body refused by a size or secret
-check. Check duplicate refunds at both an exact total-body limit and one with room remaining.
+check. Compare complete samples before charging retained bytes, so repeats need no refund. Test an
+exact total-body limit and one with room remaining, preserving the unavailable 304 and remaining budget.
 
 **A strict tool that sent an AI off to write its own.** `game_pak_extract` refused an output
 whose folder didn't exist and took one file per call; the extractor model hit that twice, then
