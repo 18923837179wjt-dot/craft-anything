@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <b>Découvrez comment n’importe quel site web, application ou jeu fonctionne, puis laissez l’IA construire votre propre version ; un moteur open-source, clean-room, écrit en pur Rust.</b><br>
+  <b>Découvrez comment n’importe quel site web, application ou jeu fonctionne, puis laissez l’IA construire votre propre version ; un moteur open-source, en salle blanche, écrit en pur Rust.</b><br>
   Pointez-le vers une cible, dites ce que vous voulez, et il étudie l’original avec de vrais outils d’inspection,<br>
   fait construire un nouveau projet par un agent de codage, compare le résultat à l’original et l’affine.
 </p>
@@ -104,7 +104,7 @@ en vous demandant en mots simples quand une décision vous appartient :
 <table>
   <tr>
     <td width="50%" valign="top">
-      <img src="docs/images/make.png" alt="L’écran Make : choisissez un site web, une application ou un jeu à recréer, tapez l’adresse, choisissez Clean room ou Deep, dites ce que vous voulez et appuyez sur Démarrer" width="100%"><br>
+      <img src="docs/images/make.png" alt="L’écran Make : choisissez un site web, une application ou un jeu à recréer, tapez l’adresse, choisissez Salle blanche ou Approfondi, dites ce que vous voulez et appuyez sur Démarrer" width="100%"><br>
       <sub><b>Make :</b> choisissez ce qu’il faut recréer, dites ce que vous voulez, appuyez sur Démarrer.</sub>
     </td>
     <td width="50%" valign="top">
@@ -120,24 +120,24 @@ en vous demandant en mots simples quand une décision vous appartient :
   appuyez sur Démarrer. Une page de projet affiche les quatre étapes (Étudier → Construire → Vérifier → Prêt), ce que
   l’agent fait en mots simples, des cartes de question et d’approbation, le degré de ressemblance du résultat, et
   des boutons pour ouvrir le résultat ou son dossier. Demandez des modifications dans la zone en bas.
-  « Juste regarder à l’intérieur » ouvre une cible pour des questions sans rien construire (en mode Deep).
+  « Juste regarder à l’intérieur » ouvre une cible pour des questions sans rien construire (en mode Approfondi).
 - **Avancé** : l’établi complet : chaque outil (Ctrl/Cmd+K), fonctions, chaînes, pseudo-C,
   désassemblage, hex, graphes d’appels, preuves, inconnues, tâches, logs et la console de l’agent.
 
 Les deux modes pilotent le même moteur.
 
-## <a id="clean-room-or-deep"></a>Clean room ou Deep
+## <a id="clean-room-or-deep"></a>Salle blanche ou Approfondi
 
-- **Clean room** (par défaut) : rien à l’intérieur de l’original n’est lu, ni son code, ni ses fichiers, ni le source des pages.
+- **Salle blanche** (par défaut) : rien à l’intérieur de l’original n’est lu, ni son code, ni ses fichiers, ni le source des pages.
   Craft Anything travaille à partir de ce que vous pouvez voir : les images que vous ajoutez, le site web tel qu’un visiteur
   le voit (captures d’écran, texte visible, mise en page mesurée, couleurs, polices et espacements, menus ouverts)
   et, lorsque vous l’autorisez, une image de la fenêtre de l’application. Les outils qui regarderaient à l’intérieur sont refusés
-  et indiquent comment activer le mode Deep.
-- **Deep** : chaque outil est utilisé, pour votre usage privé. Le code et les fichiers d’un programme sont lus avec les
+  et indiquent comment activer le mode Approfondi.
+- **Approfondi** : chaque outil est utilisé, pour votre usage privé. Le code et les fichiers d’un programme sont lus avec les
   moteurs intégrés (et Ghidra lorsqu’il est installé), le JavaScript d’un site web est lu et sa page de démarrage est observée,
   et le constructeur peut les utiliser tous.
 
-Clean room est une règle qui porte sur ce que Craft Anything propose et refuse. Ce n’est pas un bac
+Le mode Salle blanche est une règle qui porte sur ce que Craft Anything propose et refuse. Ce n’est pas un bac
 à sable au niveau du système d’exploitation : votre ordinateur n’est pas isolé. Un agent de codage que
 vous lancez agit toujours en votre nom, et ce qu’il peut lire, écrire ou exécuter dépend de ses propres
 permissions. Les outils propres à un agent que Craft Anything peut refuser varient selon l’agent ; pour
@@ -184,7 +184,7 @@ connecte Craft Anything aux applications d’agents de codage.
 Un moteur de rétro-ingénierie entièrement écrit en Rust, avec 320 outils (300 dans le moteur, le reste provenant des couches IA et
 setup) pour les programmes natifs, .NET, Java, Android, Apple, Electron/JavaScript, sites web,
 firmware, captures de paquets, bases de données et fichiers de jeux. Ses propres décodeurs, désassembleur et
-décompilateur fonctionnent sans aucun programme externe ; le mode Deep les utilise tous, et Ghidra lorsqu’il est
+décompilateur fonctionnent sans aucun programme externe ; le mode Approfondi les utilise tous, et Ghidra lorsqu’il est
 installé. Il alimente l’application de bureau (egui), le CLI et le serveur MCP, et des parties s’exécutent dans
 le navigateur en tant que WebAssembly. La liste complète se trouve dans [docs/tools.md](docs/tools.md).
 
@@ -234,7 +234,7 @@ ne fait que le retirer de la liste.
 >
 > - **Fonctionne aujourd’hui :** l’application de bureau (Simple et Avancé), le CLI et le serveur MCP ; le
 >   flux de travail Étudier → Construire → Vérifier → Affiner pour les sites web, applications et jeux avec Claude Code comme
->   constructeur ; vérification des sites web sur trois largeurs d’écran ; reconstructions de jeux en Unity, Unreal ou Godot ; mode Deep
+>   constructeur ; vérification des sites web sur trois largeurs d’écran ; reconstructions de jeux en Unity, Unreal ou Godot ; mode Approfondi
 >   avec Ghidra ; images et modèles 3D générés (opt-in, votre propre clé fal.ai) ; plugins (serveurs MCP, et composants WASM dans les builds avec l’option `wasm-plugins`).
 > - **Partiellement fonctionnel :** construction avec des clés API et d’autres agents de codage (construits, pas encore exécutés en direct),
 >   contrôles de comportement pour les applications et les jeux, quelques outils du moteur testés uniquement sur des substituts.
