@@ -163,7 +163,8 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
                 rule(ui);
             }
             ui.spacing_mut().item_spacing.x = 10.0;
-            ui.add_space(4.0);
+            // Without window buttons on the right, keep the controls off the window's rounded corner.
+            ui.add_space(if NATIVE_FRAME { 12.0 } else { 4.0 });
             if let Some((title, fraction, message)) = download {
                 if download_pill(ui, &title, fraction).on_hover_text(message).clicked() {
                     app.state.modal = Some(match app.engine_flow.job {
