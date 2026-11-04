@@ -835,8 +835,17 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
                 )
                 .to_string(),
                 (28, 16) => Ipv6Addr::from(<[u8; 16]>::try_from(rd).unwrap_or([0; 16])).to_string(),
-                (2 | 5 | 12, _) => dns_name(msg, rd_off).map(|(n, _)| n).unwrap_or_default(),
-                (15, _) => dns_name(msg, rd_off + 2).map(|(n, _)| n).unwrap_or_default(),
+                (2 | 5 | 12 | 15, _) => {
+                    let end = rd_off + rd.len();
+                    let start = rd_off + if rt == 15 { 2 } else { 0 };
+                    // Keep earlier bytes available to compression pointers, but the encoded
+                    // name itself must fit the record and account for all of its RDATA.
+                    let Some((name, _)) = dns_name(msg.get(..end).unwrap_or(&[]), start).filter(|(_, after)| *after == end) else {
+                        out.incomplete = true;
+                        break;
+                    };
+                    name
+                }
                 (16, _) => {
                     // RFC 1035 §3.3.14: one TXT RDATA holds any number of
                     // length-prefixed character strings, and a zero-length

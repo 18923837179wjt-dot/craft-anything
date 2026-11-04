@@ -843,7 +843,7 @@ Owner: open · Status: in progress
       Shared-budget revision `29c48e03` passed [full Linux CI](https://github.com/storytold/craft-anything/actions/runs/41762780268).
       The merge with main `41d2175e` awaits a new CI run.
 
-- [ ] Keep DNS answer names inside their declared RDATA, including compressed names and MX
+- [x] Keep DNS answer names inside their declared RDATA, including compressed names and MX
       exchanges, and report malformed records as incomplete instead of inventing answer values
       — claimed: Afloat16, branch bugfix/r3.12-dns-rdata-names-review-20261104
 

@@ -329,6 +329,15 @@ so reopening keeps the new request's full allowance. The original failure or can
 the result; a reset that cannot be saved is reported separately and never overwrites a broken
 or newer record. Scripted turns cover both outcomes, blank notes and unreadable records.
 
+## DNS answer name boundaries
+
+NS, CNAME, PTR and MX answer names must be fully encoded inside their declared RDATA.
+Backward compression pointers still work, including names with a label before the pointer.
+A truncated name, missing MX preference or extra bytes after a name marks the DNS message
+incomplete and keeps that answer out of the packet and capture inventories. Earlier complete
+answers remain available. Seven synthetic packet regressions cover those boundaries, root
+names, literal names and the summary inventory; no live capture was used.
+
 ## Local model identifier task hints
 
 Automatic local setup recognizes numeric suffixes on known embedding, reranking and speech task
