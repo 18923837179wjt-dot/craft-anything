@@ -584,7 +584,7 @@ Owner: open · Status: in progress
 - [x] Say plainly when what's found is the Claude desktop app rather than the `claude` program
       (#259, a guess at its cause)
 - [ ] macOS: check that `Claude.app` is where the desktop app is found (#259's hint is untried there)
-- [ ] #259's hint, the gaps left in review of #781: it's hidden when only `~/.ssh/config` suggestions are
+- [x] #259's hint, the gaps left in review of #781: it's hidden when only `~/.ssh/config` suggestions are
       found, a Store install without its `claude-desktop` alias isn't seen, and a desktop app's
       `claude.exe` on PATH is taken for Claude Code (#824) — claimed: FuryNocturn, branch
       bugfix/r2.2-claude-desktop-hint-gaps
