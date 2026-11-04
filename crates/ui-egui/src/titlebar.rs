@@ -15,13 +15,25 @@ use egui::{RichText, Ui, Vec2};
 pub const NATIVE_FRAME: bool = cfg!(target_os = "macos");
 /// Height of the custom title bar. On macOS it matches the system's title bar, so its window
 /// buttons sit centred in it.
-pub const HEIGHT: f32 = if NATIVE_FRAME { 32.0 } else { 40.0 };
+const HEIGHT: f32 = if NATIVE_FRAME { 32.0 } else { 40.0 };
 /// Height of the switches and buttons in the bar.
 const CONTROL: f32 = if NATIVE_FRAME { 26.0 } else { 30.0 };
 /// How close to the window edge the pointer must be to resize.
 const EDGE: f32 = 5.0;
 /// Room left of the app mark for macOS's window buttons.
 const NATIVE_BUTTONS_WIDTH: f32 = 84.0;
+
+/// `size` in the system's points, as egui points. Zooming out (Cmd −) shrinks our points but not
+/// macOS's window buttons, so what makes room for them grows to keep its size on screen; zooming
+/// in already leaves room.
+fn native(ctx: &egui::Context, size: f32) -> f32 {
+    if NATIVE_FRAME { size / ctx.zoom_factor().min(1.0) } else { size }
+}
+
+/// The title bar's height at the current zoom.
+pub fn height(ctx: &egui::Context) -> f32 {
+    native(ctx, HEIGHT)
+}
 
 fn maximized(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false))
@@ -83,7 +95,7 @@ pub fn resize_edges(ctx: &egui::Context) {
 /// A thin vertical rule between title bar cells.
 fn rule(ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
-    let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, HEIGHT), egui::Sense::hover());
+    let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, height(ui.ctx())), egui::Sense::hover());
     ui.painter().vline(r.center().x, r.y_range(), egui::Stroke::new(1.0, t.separator));
 }
 
@@ -126,7 +138,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
         ui.spacing_mut().item_spacing.x = 10.0;
         // Full screen hides macOS's buttons, so the bar doesn't keep their room.
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        ui.add_space(if NATIVE_FRAME && !fullscreen { NATIVE_BUTTONS_WIDTH } else { 12.0 });
+        ui.add_space(if NATIVE_FRAME && !fullscreen { native(&ctx, NATIVE_BUTTONS_WIDTH) } else { 12.0 });
         if ui.add(crate::app_icon(22.0).sense(egui::Sense::click())).on_hover_text(tr("Home")).clicked() {
             app.state.screen = Screen::Home;
         }

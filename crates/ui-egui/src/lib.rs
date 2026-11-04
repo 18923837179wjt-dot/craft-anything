@@ -1733,7 +1733,7 @@ impl CraftApp {
         self.shortcuts(&ctx);
         let t = theme::Tokens::get(&ctx);
         // The title bar is on every screen: it is how the window moves, resizes and closes.
-        egui::Panel::top("titlebar").exact_size(titlebar::HEIGHT).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
+        egui::Panel::top("titlebar").exact_size(titlebar::height(&ctx)).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
             guard_ui(ui, "title bar", |ui| titlebar::show(self, ui));
         });
         self.stuck_banner(ui, &ctx);
