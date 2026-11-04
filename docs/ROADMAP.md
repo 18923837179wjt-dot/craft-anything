@@ -755,7 +755,7 @@ Gaps found while using the app for real projects.
 - [ ] macOS: an Edit menu (Undo, Cut, Copy, Paste, Select All). The keys work in text boxes, but
       the system's Edit items need the text box to answer them, so they'd show greyed out today
 - [x] A French README (`README.fr.md`) translated from `README.md` and linked from the language
-      switcher in every README
+      switcher in every README (#831)
 
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress
