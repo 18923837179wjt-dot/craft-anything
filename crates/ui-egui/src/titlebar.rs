@@ -39,6 +39,9 @@ pub fn bar(app: &mut CraftApp, ui: &mut Ui) {
         let rect = egui::Rect::from_min_size(ui.max_rect().min * zoom, ui.max_rect().size() * zoom);
         let area = egui::Area::new(egui::Id::new("titlebar-unzoomed")).order(egui::Order::Middle).fixed_pos(rect.min).constrain(false).show(&ctx, |ui| {
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                // The layer clips to the zoomed screen by default, which cuts off the bar's right
+                // end when zoomed in.
+                ui.set_clip_rect(rect);
                 ui.set_min_size(rect.size());
                 crate::guard_ui(ui, "title bar", |ui| show(app, ui));
             });
