@@ -76,9 +76,8 @@ fn repeated_header_values_keep_their_order_and_count() {
 fn full_routes_replace_matching_304s_in_recording_order() {
     let opts = BuildOptions::default();
     assert_eq!(opts.max_samples_per_route, 16);
-    let mut entries: Vec<_> = (0..16)
-        .map(|i| entry("https://example.test/resource", 304, "", json!([{"name": "X-Request-Id", "value": format!("poll-{i}")}])))
-        .collect();
+    let mut entries: Vec<_> =
+        (0..16).map(|i| entry("https://example.test/resource", 304, "", json!([{"name": "X-Request-Id", "value": format!("poll-{i}")}]))).collect();
     entries.push(entry("https://example.test/resource", 200, "first", json!([])));
     entries.push(entry("https://example.test/resource", 200, "second", json!([])));
     let standin = capture(entries, &opts);
@@ -105,10 +104,8 @@ fn full_routes_preserve_missing_queries_and_resources() {
         ("https://example.test/items/1", "https://example.test/items/2", "/items/1", ""),
     ] {
         let opts = BuildOptions { max_samples_per_route: 2, ..Default::default() };
-        let standin = capture(
-            vec![entry(missing_url, 304, "", json!([])), entry(ready_url, 304, "", json!([])), entry(ready_url, 200, "ready", json!([]))],
-            &opts,
-        );
+        let standin =
+            capture(vec![entry(missing_url, 304, "", json!([])), entry(ready_url, 304, "", json!([])), entry(ready_url, 200, "ready", json!([]))], &opts);
         let route = &standin.routes[0];
         assert_eq!((route.requests, route.samples.len(), route.samples_left_out), (3, 2, 1));
         assert_eq!(route.samples[0].status, 304);
@@ -228,10 +225,8 @@ fn refused_bodies_keep_missing_evidence_and_count_headers_once() {
     for (mut refused, mut opts) in cases {
         opts.max_samples_per_route = 1;
         refused["response"]["headers"] = json!([{"name": "Authorization", "value": "Bearer fake-token"}]);
-        let standin = capture(
-            vec![entry("https://example.test/resource", 304, "", json!([])), refused, entry("https://example.test/later", 200, "z", json!([]))],
-            &opts,
-        );
+        let standin =
+            capture(vec![entry("https://example.test/resource", 304, "", json!([])), refused, entry("https://example.test/later", 200, "z", json!([]))], &opts);
         let route = standin.routes.iter().find(|route| route.template == "/resource").unwrap();
         assert_eq!((route.samples.len(), route.samples_left_out), (1, 1));
         assert_eq!(route.samples[0].body_left_out, Some(BodyLeftOut::NotRecorded));

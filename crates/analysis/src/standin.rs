@@ -846,9 +846,10 @@ pub fn build(har: &Har, opts: &BuildOptions) -> StandIn {
         let full = route.samples.len() >= opts.max_samples_per_route;
         let replace = if full {
             let request_key = sample_request_key(s, &scrub);
-            route.samples.iter().position(|sample| {
-                sample.status == 304 && sample.path == s.path && sample.query == s.query && sample.request_key == request_key
-            })
+            route
+                .samples
+                .iter()
+                .position(|sample| sample.status == 304 && sample.path == s.path && sample.query == s.query && sample.request_key == request_key)
         } else {
             None
         };
