@@ -815,6 +815,9 @@ Owner: open · Status: in progress
       Revision `d601bc4e` passed [full Linux CI](https://github.com/storytold/craft-anything/actions/runs/41788735130):
       all four retained-budget regressions and six deduplication regressions passed.
 
+- [ ] Keep stand-in response samples distinct when headers, content types or body-availability metadata differ.
+      — claimed: Afloat16, branch bugfix/r3.11-standin-sample-metadata-20261103b
+
 ### R3.12 Format parser correctness
 Owner: open · Status: in progress
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
