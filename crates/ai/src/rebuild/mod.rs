@@ -259,11 +259,13 @@ impl RebuildRun {
             .spawn(move || {
                 let mut ctx = ctx;
                 let mut ws = ws;
-                ctx.load_asset_keys(&key_store);
                 // A clone can run for hours: keep the computer from sleeping until it ends.
                 let awake = craft_anything_platform::keep_awake();
                 let _here = self_check::BuildingHere::new(&ws.root);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.run(&mut ws, entry, api, extractor, &opts)));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ctx.load_asset_keys(&key_store);
+                    ctx.run(&mut ws, entry, api, extractor, &opts)
+                }));
                 let (ok, message, paused) = match result {
                     Ok(Ok(m)) => (true, m, false),
                     Ok(Err(e)) if e.code == ErrorCode::Cancelled => {

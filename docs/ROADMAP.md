@@ -333,6 +333,10 @@ Owner: open · Status: todo
 - [x] A saved fal.ai key reaches an API-key build's asset tools; every call said "No fal.ai key"
       (#923). Outside a project the tools now say that instead. Not checked with a real fal.ai key
       or API build
+- [ ] Two API-key builds at once write into one project: they share the app's session and `attach`
+      points its `InboxDir` at whichever started last (`build.parallel` is 2 by default), so the
+      other's Build and asset tools use that project's folder and budget. Give each its own engine,
+      as a question does, or run API builds one at a time
 - [ ] Check #369 live with Kimi K3 and a key limited to Kimi/Moonshot models (needs the person's
       OpenRouter key): that the build starts, or that the error now names the provider's reason
 - [ ] A live API-key build (needs a key on the test machine)
