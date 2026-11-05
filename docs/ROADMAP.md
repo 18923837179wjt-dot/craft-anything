@@ -170,10 +170,17 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
 - [ ] `which::tests::usual_windows_dirs_come_after_path` (platform) fails on a Windows machine
       whose environment adds a folder (10 found, 9 expected, "nothing twice"), on `main` too. Find
       what it depends on
-- [ ] `capture::console_tests` (platform) time out now and then with the whole platform suite
-      running and pass alone: `reads_what_the_program_drew_and_stops_at_the_deadline`, and
-      `nothing_it_started_outlives_the_deadline` too, on `main` as well. Find what they depend on
+- [x] `capture::console_tests` (platform) timed out now and then with the whole platform suite
+      running. On Windows Server 2022 a program another thread starts while a console opens
+      inherits its handles and holds it open until it ends, and closing a console that programs
+      are still attached to can hang its host. Program starts and console opens (and Unix terminal
+      opens, which have a shorter gap of the same kind) now take one lock (`process::STARTING`),
+      and a timeout ends the program's whole tree before closing
       — claimed: SoldierPePe, branch test/r5.2-console-capture-flake
+- [ ] A console program that exits by itself and leaves programs attached to its console: closing
+      it can still hang the console host on Windows Server 2022 (only a timeout ends the tree)
+- [ ] `process::launch_tests::a_watched_program_can_be_stopped` leaves its `sleep 30` (Windows:
+      `ping -n 30`) running, on `main` too: `stop` ends the shell but not what the shell started
 - [ ] `a_helper_is_judged_by_whether_it_runs` (ai crate) sometimes fails when several crates'
       tests run at once and passes alone: it writes a script and runs it straight away, which a
       busy machine can refuse while another test's child still holds the file open

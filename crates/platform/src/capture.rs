@@ -339,12 +339,15 @@ pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Durat
     const ROWS: u16 = 50;
     const COLS: u16 = 200;
     let failed = |e: &dyn std::fmt::Display| ToolError::new(ErrorCode::ProgramFailed, format!("{}: {e}", program.display()));
-    let portable_pty::PtyPair { master, slave } =
-        native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 }).map_err(|e| failed(&e))?;
-    let mut cmd = CommandBuilder::new(program.as_os_str());
-    cmd.args(args);
-    let mut child = slave.spawn_command(cmd).map_err(|e| failed(&e))?;
-    drop(slave);
+    let (master, mut child) = {
+        // A program another thread started while the console opened would hold it open.
+        let _starting = crate::process::STARTING.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let portable_pty::PtyPair { master, slave } =
+            native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 }).map_err(|e| failed(&e))?;
+        let mut cmd = CommandBuilder::new(program.as_os_str());
+        cmd.args(args);
+        (master, slave.spawn_command(cmd).map_err(|e| failed(&e))?)
+    };
     let mut reader = master.try_clone_reader().map_err(|e| failed(&e))?;
     let mut writer = master.take_writer().map_err(|e| failed(&e))?;
     // The console asks where the cursor is and starts nothing until it's told.
@@ -384,6 +387,13 @@ pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Durat
         std::thread::sleep(Duration::from_millis(50));
     };
     if stopped.is_err() {
+        // Windows Server 2022's console host can hang closing a console that programs are still
+        // attached to, and they then keep running: end everything the program started first.
+        if let Some(pid) = child.process_id() {
+            let taskkill =
+                std::env::var_os("SystemRoot").map_or_else(|| "taskkill".into(), |r| std::path::PathBuf::from(r).join("System32").join("taskkill.exe"));
+            let _ = crate::process::Process::new(taskkill).args(["/T", "/F", "/PID", &pid.to_string()]).timeout(Duration::from_secs(10)).run();
+        }
         let _ = child.kill();
     } else {
         // The console sends what the program drew a moment after it exits, and closing it first
@@ -418,13 +428,36 @@ pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Durat
 mod console_tests {
     use super::*;
 
+    /// Runs `f` while this process starts other programs, as the app and other tests do. On
+    /// Windows Server 2022 a program started while a console opens inherits handles that keep the
+    /// console open until the program ends. Six programs at most, ended afterwards.
+    fn while_other_programs_start<R>(f: impl FnOnce() -> R) -> R {
+        let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+        let starter = std::thread::spawn(move || {
+            (0..6)
+                .filter_map(|_| {
+                    let p = crate::process::Process::new(&comspec).args(["/c", "ping -n 12 127.0.0.1 >nul"]).timeout(Duration::from_secs(20)).spawn().ok();
+                    std::thread::sleep(Duration::from_millis(3));
+                    p
+                })
+                .collect::<Vec<_>>()
+        });
+        let r = f();
+        let started = starter.join().unwrap_or_default();
+        assert_eq!(started.len(), 6, "the other programs didn't start");
+        drop(started);
+        r
+    }
+
     #[test]
     fn reads_what_the_program_drew_and_stops_at_the_deadline() {
         let cmd = PathBuf::from(std::env::var_os("ComSpec").unwrap());
         let echo: Vec<OsString> = ["/c", "echo hello-console & exit 3"].map(OsString::from).to_vec();
-        let (text, code) = console_text(&cmd, &echo, Duration::from_secs(30), None).unwrap();
+        let start = std::time::Instant::now();
+        let (text, code) = while_other_programs_start(|| console_text(&cmd, &echo, Duration::from_secs(30), None)).unwrap();
         assert!(text.contains("hello-console"), "{text:?}");
         assert_eq!(code, Some(3));
+        assert!(start.elapsed() < Duration::from_secs(5), "waited {:?} for a console another program held open", start.elapsed());
         let hang: Vec<OsString> = ["/c", "ping -n 60 127.0.0.1"].map(OsString::from).to_vec();
         assert_eq!(console_text(&cmd, &hang, Duration::from_millis(300), None).unwrap_err().code, ErrorCode::TimedOut);
     }
@@ -438,13 +471,15 @@ mod console_tests {
         std::fs::write(dir.path().join("main.cmd"), "@echo off\r\nstart /b cmd /c \"%~dp0tick.cmd\"\r\nping -n 60 127.0.0.1 >nul\r\n").unwrap();
         let cmd = PathBuf::from(std::env::var_os("ComSpec").unwrap());
         let run = vec![OsString::from("/c"), dir.path().join("main.cmd").into_os_string()];
-        let e = console_text(&cmd, &run, Duration::from_secs(4), None).unwrap_err();
-        assert_eq!(e.code, ErrorCode::TimedOut);
-        assert!(ticks.is_file(), "the second program never ran");
-        std::thread::sleep(Duration::from_secs(2));
-        let before = std::fs::metadata(&ticks).unwrap().len();
-        std::thread::sleep(Duration::from_secs(4));
-        assert_eq!(std::fs::metadata(&ticks).unwrap().len(), before, "the second program is still running");
+        while_other_programs_start(|| {
+            let e = console_text(&cmd, &run, Duration::from_secs(4), None).unwrap_err();
+            assert_eq!(e.code, ErrorCode::TimedOut);
+            assert!(ticks.is_file(), "the second program never ran");
+            std::thread::sleep(Duration::from_secs(2));
+            let before = std::fs::metadata(&ticks).unwrap().len();
+            std::thread::sleep(Duration::from_secs(4));
+            assert_eq!(std::fs::metadata(&ticks).unwrap().len(), before, "the second program is still running");
+        });
     }
 }
 
@@ -833,7 +868,11 @@ mod unix {
 
         let pty = native_pty_system();
         let size = PtySize { rows: spec.terminal.rows, cols: spec.terminal.cols, pixel_width: 0, pixel_height: 0 };
-        let pair = pty.openpty(size).map_err(|e| to_err("opening a pseudo-terminal", e))?;
+        let pair = {
+            // A program another thread started while the terminal opened would hold it open.
+            let _starting = crate::process::STARTING.write().unwrap_or_else(PoisonError::into_inner);
+            pty.openpty(size).map_err(|e| to_err("opening a pseudo-terminal", e))?
+        };
 
         let mut cmd = CommandBuilder::new(&program);
         for a in &pre_args {
