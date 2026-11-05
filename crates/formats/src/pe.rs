@@ -757,7 +757,12 @@ pub fn parse_resources(data: &[u8], max_entries: usize) -> Result<Resources, For
             let (Some(name), Some(target)) = (r.u32_le(e), r.u32_le(e + 4)) else { break };
             let label = if name & 0x8000_0000 != 0 {
                 let so = (name & 0x7fff_ffff) as usize;
-                let Some(label) = r.u16_le(so).and_then(|len| utf16_at(&r, so + 2, usize::from(len))) else {
+                let Some(label) = r.u16_le(so).and_then(|len| {
+                    let start = so.checked_add(2)?;
+                    let units = usize::from(len);
+                    r.slice(start, units.checked_mul(2)?)?;
+                    utf16_at(&r, start, units)
+                }) else {
                     res.warnings.push("resource name runs past the directory; skipped an entry".into());
                     continue;
                 };
