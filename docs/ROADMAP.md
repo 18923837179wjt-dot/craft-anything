@@ -651,6 +651,8 @@ Owner: open · Status: in progress
       Go's root `main.go`, and one root `.csproj` also launch for screenshots, self-tests and Play;
       existing packaged programs, Rust, Electron and game-engine paths keep priority — PR #950
       — claimed: Codex, branch bugfix/r2.7-new-project-toolchains
+- [x] Runtime window capture follows runner descendants (including `go run`) and reads controls
+      from the same process that supplied the picture, without falling back to unrelated names — PR #950
 - [ ] Extend launch recipes beyond conventional root entrypoints: Python package scripts, Go
       `cmd/` layouts, and Java build outputs; build checks already use their toolchain commands
 - [ ] Audit relative project placements in build, option-run and Play paths too: runtime window

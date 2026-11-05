@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+mod process_tree;
+
 /// Largest picture kept inline in the evidence (bigger ones are only written to `output`).
 const MAX_INLINE: usize = 8 * 1024 * 1024;
 /// Most UI elements saved to `ui_tree`.
@@ -97,15 +99,24 @@ fn native_window_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
         std::thread::sleep(Duration::from_millis(200));
     }
     let name = p.program.file_stem().map(|s| s.to_string_lossy().into_owned());
-    let shot = craft_anything_platform::window::capture_window(running.pid(), name.as_deref());
+    let shot = process_tree::capture(
+        running.pid(),
+        || process_tree::snapshot(&ctx.cancel),
+        |pid| {
+            if ctx.cancel.is_cancelled() {
+                return Err(ToolError::cancelled());
+            }
+            craft_anything_platform::window::capture_window(pid, None)
+        },
+    );
     // Read while it still runs; a tree that can't be read is only left out.
-    let tree = p.ui_tree.as_ref().map(|_| super::apple_runtime::ui_tree(ctx, running.pid(), UI_TREE_NODES));
+    let tree = shot.as_ref().ok().and_then(|(pid, _)| p.ui_tree.as_ref().map(|_| super::apple_runtime::ui_tree(ctx, *pid, UI_TREE_NODES)));
     // Always closed again, picture or not, and confirmed before we return (a caller such as the
     // CLI may exit right after, before a background kill would happen).
     if !running.kill_and_wait(Duration::from_secs(10)) {
         log::warn!("{} may still be running", p.program.display());
     }
-    let shot = shot?;
+    let (_, shot) = shot?;
     let png = encode_png(&Image { width: shot.width, height: shot.height, rgba: shot.rgba })?;
     if let Some(out) = &p.output {
         if !out.is_absolute() {

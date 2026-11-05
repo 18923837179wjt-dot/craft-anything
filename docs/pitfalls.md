@@ -138,6 +138,10 @@ call it and make them `wait` for the result, not `run_steps(n)`.
 
 ## Building and running
 
+**A runner's PID isn't the window owner's.** `go run` starts a compiled child, so picturing the
+runner missed the app (or a name fallback found another app). Search only the launched process
+and its descendants, and read the UI tree from the same PID that supplied the picture.
+
 **Runtime capture passed relative paths to a tool that needs absolute ones.** With a relative
 project placement, the selected virtualenv interpreter and artifact paths stayed relative;
 PATH lookup can return a relative path too. Resolve workspace paths against the process's
