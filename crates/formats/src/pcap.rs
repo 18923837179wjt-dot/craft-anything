@@ -756,14 +756,27 @@ pub fn qtype_name(t: u16) -> String {
     }
 }
 
-/// A (possibly compressed) DNS name at `off`; returns the name and the offset after it.
-fn dns_name(msg: &[u8], mut off: usize) -> Option<(String, usize)> {
+fn dns_sd_service_label(label: &[u8]) -> bool {
+    let Some(name) = label.strip_prefix(b"_") else { return false };
+    // RFC 6763 §7 / RFC 6335 §5.1, excluding the leading underscore.
+    (1..=15).contains(&name.len())
+        && name.first().is_some_and(u8::is_ascii_alphanumeric)
+        && name.last().is_some_and(u8::is_ascii_alphanumeric)
+        && name.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+        && name.iter().any(u8::is_ascii_alphabetic)
+        && !name.windows(2).any(|pair| pair == b"--")
+}
+
+/// A DNS name, the offset after it, and whether its wire labels name a DNS-SD instance.
+fn dns_name(msg: &[u8], mut off: usize) -> Option<(String, usize, bool)> {
     let mut out = String::new();
     let mut after: Option<usize> = None;
+    let mut labels = 0;
+    let mut service_instance = false;
     for _ in 0..128 {
         let len = *msg.get(off)?;
         match len {
-            0 => return Some((if out.is_empty() { ".".into() } else { out }, after.unwrap_or(off + 1))),
+            0 => return Some((if out.is_empty() { ".".into() } else { out }, after.unwrap_or(off + 1), labels >= 4 && service_instance)),
             l if l & 0xc0 == 0xc0 => {
                 let ptr = usize::from(u16::from_be_bytes([l & 0x3f, *msg.get(off + 1)?]));
                 after.get_or_insert(off + 2);
@@ -774,6 +787,14 @@ fn dns_name(msg: &[u8], mut off: usize) -> Option<(String, usize)> {
             }
             l if l < 64 => {
                 let label = msg.get(off + 1..off + 1 + usize::from(l))?;
+                // Match Instance / _service / _tcp|_udp / Domain before rendering:
+                // a literal dot inside one wire label is not a label boundary.
+                match labels {
+                    1 => service_instance = dns_sd_service_label(label),
+                    2 => service_instance &= label.eq_ignore_ascii_case(b"_tcp") || label.eq_ignore_ascii_case(b"_udp"),
+                    _ => {}
+                }
+                labels += 1;
                 if !out.is_empty() {
                     out.push('.');
                 }
@@ -801,7 +822,7 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
     let mut out = Dns { id, response: flags & 0x8000 != 0, rcode: (flags & 0xf) as u8, questions: Vec::new(), answers: Vec::new(), incomplete: false };
     let mut off = 12usize;
     for _ in 0..qd {
-        let Some((name, next)) = dns_name(msg, off) else {
+        let Some((name, next, _)) = dns_name(msg, off) else {
             out.incomplete = true;
             break;
         };
@@ -814,7 +835,7 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
     }
     if !out.incomplete {
         for _ in 0..an.min(64) {
-            let Some((name, next)) = dns_name(msg, off) else {
+            let Some((name, next, service_instance)) = dns_name(msg, off) else {
                 out.incomplete = true;
                 break;
             };
@@ -836,8 +857,8 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
                 )
                 .to_string(),
                 (28, 16) => Ipv6Addr::from(<[u8; 16]>::try_from(rd).unwrap_or([0; 16])).to_string(),
-                (2 | 5 | 12, _) => dns_name(msg, rd_off).map(|(n, _)| n).unwrap_or_default(),
-                (15, _) => dns_name(msg, rd_off + 2).map(|(n, _)| n).unwrap_or_default(),
+                (2 | 5 | 12, _) => dns_name(msg, rd_off).map(|(n, _, _)| n).unwrap_or_default(),
+                (15, _) => dns_name(msg, rd_off + 2).map(|(n, _, _)| n).unwrap_or_default(),
                 (16, _) => {
                     // RFC 1035 §3.3.14: one TXT RDATA holds one or more
                     // length-prefixed character strings, and a zero-length
@@ -849,7 +870,10 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
                     // UPDATE's answer section holds prerequisites. ANY/NONE
                     // prerequisites use empty RDATA and zero TTL (RFC 2136 §2.4).
                     let empty_prerequisite = opcode == 5 && matches!(class, 254 | 255) && ttl == 0;
-                    out.incomplete |= rd.is_empty() && !empty_prerequisite;
+                    // DNS-SD receivers treat empty RDATA as an empty string
+                    // (RFC 6763 §6.1), for both multicast and unicast DNS.
+                    let empty_service_txt = opcode == 0 && service_instance;
+                    out.incomplete |= rd.is_empty() && !empty_prerequisite && !empty_service_txt;
                     while let Some(&len) = rd.get(pos) {
                         let len = usize::from(len);
                         let end = pos + 1 + len;
