@@ -11,7 +11,8 @@ use crate::bytes::Reader;
 use crate::{FormatError, hex_addr};
 use object::{Object, ObjectSection, ObjectSegment};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 
 /// Largest input we parse (256 MiB).
 pub const MAX_INPUT: usize = 256 << 20;
@@ -673,6 +674,20 @@ fn find_pclntab(file: &object::File<'_>, data: &[u8], container: &str, text_va: 
             None => warnings.push(format!("{want} is present but could not be read within its declared section")),
         }
     }
+    // Index file-backed extents once; candidates advance monotonically through them.
+    let mut ranges: Vec<_> = file
+        .sections()
+        .filter_map(|s| {
+            let (off, size) = s.file_range()?;
+            let start = usize::try_from(off).ok()?;
+            let size = usize::try_from(size).unwrap_or(usize::MAX);
+            let end = start.saturating_add(size).min(data.len());
+            (start < end).then_some((start, end))
+        })
+        .collect();
+    ranges.sort_unstable();
+    let mut ranges = ranges.into_iter().peekable();
+    let mut active_ends = BinaryHeap::new();
     // Scan for a header with plausible fields (PE files and stripped section tables).
     let mut i = 0usize;
     let mut tries = 0usize;
@@ -682,8 +697,19 @@ fn find_pclntab(file: &object::File<'_>, data: &[u8], container: &str, text_va: 
         let Some(pos) = pos else { break };
         let Some(at) = i.checked_add(pos) else { break };
         tries += 1;
-        // A scan may recover a later header, but cannot widen a known section's extent.
-        let size = named_section.filter(|&(start, end)| at == start || (at >= start && at < end)).map_or(data.len() - at, |(_, end)| end.saturating_sub(at));
+        while ranges.peek().is_some_and(|&(start, _)| start <= at) {
+            let Some((_, end)) = ranges.next() else { break };
+            if end > at {
+                active_ends.push(Reverse(end));
+            }
+        }
+        while active_ends.peek().is_some_and(|&Reverse(end)| end <= at) {
+            active_ends.pop();
+        }
+        // Overlapping sections all constrain a candidate; retain zero-size named bounds too.
+        let end = active_ends.peek().map_or(data.len(), |&Reverse(end)| end);
+        let end = named_section.filter(|&(start, end)| at == start || (at >= start && at < end)).map_or(end, |(_, named_end)| end.min(named_end));
+        let size = end.saturating_sub(at);
         if pcln_header(&r, at).is_some()
             && let Some(t) = read_pclntab(&r, at, size, "scan", None, text_va)
             && !t.functions.is_empty()
@@ -906,6 +932,93 @@ mod tests {
         let (data, _, partial) = named_pclntab_with_unreadable_names(false);
         assert_eq!(inspect(&data, None).unwrap().pclntab, Some(partial));
         assert!(functions(&data).is_empty());
+    }
+
+    #[test]
+    fn pclntab_scan_respects_unnamed_section_entry_bounds() {
+        let mut data = fx::go_elf();
+        let (header, start, _) = pclntab_section(&data);
+        data[header..header + 4].fill(0);
+        // A rejected header in .text must stop constraining candidates after that section.
+        let prefix = data[start..start + 8].to_vec();
+        data[0x1000..0x1008].copy_from_slice(&prefix);
+        let complete = inspect(&data, None).unwrap().pclntab.unwrap();
+        assert_eq!(complete.located_by, "scan");
+        let expected: Vec<_> = fx::GO_FUNCS.iter().map(|(name, off)| GoFunction { name: (*name).to_string(), entry: fx::GO_TEXT_VA + *off }).collect();
+        assert_eq!(complete.functions, expected);
+
+        let functab = Reader::new(&data).u64_le(start + 64).unwrap() as usize;
+        data[header + 32..header + 40].copy_from_slice(&((functab + 4) as u64).to_le_bytes());
+        assert!(inspect(&data, None).unwrap().pclntab.is_none());
+        assert!(functions(&data).is_empty());
+    }
+
+    #[test]
+    fn pclntab_scan_requires_names_to_end_inside_unnamed_sections() {
+        let mut data = fx::go_elf();
+        let (header, start, size) = pclntab_section(&data);
+        let r = Reader::new(&data);
+        let names = r.u64_le(start + 32).unwrap() as usize;
+        let functab = r.u64_le(start + 64).unwrap() as usize;
+        let names = data[start + names..start + functab].to_vec();
+        data[start + size..start + size + names.len()].copy_from_slice(&names);
+        data[start + 32..start + 40].copy_from_slice(&(size as u64).to_le_bytes());
+        data[header..header + 4].fill(0);
+        data[header + 32..header + 40].copy_from_slice(&((size + names.len()) as u64).to_le_bytes());
+        // Keep the enclosing PT_LOAD consistent with the extended section.
+        let mapped_size = (start + size + names.len() - 0x1000) as u64;
+        data[0x60..0x68].copy_from_slice(&mapped_size.to_le_bytes());
+        data[0x68..0x70].copy_from_slice(&mapped_size.to_le_bytes());
+        let complete = inspect(&data, None).unwrap().pclntab.unwrap();
+        assert_eq!(complete.located_by, "scan");
+        let expected: Vec<_> = fx::GO_FUNCS.iter().map(|(name, off)| GoFunction { name: (*name).to_string(), entry: fx::GO_TEXT_VA + *off }).collect();
+        assert_eq!(complete.functions, expected);
+
+        let first_name_len = fx::GO_FUNCS[0].0.len();
+        assert_eq!(data[start + size + first_name_len], 0);
+        data[header + 32..header + 40].copy_from_slice(&((size + first_name_len) as u64).to_le_bytes());
+        assert!(inspect(&data, None).unwrap().pclntab.is_none());
+        assert!(functions(&data).is_empty());
+    }
+
+    #[test]
+    fn pclntab_scan_uses_the_shortest_overlapping_section_end() {
+        let mut original = fx::go_elf();
+        let (header, start, size) = pclntab_section(&original);
+        let text_header = header - 64;
+        let text_start = Reader::new(&original).u64_le(text_header + 24).unwrap() as usize;
+        original[header..header + 4].fill(0);
+        original[text_header + 32..text_header + 40].copy_from_slice(&((start + size - text_start) as u64).to_le_bytes());
+        let complete = inspect(&original, None).unwrap().pclntab.unwrap();
+        assert_eq!(complete.located_by, "scan");
+        assert_eq!(complete.functions.len(), fx::GO_FUNCS.len());
+
+        let functab = Reader::new(&original).u64_le(start + 64).unwrap() as usize;
+        for (section, section_start) in [(header, start), (text_header, text_start)] {
+            let mut data = original.clone();
+            let size = start + functab + 4 - section_start;
+            data[section + 32..section + 40].copy_from_slice(&(size as u64).to_le_bytes());
+            assert!(inspect(&data, None).unwrap().pclntab.is_none());
+            assert!(functions(&data).is_empty());
+        }
+    }
+
+    #[test]
+    fn pclntab_scan_keeps_whole_file_fallback_outside_known_sections() {
+        for stripped in [false, true] {
+            let mut data = fx::go_elf();
+            let (header, _, _) = pclntab_section(&data);
+            data[header..header + 4].fill(0);
+            data[header + 32..header + 40].fill(0);
+            if stripped {
+                data[40..48].fill(0); // e_shoff
+                data[60..64].fill(0); // e_shnum and e_shstrndx
+            }
+            let complete = inspect(&data, None).unwrap().pclntab.unwrap();
+            assert_eq!(complete.located_by, "scan");
+            let expected: Vec<_> = fx::GO_FUNCS.iter().map(|(name, off)| GoFunction { name: (*name).to_string(), entry: fx::GO_TEXT_VA + *off }).collect();
+            assert_eq!(complete.functions, expected);
+        }
     }
 
     #[test]
