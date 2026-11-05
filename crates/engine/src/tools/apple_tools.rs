@@ -592,6 +592,7 @@ fn apple_signature_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         ToolError::new(ErrorCode::NotSupported, "the code signature lies outside the file").with_remediation("The file may be truncated; check it is complete.")
     })?;
     let sig = codesign::parse(sig_bytes).map_err(|e| format_err(e, "a code signature"))?;
+    let sig_bytes = sig_bytes.get(..(sig.length as usize).min(sig_bytes.len())).unwrap_or_default();
     let checks: Vec<Value> = sig
         .code_directories
         .iter()
@@ -1375,6 +1376,7 @@ fn apple_dylibs_resolve(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
 mod tests {
     use super::super::native_common::test_support::{call, call_err, engine_with};
     use crate::Engine;
+    use craft_anything_formats::codesign;
     use craft_anything_testkit::apple as fx;
     use serde_json::json;
 
@@ -1423,6 +1425,55 @@ mod tests {
         let unsigned = engine_with("plain", &craft_anything_testkit::macho64());
         let u = call(&unsigned, "apple_signature_show", json!({}));
         assert_eq!(u["result"]["signed"], false);
+    }
+
+    fn signature_file(signature: &[u8]) -> Vec<u8> {
+        // One load command fits in the fixture's 64-byte header area.
+        let command: Vec<u8> = [0x1du32, 16, 64, signature.len() as u32].into_iter().flat_map(u32::to_le_bytes).collect();
+        let mut bytes = fx::macho_min(fx::CPU_X86_64, 2, &[command], &[]);
+        assert_eq!(bytes.len(), 64);
+        bytes.extend_from_slice(signature);
+        bytes
+    }
+
+    #[test]
+    fn signature_special_slots_ignore_bytes_past_superblob() {
+        let mut signature = fx::code_signature_blob();
+        let parsed = codesign::parse(&signature).unwrap();
+        let entitlements = parsed.blobs.iter().find(|b| b.slot == 5).unwrap();
+        // Retain the child's header, but leave its payload outside the declared signature.
+        signature[4..8].copy_from_slice(&(entitlements.offset + 8).to_be_bytes());
+        let e = engine_with("short-signature", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        assert!(r["result"]["entitlements"].is_null());
+        let special = r["result"]["hash_checks"][0]["result"]["special_slots"].as_array().unwrap();
+        assert_eq!(special.iter().find(|s| s["what"] == "entitlements").unwrap()["status"], "not-checked");
+
+        // The same complete child is still checked when it lies inside the declared extent.
+        signature[4..8].copy_from_slice(&parsed.length.to_be_bytes());
+        let e = engine_with("complete-signature", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        assert_eq!(r["result"]["entitlements"]["com.apple.security.network.client"], true);
+        let special = r["result"]["hash_checks"][0]["result"]["special_slots"].as_array().unwrap();
+        assert_eq!(special.iter().find(|s| s["what"] == "entitlements").unwrap()["status"], "mismatch");
+    }
+
+    #[test]
+    fn signature_stored_hashes_ignore_bytes_past_superblob() {
+        let mut signature = fx::assemble_superblob(&[(0, fx::code_directory_blob())]);
+        let parsed = codesign::parse(&signature).unwrap();
+        let cd = &parsed.code_directories[0];
+        let hash_offset = parsed.length - cd.offset as u32;
+        signature[cd.offset + 16..cd.offset + 20].copy_from_slice(&hash_offset.to_be_bytes());
+        signature[cd.offset + 24..cd.offset + 28].copy_from_slice(&0u32.to_be_bytes());
+        // LC_CODE_SIGNATURE includes these bytes; the superblob does not.
+        signature.extend_from_slice(&[0; 32]);
+        let e = engine_with("external-page-hash", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        let checks = &r["result"]["hash_checks"][0]["result"];
+        assert_eq!(checks["pages_unchecked"], 1);
+        assert_eq!(checks["pages_matched"], 0);
+        assert!(checks["pages_mismatched"].as_array().unwrap().is_empty());
     }
 
     #[test]
