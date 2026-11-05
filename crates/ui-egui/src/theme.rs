@@ -667,7 +667,8 @@ mod tests {
             ("Arabic", "مرحبا بالعالم"),
             ("Hebrew", "שלום עולם"),
             ("Hindi", "नमस्ते दुनिया"),
-            ("Vietnamese", "Tiếng Việt"),
+            // Every Vietnamese tone mark on every vowel shape, plus ơ, ư and đ (the UI catalog uses them all).
+            ("Vietnamese", "Tiếng Việt ơ ư Ư đ Đ ạ ả ấ ầ ẩ ẫ ậ ắ ằ ẳ ẵ ặ ẹ ẻ ẽ ề ể ễ ệ ỉ ị ọ ỏ ố ồ ổ ỗ ộ ớ ờ Ở ở ỡ ợ ụ ủ Ứ ứ ừ ử ữ ự ỳ ỹ"),
             ("Russian", "Привет"),
             ("Greek", "Γειά σου"),
             ("arrows", "Settings → AI ← ↑ ↓"),

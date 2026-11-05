@@ -1,7 +1,7 @@
 # UI localisation
 
-The desktop app offers **Čeština** (`cs`), **Deutsch** (`de`), **한국어** (`ko`), **Русский** (`ru`), **简体中文** (`zh-hans`)
-and **繁體中文** (`zh-hant`), alongside English, French and Japanese, in **Settings → General → Language**. The choice is saved in the
+The desktop app offers **Čeština** (`cs`), **Deutsch** (`de`), **한국어** (`ko`), **Русский** (`ru`), **Tiếng Việt** (`vi`),
+**简体中文** (`zh-hans`) and **繁體中文** (`zh-hant`), alongside English, French and Japanese, in **Settings → General → Language**. The choice is saved in the
 existing `language` setting. **System** uses the operating system's preferred
 supported language; if none matches, it uses English. An explicit choice takes
 precedence over the system language.
@@ -21,9 +21,24 @@ Product and technology names, tool ids and shortcuts keep their spelling. The ki
 a request ("a game", "a website") also knows the German words *Spiel*, *Webseite* and *Internetseite*,
 so a translated suggestion keeps its project kind.
 
+## Vietnamese
+
+**Tiếng Việt** (`vi`) addresses the person as *bạn*. `vi` and `vi-VN` select it, as does the system
+language when it is Vietnamese. `crates/ui-egui/src/i18n/vi.tsv` has the same keys as the other
+catalogs, written from the English source strings in NFC (precomposed) Unicode. It was drafted with
+an AI and not yet reviewed by a native speaker; corrections are welcome. Product, technology and
+engine names, tool ids and shortcuts keep their spelling. The glossary: *Phòng sạch* (Clean room),
+*Chuyên sâu* (Deep), *Tìm hiểu / Xây dựng / Kiểm tra / Tinh chỉnh / Sẵn sàng*
+(Study / Build / Check / Refine / Ready), *Bằng chứng* (Evidence), *Phát hiện* (finding),
+*Dự án* (Project), *Mục tiêu* (target), *Công cụ* (tool), *Bàn làm việc* (workbench),
+*Cài đặt* (Settings) and *Dựng lại* (rebuild).
+
+The kind detection that reads a request also knows *trò chơi* for a game and *trang web* for a
+website, so a translated suggestion keeps its project kind.
+
 ## Scope and format
 
-`crates/ui-egui/src/i18n/cs.tsv`, `de.tsv`, `ko.tsv`, `ru.tsv`, `zh-hans.tsv` and `zh-hant.tsv` contain original
+`crates/ui-egui/src/i18n/cs.tsv`, `de.tsv`, `ko.tsv`, `ru.tsv`, `vi.tsv`, `zh-hans.tsv` and `zh-hant.tsv` contain original
 translations under the repository's MIT OR Apache-2.0 licence. Each UTF-8 line
 has two columns: `English source<TAB>translation`. Comments begin with `#`;
 `\n` represents a newline. The language registry in `i18n.rs` embeds the catalogs.
@@ -39,7 +54,7 @@ descriptions, logs and exported reports retain their original text. The CLI,
 MCP, tool IDs, stored project data and the separate browser viewer are unchanged.
 
 Keep placeholders such as `{name}` and `{n}` intact, along with command IDs,
-shortcuts, escapes and trailing `…`. Update every catalog (`cs`, `de`, `ko`, `ru`, `zh-hans`, `zh-hant`)
+shortcuts, escapes and trailing `…`. Update every catalog (`cs`, `de`, `ko`, `ru`, `vi`, `zh-hans`, `zh-hant`)
 when English source keys change; the tests require matching key sets. Common terms include 净室 / 淨室 (Clean room), 深度 (Deep),
 构建 / 建置 (Build), 证据 / 證據 (Evidence), and 项目 / 專案 (Project).
 The Korean catalog `ko.tsv` uses 클린룸 (Clean room), 심층 (Deep), 분석 / 만들기 / 검사 / 완성
@@ -70,7 +85,10 @@ The existing snapshot example accepts any catalog code with `--lang`, such as
 cargo run -p craft-anything-ui-egui --example snapshot -- --lang zh-hant --only settings --out-dir target/snapshots/zh-hant
 ```
 
-Chinese and Korean glyphs use the existing craft-fonts fallback, which release and CI builds
+Vietnamese needs craft-fonts too: the bundled DM Sans and egui's default fonts lack the letters with
+stacked marks (ạ, ả, ấ, ế, ơ, ư, ữ…), so a build without craft-fonts shows them as boxes. With
+craft-fonts, Noto Sans CJK SC supplies those letters (a different face from the DM Sans around them);
+the script test in `theme.rs` checks every one of them. Chinese and Korean glyphs use the existing craft-fonts fallback, which release and CI builds
 already include. Local builds must set `CRAFT_FONTS_DIR` to a craft-fonts checkout
 before compiling to get the same glyph coverage. The catalogs add no font assets.
 Check each script, clipping, narrow windows and native file dialogs visually
