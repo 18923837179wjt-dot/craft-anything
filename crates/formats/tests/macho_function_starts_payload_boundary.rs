@@ -42,6 +42,13 @@ fn function_addresses_do_not_wrap_on_overflow() {
 }
 
 #[test]
+fn complete_starts_before_an_overflowing_delta_are_preserved() {
+    let binary = function_starts(&[4, 1, 0], &[], u64::MAX - 4);
+    assert_eq!(binary.function_starts, [u64::MAX]);
+    assert!(!binary.warnings.is_empty());
+}
+
+#[test]
 fn complete_multibyte_deltas_and_the_terminator_are_preserved() {
     let binary = function_starts(&[0x80, 0x01, 0x10, 0], &[0x7f], 0x1000);
     assert_eq!(binary.function_starts, [0x1080, 0x1090]);
