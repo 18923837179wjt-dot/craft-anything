@@ -151,6 +151,12 @@ impl KeyStore {
         if t.remove(backend).is_some() {
             self.write_file(&t)?;
         }
+        // A locked or busy keychain may have refused, and it's read first, so the key would still
+        // work. Reading back, not the delete's result: with no keychain at all the delete fails too.
+        if self.use_keychain && keychain::get(backend).is_some() {
+            return Err(ToolError::new(ErrorCode::NoPermission, "The system keychain still has this key, so it wasn't removed.")
+                .with_remediation("Unlock the keychain and try again, or delete the entry from your keychain app."));
+        }
         Ok(())
     }
 }

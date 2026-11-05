@@ -1923,15 +1923,16 @@ mod picking_up_a_build {
 fn a_saved_asset_key_gets_an_api_builders_tool_past_the_key_check() {
     let dir = tempfile::tempdir().unwrap();
     let ws = Workspace::create(dir.path(), "x", "Make a game", TargetRef::None).unwrap();
-    let worker = check_worker(&ws, false);
+    let mut worker = check_worker(&ws, false);
     worker.attach(&ws).unwrap();
     let call =
-        || worker.engine.call("assets_image_generate", json!({"prompt": "a crate", "save_as": "crate.png"}), CallOptions::new(Caller::Ui)).err().unwrap();
-    assert_eq!(call().code, ErrorCode::BadSettings, "no key loaded yet");
+        |w: &Worker| w.engine.call("assets_image_generate", json!({"prompt": "a crate", "save_as": "crate.png"}), CallOptions::new(Caller::Ui)).err().unwrap();
+    assert_eq!(call(&worker).code, ErrorCode::BadSettings, "no key loaded yet");
     let store = crate::KeyStore::file_only(dir.path().join("keys.toml"));
     store.set(crate::keys::FAL_KEY, "k-1").unwrap();
     worker.load_asset_keys(&store);
-    assert_eq!(call().code, ErrorCode::NoPermission);
+    assert_eq!(call(&worker).code, ErrorCode::NoPermission);
+    assert!(worker.assets, "the brief and the tools go by the same read");
 }
 
 fn check_worker(ws: &Workspace, deep: bool) -> Worker {

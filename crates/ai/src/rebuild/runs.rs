@@ -1,7 +1,9 @@
 //! Several rebuilds at once. A [`RunSet`] keeps every project's run by folder: up to its limit
 //! work at the same time, the rest wait in order and start as others finish. The app and the
 //! rebuild tools both hold one; each run keeps its own project's feed, so nothing here depends on
-//! which project is on screen.
+//! which project is on screen. A run whose AI uses our own agent loop works alone: its tools run in
+//! the app's session, which points at one project at a time, so a run starting beside it would send
+//! its files and asset spending to the other project.
 
 use super::*;
 use std::collections::{HashMap, VecDeque};
@@ -33,10 +35,23 @@ pub struct RunSet {
     limit: usize,
     /// Running and finished runs (a finished one keeps its preview and unsent notes).
     runs: HashMap<PathBuf, RebuildRun>,
-    queue: VecDeque<(Workspace, RunOptions)>,
+    /// Waiting runs, and whether each must work alone (decided when queued: `poll` runs every frame
+    /// and looking it up can read the settings file).
+    queue: VecDeque<(Workspace, RunOptions, bool)>,
+    /// The last run that had to work alone; nothing else starts while it's working.
+    alone: Option<PathBuf>,
     starter: Starter,
     /// A [`keep_queue_moving`] thread is looking after the queue.
     watched: bool,
+}
+
+/// Whether this run's tools would run in the app's session: its Builder, or the Extractor that may
+/// work for it, is an API backend. Agent apps have a tool server of their own.
+fn must_work_alone(hub: &AiHub, ws: &Workspace, opts: &RunOptions) -> bool {
+    let cfg = hub.config();
+    let in_session = |e: &crate::BackendEntry| e.config.kind != BackendKind::AgentCli;
+    builder_backend(&cfg, opts.backend.as_deref().or_else(|| super::project_builder(&cfg, ws))).is_ok_and(|e| in_session(&e))
+        || hub.chosen(Role::Extractor).and_then(|n| cfg.get(&n).cloned()).is_some_and(|e| in_session(&e))
 }
 
 impl std::fmt::Debug for RunSet {
@@ -48,7 +63,13 @@ impl std::fmt::Debug for RunSet {
 impl RunSet {
     /// At most `limit` runs work at once (at least one).
     pub fn new(limit: usize) -> RunSet {
-        RunSet { limit: limit.max(1), runs: HashMap::new(), queue: VecDeque::new(), starter: Box::new(RebuildRun::start), watched: false }
+        RunSet { limit: limit.max(1), runs: HashMap::new(), queue: VecDeque::new(), alone: None, starter: Box::new(RebuildRun::start), watched: false }
+    }
+
+    /// A run may start now: there's a place, and neither it nor anyone working needs to be alone.
+    fn has_room(&self, alone: bool) -> bool {
+        let active = self.active();
+        active < self.limit && (!alone || active == 0) && !self.alone.as_ref().is_some_and(|root| self.is_running(root))
     }
 
     /// Start runs another way (a fork's runner, or a test's).
@@ -66,24 +87,29 @@ impl RunSet {
         self.limit
     }
 
-    /// Start a run on `ws`, or queue it when `limit` are already working. A project that is
-    /// working or queued is refused.
+    /// Start a run on `ws`, or queue it when `limit` are already working or it has to wait to work
+    /// alone. Nothing overtakes the queue, so one waiting to be alone gets its turn. A project that
+    /// is working or queued is refused.
     pub fn start(&mut self, hub: &AiHub, ws: Workspace, opts: RunOptions) -> Result<Started, ToolError> {
         if self.is_running(&ws.root) || self.position(&ws.root).is_some() {
             return Err(
                 ToolError::new(ErrorCode::BadInput, "This project is already building.").with_remediation("Add to it while it works, or stop it first.")
             );
         }
-        if self.active() < self.limit {
+        let alone = must_work_alone(hub, &ws, &opts);
+        if self.queue.is_empty() && self.has_room(alone) {
             let root = ws.root.clone();
             let run = (self.starter)(hub, ws, opts)?;
+            if alone {
+                self.alone = Some(root.clone());
+            }
             self.runs.insert(root, run);
             return Ok(Started::Running);
         }
         // Fail now, not when its turn comes, when no coding agent is set up.
         let cfg = hub.config();
         builder_backend(&cfg, opts.backend.as_deref().or_else(|| super::project_builder(&cfg, &ws)))?;
-        self.queue.push_back((ws, opts));
+        self.queue.push_back((ws, opts, alone));
         Ok(Started::Queued { position: self.queue.len() })
     }
 
@@ -94,12 +120,15 @@ impl RunSet {
         for (root, run) in &mut self.runs {
             out.extend(run.poll().into_iter().map(|e| (root.clone(), e)));
         }
-        while self.active() < self.limit {
-            let Some((ws, opts)) = self.queue.pop_front() else { break };
+        while self.queue.front().is_some_and(|(_, _, alone)| self.has_room(*alone)) {
+            let Some((ws, opts, alone)) = self.queue.pop_front() else { break };
             let root = ws.root.clone();
             let mut keep = ws.clone();
             match (self.starter)(hub, ws, opts) {
                 Ok(run) => {
+                    if alone {
+                        self.alone = Some(root.clone());
+                    }
                     self.runs.insert(root, run);
                 }
                 Err(e) => {
@@ -128,7 +157,7 @@ impl RunSet {
 
     /// Its place in the queue (1 starts next).
     pub fn position(&self, root: &Path) -> Option<usize> {
-        self.queue.iter().position(|(ws, _)| ws.root == root).map(|i| i + 1)
+        self.queue.iter().position(|(ws, _, _)| ws.root == root).map(|i| i + 1)
     }
 
     /// How many are waiting.
@@ -154,13 +183,13 @@ impl RunSet {
     /// The projects working or waiting.
     pub fn busy(&self) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = self.runs.iter().filter(|(_, r)| r.is_running()).map(|(p, _)| p.clone()).collect();
-        v.extend(self.queue.iter().map(|(ws, _)| ws.root.clone()));
+        v.extend(self.queue.iter().map(|(ws, _, _)| ws.root.clone()));
         v
     }
 
     /// Stop the project's run, or take it out of the queue.
     pub fn stop(&mut self, root: &Path) -> Stopped {
-        if let Some(i) = self.queue.iter().position(|(ws, _)| ws.root == root) {
+        if let Some(i) = self.queue.iter().position(|(ws, _, _)| ws.root == root) {
             self.queue.remove(i);
             return Stopped::Unqueued;
         }
@@ -261,6 +290,38 @@ mod tests {
         assert_eq!(set.stop(&a.root), Stopped::Nothing);
         set.stop_all();
         assert!(set.position(&a.root).is_none());
+    }
+
+    /// #923: two builds in one session wrote into one project, and spent its asset budget.
+    #[test]
+    fn a_run_in_the_apps_session_works_alone_and_nothing_overtakes_it() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = |n: &str| Workspace::create(d.path(), n, "A game", TargetRef::None).unwrap();
+        let (agent, key, later) = (ws("Agent"), ws("Key"), ws("Later"));
+        let mut s = craft_anything_engine::testing::session();
+        s.settings.ai = toml::from_str(
+            "[[backends]]\nname = \"Agent\"\nkind = \"agent_cli\"\nmodel = \"claude-code\"\n[[backends]]\nname = \"Key\"\nkind = \"openrouter\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        let hub = AiHub::new(Arc::new(Engine::new(s)));
+        let by = |name: &str| RunOptions { backend: Some(name.into()), ..RunOptions::default() };
+        let fake = StandIns::new();
+        let mut set = RunSet::new(4).with_starter(fake.starter());
+
+        assert_eq!(set.start(&hub, agent.clone(), by("Agent")).unwrap(), Started::Running);
+        assert_eq!(set.start(&hub, key.clone(), by("Key")).unwrap(), Started::Queued { position: 1 }, "it waits for the session");
+        assert_eq!(set.start(&hub, later.clone(), by("Agent")).unwrap(), Started::Queued { position: 2 }, "nothing overtakes it");
+        assert!(set.poll(&hub).is_empty() && set.active() == 1);
+
+        fake.finish(&agent.root);
+        set.poll(&hub);
+        assert!(set.is_running(&key.root) && !set.is_running(&later.root), "it has the session to itself, with places free");
+
+        fake.finish(&key.root);
+        set.poll(&hub);
+        assert!(set.is_running(&later.root));
+        assert_eq!(set.start(&hub, agent.clone(), by("Agent")).unwrap(), Started::Running, "agent apps still work side by side");
+        set.stop_all();
     }
 
     #[test]

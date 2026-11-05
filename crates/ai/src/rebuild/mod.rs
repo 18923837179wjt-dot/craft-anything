@@ -246,7 +246,7 @@ impl RebuildRun {
             editor: None,
             notes: notes.clone(),
             feed: feed.clone(),
-            assets: hub.has_asset_keys(),
+            assets: false,
             decompiled: false,
             usage: Some(UsageClock { root: root.clone(), since: Instant::now() }),
             self_check: None,
@@ -498,12 +498,14 @@ impl Worker {
     /// An API backend's builder runs its tools in this session, not in a tool server that loads the
     /// keys itself (#923). Read on the worker because the keychain can block, and for each run so a
     /// key saved outside the app since the last one counts. The session stays held through the
-    /// read, so a key removed meanwhile can't be put back by keys read before it went.
-    fn load_asset_keys(&self, store: &crate::KeyStore) {
+    /// read, so a key removed meanwhile can't be put back by keys read before it went. What the
+    /// brief says about assets comes from the same read, so the two agree.
+    fn load_asset_keys(&mut self, store: &crate::KeyStore) {
         let mut session = self.engine.session();
         session.label("Load the asset keys");
         let providers = session.ext.get::<craft_anything_engines::assets::AssetProviders>().map(|p| p.as_ref().clone()).unwrap_or_default();
         let keys = crate::keys::asset_keys(store, &providers);
+        self.assets = !keys.0.is_empty();
         session.ext.insert(Arc::new(keys));
     }
 
