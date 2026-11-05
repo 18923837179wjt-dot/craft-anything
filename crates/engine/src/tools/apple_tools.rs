@@ -541,7 +541,10 @@ fn check_hashes(slice: &[u8], sig_bytes: &[u8], sig: &codesign::Signature, cd: &
             continue;
         }
         let stored = sig_bytes.get(base.saturating_sub(slot as usize * hs)..base.saturating_sub(slot as usize * hs).saturating_add(hs));
-        let Some(stored) = stored else { continue };
+        let Some(stored) = stored else {
+            special.push(json!({"slot": -slot, "what": what, "status": "not-checked", "stored": null}));
+            continue;
+        };
         let zero = stored.iter().all(|&x| x == 0);
         let actual: Option<Vec<u8>> = match slot {
             2 | 5 | 7 => blob_for(slot as u32).map(<[u8]>::to_vec),
@@ -1474,6 +1477,32 @@ mod tests {
         assert_eq!(checks["pages_unchecked"], 1);
         assert_eq!(checks["pages_matched"], 0);
         assert!(checks["pages_mismatched"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn signature_missing_special_hashes_are_reported() {
+        let mut signature = fx::assemble_superblob(&[(0, fx::code_directory_blob())]);
+        let parsed = codesign::parse(&signature).unwrap();
+        let cd = &parsed.code_directories[0];
+        let special_slots = 7u32;
+        let missing_bytes = special_slots * u32::from(cd.hash_size);
+        let hash_offset = parsed.length - cd.offset as u32 + missing_bytes;
+        signature[cd.offset + 16..cd.offset + 20].copy_from_slice(&hash_offset.to_be_bytes());
+        signature[cd.offset + 24..cd.offset + 28].copy_from_slice(&special_slots.to_be_bytes());
+        signature[cd.offset + 28..cd.offset + 32].copy_from_slice(&0u32.to_be_bytes());
+        // Stored special hashes start at the superblob's end, inside LC_CODE_SIGNATURE only.
+        signature.resize(signature.len() + missing_bytes as usize, 0);
+        let e = engine_with("external-special-hashes", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        let checks = &r["result"]["hash_checks"][0]["result"];
+        assert_eq!(checks["checked"], true);
+        let special = checks["special_slots"].as_array().unwrap();
+        let expected = [(-1, "info-plist"), (-2, "requirements"), (-5, "entitlements"), (-7, "der-entitlements"), (-3, "resources")];
+        assert_eq!(special.len(), expected.len());
+        for (slot, what) in expected {
+            let entry = special.iter().find(|s| s["slot"] == slot).unwrap();
+            assert_eq!(entry, &json!({"slot": slot, "what": what, "status": "not-checked", "stored": null}));
+        }
     }
 
     #[test]
