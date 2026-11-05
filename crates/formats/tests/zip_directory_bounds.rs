@@ -26,6 +26,14 @@ fn directory_names_and_comments_cannot_borrow_end_record_bytes() {
 }
 
 #[test]
+fn directory_extra_fields_cannot_borrow_end_record_bytes() {
+    let mut data = zip_stored(&[("a", b"x")]);
+    let central = data.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    data[central + 30..central + 32].copy_from_slice(&2u16.to_le_bytes());
+    assert_eq!(zip::parse(&data, 10), Err(ZipError::Truncated("directory entry fields")));
+}
+
+#[test]
 fn a_directory_cannot_extend_into_its_end_record() {
     let mut data = zip_stored(&[("a", b"x")]);
     let end = data.len() - 22;
