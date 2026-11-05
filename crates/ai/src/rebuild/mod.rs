@@ -495,8 +495,7 @@ impl Worker {
 
     /// An API backend's builder runs its tools in this session, not in a tool server that loads the
     /// keys itself (#923). Read on the worker because the keychain can block, and for each run so a
-    /// key saved or removed since the last one counts.
-    // shortcut: a key removed mid-run stays loaded until the next run, like a CLI agent's tool server; clear it on removal if people expect it to stop at once.
+    /// key saved outside the app since the last one counts.
     fn load_asset_keys(&self, store: &crate::KeyStore) {
         let providers = self.engine.session().ext.get::<craft_anything_engines::assets::AssetProviders>().map(|p| p.as_ref().clone()).unwrap_or_default();
         let keys = crate::keys::asset_keys(store, &providers);

@@ -722,6 +722,12 @@ impl AiHub {
         self.keys.delete(&keys::asset_key_name(provider))
     }
 
+    /// See [`keys::refresh_loaded`]: for callers that don't hold the session. It can wait for a
+    /// running tool, so never call it from the UI thread or a tool.
+    pub fn refresh_loaded_asset_keys(&self) {
+        keys::refresh_loaded(&mut self.engine.session(), &self.keys);
+    }
+
     /// The provider's key is stored or in its environment variable.
     pub fn has_asset_key(&self, providers: &craft_anything_engines::assets::AssetProviders, provider: &str) -> bool {
         providers.get(provider).is_some_and(|p| keys::asset_key(&self.keys, p.as_ref()).is_some())

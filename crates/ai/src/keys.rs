@@ -37,6 +37,16 @@ pub fn asset_keys(store: &KeyStore, providers: &AssetProviders) -> AssetKeys {
     )
 }
 
+/// After a key changed: keys a run already loaded into `session` follow, so a removed one stops being
+/// spent at once. A session with none loaded stays that way. Reads the keychain, so call it off the UI
+/// thread; a tool passes the session it holds, because locking it again would wait forever.
+pub fn refresh_loaded(session: &mut craft_anything_engine::Session, store: &KeyStore) {
+    if session.ext.get::<AssetKeys>().is_some() {
+        let providers = session.ext.get::<AssetProviders>().map(|p| p.as_ref().clone()).unwrap_or_default();
+        session.ext.insert(std::sync::Arc::new(asset_keys(store, &providers)));
+    }
+}
+
 /// The fal.ai key for game assets: stored, else fal's environment variable.
 pub fn fal_key(store: &KeyStore) -> Option<String> {
     asset_key(store, &craft_anything_engines::assets::fal::Fal::default())
@@ -225,6 +235,27 @@ mod tests {
         s.delete(&asset_key_name("other")).unwrap();
         assert_eq!(asset_keys(&s, &providers).get("other"), None);
         assert_eq!(fal_key(&s).as_deref(), Some("f-1"));
+    }
+
+    /// #923: a key removed in Settings must stop being spent, in a run that already loaded it too.
+    #[test]
+    fn keys_loaded_by_a_run_follow_a_change_and_none_appear_otherwise() {
+        let d = tempfile::tempdir().unwrap();
+        let s = KeyStore::file_only(d.path().join("keys.toml"));
+        let mut providers = AssetProviders::built_in();
+        providers.register(std::sync::Arc::new(Other));
+        s.set(&asset_key_name("other"), "o-1").unwrap();
+        let mut session = craft_anything_engine::testing::session();
+        session.ext.insert(std::sync::Arc::new(providers));
+        refresh_loaded(&mut session, &s);
+        assert!(session.ext.get::<AssetKeys>().is_none(), "no run loaded any");
+
+        session.ext.insert(std::sync::Arc::new(AssetKeys([("other".to_string(), "old".to_string())].into())));
+        refresh_loaded(&mut session, &s);
+        assert_eq!(session.ext.get::<AssetKeys>().unwrap().get("other"), Some("o-1"), "a changed key");
+        s.delete(&asset_key_name("other")).unwrap();
+        refresh_loaded(&mut session, &s);
+        assert_eq!(session.ext.get::<AssetKeys>().unwrap().get("other"), None, "a removed key");
     }
 
     /// #262: a key file that can't be read is left as it is, with every other key in it.
