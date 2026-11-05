@@ -844,7 +844,8 @@ Owner: open · Status: in progress
       The merge with main `41d2175e` awaits a new CI run.
 
 - [x] Keep DNS answer names inside their declared RDATA, including compressed names and MX
-      exchanges, and report malformed records as incomplete instead of inventing answer values
+      exchanges, and report malformed records as incomplete instead of inventing answer values,
+      while preserving legal empty DNS UPDATE RRset prerequisites
       — claimed: Afloat16, branch bugfix/r3.12-dns-rdata-names-review-20261104
 
 ### R3.13 Web inspection correctness

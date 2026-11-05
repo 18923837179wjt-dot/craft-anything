@@ -108,3 +108,77 @@ fn earlier_answers_survive_before_a_malformed_name() {
     assert_eq!(dns.answers[0].rtype, "A");
     assert_eq!(dns.answers[0].value, "192.0.2.3");
 }
+
+fn prerequisite_message(flags: u16, record_type: u16, class: u16, ttl: u32, rdata: &[u8]) -> Vec<u8> {
+    let mut message = vec![0, 1];
+    message.extend(flags.to_be_bytes());
+    message.extend([0, 1, 0, 2, 0, 0, 0, 0]);
+    message.extend(b"\x07example\x04test\0");
+    message.extend([0, 6, 0, 1]); // One Zone record, SOA/IN.
+    message.extend(b"\x05first\xc0\x0c");
+    message.extend(record_type.to_be_bytes());
+    message.extend(class.to_be_bytes());
+    message.extend(ttl.to_be_bytes());
+    message.extend((rdata.len() as u16).to_be_bytes());
+    message.extend(rdata);
+    // A different owner lets this value-dependent prerequisite coexist with CLASS NONE above.
+    message.extend(b"\x05after\xc0\x0c");
+    message.extend([0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 192, 0, 2, 4]);
+    message
+}
+
+#[test]
+fn empty_update_name_prerequisites_preserve_the_following_record() {
+    for record_type in [2, 5, 12, 15] {
+        for class in [254, 255] {
+            let dns = decode(1, &packet(&prerequisite_message(0x2800, record_type, class, 0, &[]))).dns.unwrap();
+            assert!(!dns.incomplete, "type {record_type}, class {class}");
+            assert_eq!(dns.answers.len(), 2);
+            assert_eq!(dns.answers[0].value, "");
+            assert_eq!(dns.answers[1].name, "after.example.test");
+            assert_eq!(dns.answers[1].value, "192.0.2.4");
+        }
+    }
+}
+
+#[test]
+fn empty_name_rdata_is_rejected_outside_legal_update_prerequisites() {
+    let cases = [(0x8180, 254, 0), (0x8180, 255, 0), (0x2000, 254, 0), (0x2000, 255, 0), (0x2800, 1, 0), (0x2800, 254, 1), (0x2800, 255, 1)];
+    for record_type in [2, 5, 12, 15] {
+        for (flags, class, ttl) in cases {
+            let dns = decode(1, &packet(&prerequisite_message(flags, record_type, class, ttl, &[]))).dns.unwrap();
+            assert!(dns.incomplete, "type {record_type}, flags {flags:#x}, class {class}, TTL {ttl}");
+            assert!(dns.answers.is_empty());
+        }
+    }
+}
+
+#[test]
+fn update_name_rdata_still_requires_complete_exact_encoding() {
+    for record_type in [2, 5, 12, 15] {
+        for class in [1, 254, 255] {
+            for name in [&[0xc0][..], &[0, 0xaa]] {
+                let mut rdata = if record_type == 15 { vec![0, 10] } else { Vec::new() };
+                rdata.extend(name);
+                let dns = decode(1, &packet(&prerequisite_message(0x2800, record_type, class, 0, &rdata))).dns.unwrap();
+                assert!(dns.incomplete, "type {record_type}, class {class}, name {name:?}");
+                assert!(dns.answers.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn value_dependent_update_name_prerequisites_keep_their_values() {
+    for record_type in [2, 5, 12, 15] {
+        for (name, expected) in [(&[0][..], "."), (&[0xc0, 12], "example.test")] {
+            let mut rdata = if record_type == 15 { vec![0, 0] } else { Vec::new() };
+            rdata.extend(name);
+            let dns = decode(1, &packet(&prerequisite_message(0x2800, record_type, 1, 0, &rdata))).dns.unwrap();
+            assert!(!dns.incomplete, "type {record_type}, name {expected}");
+            assert_eq!(dns.answers.len(), 2);
+            assert_eq!(dns.answers[0].value, expected);
+            assert_eq!(dns.answers[1].value, "192.0.2.4");
+        }
+    }
+}

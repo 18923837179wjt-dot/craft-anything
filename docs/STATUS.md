@@ -331,12 +331,15 @@ or newer record. Scripted turns cover both outcomes, blank notes and unreadable 
 
 ## DNS answer name boundaries
 
-NS, CNAME, PTR and MX answer names must be fully encoded inside their declared RDATA.
+Within the first 64 decoded answer/prerequisite records, NS, CNAME, PTR and MX values must be
+fully encoded inside their declared RDATA. DNS UPDATE RRset prerequisites may carry an empty
+value only with CLASS ANY/NONE and TTL zero; later prerequisite records are still decoded.
 Backward compression pointers still work, including names with a label before the pointer.
 A truncated name, missing MX preference or extra bytes after a name marks the DNS message
 incomplete and keeps that answer out of the packet and capture inventories. Earlier complete
-answers remain available. Seven synthetic packet regressions cover those boundaries, root
-names, literal names and the summary inventory; no live capture was used.
+answers remain available. Eleven synthetic packet regressions cover those boundaries, root
+names, literal names, legal and malformed UPDATE prerequisites, and the summary inventory;
+no live capture was used.
 
 ## Local model identifier task hints
 
