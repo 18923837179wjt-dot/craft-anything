@@ -98,7 +98,9 @@ impl Toolchain {
     fn command_for(&self, app: &Path, command: &[String], windows: bool) -> Option<(PathBuf, Vec<String>)> {
         let (program, args) = command.split_first()?;
         let here = |p: &&String| windows == [".bat", ".cmd", ".exe"].iter().any(|e| p.ends_with(e));
-        let local = self.local_programs.iter().filter(here).map(|p| app.join(p)).find(|p| p.is_file());
+        // Callers run in `app`, so a project-relative executable must first be made absolute.
+        // Keep virtualenv symlinks intact: canonicalizing can select the system interpreter.
+        let local = self.local_programs.iter().filter(here).map(|p| app.join(p)).find(|p| p.is_file()).map(std::path::absolute).transpose().ok()?;
         let system = self.windows_program.as_ref().filter(|_| windows).unwrap_or(program);
         Some((local.unwrap_or_else(|| PathBuf::from(system)), args.to_vec()))
     }
@@ -195,5 +197,28 @@ mod tests {
             assert_eq!(tool.command_for(dir.path(), &tool.build, windows).unwrap().0, path);
         }
         assert_eq!(tool.launch(dir.path()).unwrap().0, dir.path().join(if cfg!(windows) { ".venv/Scripts/python.exe" } else { ".venv/bin/python" }));
+    }
+
+    /// A local runner remains resolvable after the caller changes to a relative project folder.
+    #[test]
+    fn relative_projects_resolve_local_programs_absolutely() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&cwd).unwrap();
+        let app = dir.path().strip_prefix(&cwd).unwrap();
+        std::fs::write(app.join("main.py"), "").unwrap();
+        let tool = found_in(app).unwrap();
+        let command = vec!["python3".into(), "main.py".into(), "argument with spaces".into()];
+        for (windows, relative, system) in [(false, ".venv/bin/python", "python3"), (true, ".venv/Scripts/python.exe", "python")] {
+            assert_eq!(tool.command_for(app, &command, windows), Some((PathBuf::from(system), command[1..].to_vec())));
+            let path = app.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "fixture").unwrap();
+            let expected = std::path::absolute(&path).unwrap();
+            assert_eq!(tool.command_for(app, &command, windows), Some((expected.clone(), command[1..].to_vec())));
+            assert_eq!(tool.command_for(app, &tool.build, windows).unwrap().0, expected);
+            if windows == cfg!(windows) {
+                assert_eq!(crate::outputs::launch(app, None), Some((expected, vec!["main.py".into()])));
+            }
+        }
     }
 }
