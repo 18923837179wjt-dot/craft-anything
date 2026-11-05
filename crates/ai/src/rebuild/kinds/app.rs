@@ -44,6 +44,8 @@ impl TargetKind for AppKind {
         "a desktop app with the same core features"
     }
 
+    /// Describe the checks for a new app: screenshots or recorded console runs, plus Deep-mode
+    /// requirements when studying a program. Existing projects keep their own build/test contract.
     fn brief_sections(&self, cx: &BriefCx) -> Vec<String> {
         let mut s = Vec::new();
         if cx.ws.manifest.own_project() {

@@ -71,6 +71,8 @@ impl TargetKind for GameKind {
         "a playable game that plays like the original: the same rules, controls, numbers and feel"
     }
 
+    /// Assemble the game's study, screenshot, self-test and optional generated-asset instructions.
+    /// Existing projects keep their own checks; website targets omit native-code study requirements.
     fn brief_sections(&self, cx: &BriefCx) -> Vec<String> {
         let target = &cx.ws.manifest.target;
         if matches!(target, TargetRef::Website { .. }) {

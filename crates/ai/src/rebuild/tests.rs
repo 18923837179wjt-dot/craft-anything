@@ -1967,6 +1967,7 @@ fn new_python_projects_build_and_save_screenshots_through_their_toolchain() {
     assert_eq!(checks.iter().map(|c| (c.check.as_str(), c.passed)).collect::<Vec<_>>(), [("build", true), ("app-screenshot", true)], "{checks:?}");
     let args = std::fs::read_to_string(app.join("build-args.txt")).unwrap();
     assert!(args.starts_with("-m\ncompileall\n-q\n") && args.ends_with(".\n"), "{args}");
+    assert_eq!(args.lines().nth(3), Some("-f"), "{args}");
     assert_eq!(launch(&app, None).unwrap(), (program, vec!["main.py".into()]), "Play uses the same interpreter/entrypoint");
     let shot = ws.checks_dir().join("round-1/screenshot.png");
     assert!(shot.is_file());

@@ -153,6 +153,7 @@ mod tests {
     use super::*;
     use crate::{CallOptions, Caller, Consent, Engine};
 
+    /// Reject missing consent, invalid paths and unsupported hosts before launching any program.
     #[test]
     fn it_needs_consent_and_a_real_program() {
         let e = Engine::new(crate::testing::session());

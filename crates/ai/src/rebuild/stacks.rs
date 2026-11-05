@@ -194,6 +194,7 @@ mod tests {
         assert_eq!(found(&[("notes.md", "")]), None);
     }
 
+    /// Verify file-based toolchain detection and that every shared row has build/test commands.
     #[test]
     fn a_folder_says_how_it_builds_and_tests_itself() {
         let tool = |file: &str| {
