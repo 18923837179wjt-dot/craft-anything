@@ -59,7 +59,9 @@ Godot, Claude Code). The terms the app itself translates follow one glossary: *c
 *construcción* (Build), *evidencia* (Evidence), *proyecto* (Project), *hallazgo* (finding),
 *objetivo* (target), *herramienta* (tool), *banco de trabajo* (workbench), *constructor* (builder),
 *Configuración* (Settings) and *Estudiar / Construir / Verificar / Listo* for
-Study / Build / Check / Ready.
+Study / Build / Check / Ready. *Plugin* stays as it is, in all 16 strings that use it, rather than the
+suite's *complemento*: it is the word the people using the interface say in Mexican Spanish, and a
+catalogue that changes term halfway reads worse than one that keeps a loanword.
 
 The kind detection that reads a request also knows the Spanish words *juego*, *juegos*, *jugabilidad*
 and *videojuego* for a game, and *sitio web* and *página web* for a website, so a translated
