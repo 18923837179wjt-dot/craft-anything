@@ -502,7 +502,8 @@ fn check_hashes(slice: &[u8], sig_bytes: &[u8], sig: &codesign::Signature, cd: &
     if hs == 0 || hs > 64 || cd.page_size == 0 {
         return json!({"checked": false, "reason": "unsupported hash size or page size"});
     }
-    let base = cd.offset.saturating_add(cd.hash_offset as usize);
+    let base = cd.hash_offset as usize;
+    let cd_bytes = cd.offset.checked_add(cd.length as usize).and_then(|end| sig_bytes.get(cd.offset..end.min(sig_bytes.len()))).unwrap_or_default();
     let page = usize::try_from(cd.page_size).unwrap_or(4096);
     let limit = usize::try_from(cd.code_limit).unwrap_or(usize::MAX).min(slice.len());
     let mut matched = 0u64;
@@ -516,7 +517,8 @@ fn check_hashes(slice: &[u8], sig_bytes: &[u8], sig: &codesign::Signature, cd: &
             continue;
         }
         let end = start.saturating_add(page).min(limit);
-        let (Some(data), Some(stored)) = (slice.get(start..end), sig_bytes.get(base.saturating_add(i * hs)..base.saturating_add(i * hs + hs))) else {
+        let stored = i.checked_mul(hs).and_then(|n| base.checked_add(n)).and_then(|at| cd_bytes.get(at..at.checked_add(hs)?));
+        let (Some(data), Some(stored)) = (slice.get(start..end), stored) else {
             missing += 1;
             continue;
         };
@@ -540,7 +542,7 @@ fn check_hashes(slice: &[u8], sig_bytes: &[u8], sig: &codesign::Signature, cd: &
         if slot > i64::from(cd.special_slots) {
             continue;
         }
-        let stored = sig_bytes.get(base.saturating_sub(slot as usize * hs)..base.saturating_sub(slot as usize * hs).saturating_add(hs));
+        let stored = (slot as usize).checked_mul(hs).and_then(|n| base.checked_sub(n)).and_then(|at| cd_bytes.get(at..at.checked_add(hs)?));
         let Some(stored) = stored else {
             special.push(json!({"slot": -slot, "what": what, "status": "not-checked", "stored": null}));
             continue;
@@ -1503,6 +1505,43 @@ mod tests {
             let entry = special.iter().find(|s| s["slot"] == slot).unwrap();
             assert_eq!(entry, &json!({"slot": slot, "what": what, "status": "not-checked", "stored": null}));
         }
+    }
+
+    #[test]
+    fn signature_stored_hashes_stay_inside_code_directory() {
+        let mut signature = fx::code_signature_blob();
+        let parsed = codesign::parse(&signature).unwrap();
+        let cd = &parsed.code_directories[0];
+        let hash_offset = cd.length + u32::from(cd.hash_size);
+        // Both stored hashes lie beyond the CodeDirectory, inside the complete superblob.
+        assert!(cd.offset + hash_offset as usize + usize::from(cd.hash_size) <= signature.len());
+        signature[cd.offset + 16..cd.offset + 20].copy_from_slice(&hash_offset.to_be_bytes());
+        signature[cd.offset + 24..cd.offset + 28].copy_from_slice(&1u32.to_be_bytes());
+        let e = engine_with("hashes-past-code-directory", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        let checks = &r["result"]["hash_checks"][0]["result"];
+        assert_eq!(checks["checked"], true);
+        assert_eq!(checks["pages_unchecked"], 1);
+        assert_eq!(checks["pages_matched"], 0);
+        assert!(checks["pages_mismatched"].as_array().unwrap().is_empty());
+        assert_eq!(checks["special_slots"], json!([{"slot": -1, "what": "info-plist", "status": "not-checked", "stored": null}]));
+    }
+
+    #[test]
+    fn signature_special_hashes_cannot_precede_code_directory() {
+        let mut signature = fx::code_signature_blob();
+        let parsed = codesign::parse(&signature).unwrap();
+        let cd = &parsed.code_directories[0];
+        // Absolute subtraction would stay inside the superblob but precede this CodeDirectory.
+        assert!(cd.offset >= usize::from(cd.hash_size));
+        signature[cd.offset + 16..cd.offset + 20].copy_from_slice(&0u32.to_be_bytes());
+        signature[cd.offset + 24..cd.offset + 28].copy_from_slice(&1u32.to_be_bytes());
+        signature[cd.offset + 28..cd.offset + 32].copy_from_slice(&0u32.to_be_bytes());
+        let e = engine_with("hash-before-code-directory", &signature_file(&signature));
+        let r = call(&e, "apple_signature_show", json!({}));
+        let checks = &r["result"]["hash_checks"][0]["result"];
+        assert_eq!(checks["checked"], true);
+        assert_eq!(checks["special_slots"], json!([{"slot": -1, "what": "info-plist", "status": "not-checked", "stored": null}]));
     }
 
     #[test]
