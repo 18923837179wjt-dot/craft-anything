@@ -792,8 +792,9 @@ fn dns_name(msg: &[u8], mut off: usize) -> Option<(String, usize)> {
 fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
     let r = Reader::new(msg);
     let (Some(id), Some(flags), Some(qd), Some(an)) = (r.u16_be(0), r.u16_be(2), r.u16_be(4), r.u16_be(6)) else { return };
+    let opcode = (flags >> 11) & 0xf;
     // Sanity: opcode 0–6 and no absurd counts, so random payload on port 53 isn't misread.
-    if (flags >> 11) & 0xf > 6 || qd > 64 || qd == 0 && an == 0 {
+    if opcode > 6 || qd > 64 || qd == 0 && an == 0 {
         return;
     }
     d.protocols.push(label);
@@ -817,7 +818,7 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
                 out.incomplete = true;
                 break;
             };
-            let (Some(rt), Some(ttl), Some(rdlen)) = (r.u16_be(next), r.u32_be(next + 4), r.u16_be(next + 8)) else {
+            let (Some(rt), Some(class), Some(ttl), Some(rdlen)) = (r.u16_be(next), r.u16_be(next + 2), r.u32_be(next + 4), r.u16_be(next + 8)) else {
                 out.incomplete = true;
                 break;
             };
@@ -838,14 +839,17 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
                 (2 | 5 | 12, _) => dns_name(msg, rd_off).map(|(n, _)| n).unwrap_or_default(),
                 (15, _) => dns_name(msg, rd_off + 2).map(|(n, _)| n).unwrap_or_default(),
                 (16, _) => {
-                    // RFC 1035 §3.3.14: one TXT RDATA holds any number of
+                    // RFC 1035 §3.3.14: one TXT RDATA holds one or more
                     // length-prefixed character strings, and a zero-length
                     // string does not end the record. Consumers join them all
                     // (RFC 7208 §3.3), so keep every string instead of the
                     // first one and skip the rest of the RDATA.
                     let mut txt = String::new();
                     let mut pos = 0;
-                    out.incomplete |= rd.is_empty();
+                    // UPDATE's answer section holds prerequisites. ANY/NONE
+                    // prerequisites use empty RDATA and zero TTL (RFC 2136 §2.4).
+                    let empty_prerequisite = opcode == 5 && matches!(class, 254 | 255) && ttl == 0;
+                    out.incomplete |= rd.is_empty() && !empty_prerequisite;
                     while let Some(&len) = rd.get(pos) {
                         let len = usize::from(len);
                         let end = pos + 1 + len;
