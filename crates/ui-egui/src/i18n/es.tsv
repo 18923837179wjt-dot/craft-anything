@@ -1154,7 +1154,7 @@ Tools may now run code from what you open without asking. Turn this back on unle
 Tools that run code from a target or change a phone always ask first, unless you allowed them for a project.	Las herramientas que ejecutan código de un objetivo o cambian un teléfono siempre preguntan primero, a menos que las hayas permitido para un proyecto.
 Trace a UI action	Rastrear una acción de la interfaz
 Trace a feature	Rastrear una funcionalidad
-Try again	Intentar otra vez
+Try again	Reintentar
 Try asking	Prueba preguntando
 Try it out, then ask below for any changes.	Pruébalo y luego pide cambios abajo.
 Turn a program's machine code back into something that reads like source code. It's a reconstruction, not the original.	Convierte el código máquina de un programa en algo que se lee como código fuente. Es una reconstrucción, no el original.
@@ -1278,8 +1278,8 @@ Worked through {n} steps	Se recorrieron {n} pasos
 Working on it	Trabajando en ello
 Working on your answer	Trabajando en tu respuesta
 Working out how much space a copy takes…	Calculando cuánto espacio ocupa una copia…
-Working…	Trabajando…
-Working… ({n} steps so far)	Trabajando… ({n} pasos hasta ahora)
+Working…	Procesando…
+Working… ({n} steps so far)	Procesando… ({n} pasos hasta ahora)
 Write a project file	Escribir un archivo del proyecto
 Write a readable report	Escribir un informe legible
 Write comment	Escribir comentario
