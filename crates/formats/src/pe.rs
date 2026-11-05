@@ -89,16 +89,20 @@ pub fn headers(data: &[u8]) -> Result<PeHeaders, FormatError> {
     let opt_size = usize::from(t(r.u16_le(coff + 16))?);
     let characteristics = t(r.u16_le(coff + 18))?;
     let opt = coff + 20;
-    let magic = r.u16_le(opt).ok_or_else(|| FormatError::Truncated("optional header".into()))?;
+    let optional = Reader::new(r.slice(opt, opt_size).ok_or_else(|| FormatError::Truncated("optional header".into()))?);
+    let magic = optional.u16_le(0).ok_or_else(|| FormatError::Truncated("optional header".into()))?;
     let pe32_plus = match magic {
         0x20b => true,
         0x10b => false,
         m => return Err(FormatError::Malformed(format!("optional header magic {m:#x}"))),
     };
-    let image_base = if pe32_plus { r.u64_le(opt + 24) } else { r.u32_le(opt + 28).map(u64::from) }.unwrap_or(0);
-    let (dd, count_off) = if pe32_plus { (opt + 112, opt + 108) } else { (opt + 96, opt + 92) };
-    let count = (r.u32_le(count_off).unwrap_or(0) as usize).min(16);
-    let data_dirs = (0..count).map(|i| (r.u32_le(dd + i * 8).unwrap_or(0), r.u32_le(dd + i * 8 + 4).unwrap_or(0))).collect();
+    let (dd, count_off) = if pe32_plus { (112, 108) } else { (96, 92) };
+    if opt_size < dd {
+        return Err(FormatError::Truncated("fixed optional header fields".into()));
+    }
+    let image_base = if pe32_plus { optional.u64_le(24) } else { optional.u32_le(28).map(u64::from) }.unwrap_or(0);
+    let count = (optional.u32_le(count_off).unwrap_or(0) as usize).min(16).min((opt_size - dd) / 8);
+    let data_dirs = (0..count).map(|i| (optional.u32_le(dd + i * 8).unwrap_or(0), optional.u32_le(dd + i * 8 + 4).unwrap_or(0))).collect();
     let sh = opt + opt_size;
     let mut sections = Vec::new();
     for i in 0..nsections.min(96) {
@@ -121,10 +125,10 @@ pub fn headers(data: &[u8]) -> Result<PeHeaders, FormatError> {
         characteristics,
         pe32_plus,
         image_base,
-        entry_rva: r.u32_le(opt + 16).unwrap_or(0),
-        subsystem: r.u16_le(opt + 68).unwrap_or(0),
-        dll_characteristics: r.u16_le(opt + 70).unwrap_or(0),
-        linker: (r.u8(opt + 2).unwrap_or(0), r.u8(opt + 3).unwrap_or(0)),
+        entry_rva: optional.u32_le(16).unwrap_or(0),
+        subsystem: optional.u16_le(68).unwrap_or(0),
+        dll_characteristics: optional.u16_le(70).unwrap_or(0),
+        linker: (optional.u8(2).unwrap_or(0), optional.u8(3).unwrap_or(0)),
         data_dirs,
         sections,
     })
