@@ -653,6 +653,8 @@ Owner: open · Status: in progress
       — claimed: Codex, branch bugfix/r2.7-new-project-toolchains
 - [ ] Extend launch recipes beyond conventional root entrypoints: Python package scripts, Go
       `cmd/` layouts, and Java build outputs; build checks already use their toolchain commands
+- [ ] Audit relative project placements in build, option-run and Play paths too: runtime window
+      capture now normalizes its request paths, but earlier runner paths can still be relative
 
 ### R2.8 Clean room means clean room
 Owner: maintainers · Status: in progress

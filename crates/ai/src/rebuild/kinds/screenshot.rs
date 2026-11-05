@@ -108,6 +108,37 @@ impl Check for ScreenshotCheck {
     }
 }
 
+/// Absolute capture parameters and the paths used to read back its artifacts.
+struct RuntimeCapture {
+    params: Value,
+    shot: PathBuf,
+    tree: PathBuf,
+}
+
+/// Normalize workspace-relative paths against this process's current directory. A selected local
+/// executable already includes the app path; only bare runner names are searched on PATH.
+fn capture_request(
+    app: &Path,
+    program: &Path,
+    args: &[String],
+    dir: &Path,
+    include_tree: bool,
+    find_program: impl FnOnce(&str) -> Option<PathBuf>,
+) -> Option<RuntimeCapture> {
+    let working_directory = std::path::absolute(app).ok()?;
+    let selected = if program.is_absolute() || program.components().count() > 1 { program.to_path_buf() } else { find_program(program.to_str()?)? };
+    // PATH may itself contain relative entries, so normalize the lookup's result too. Do not
+    // canonicalize a virtualenv symlink into the system Python: the selected interpreter matters.
+    let program = std::path::absolute(selected).ok()?;
+    let shot = std::path::absolute(dir.join("window.png")).ok()?;
+    let tree = std::path::absolute(dir.join("ui-tree.json")).ok()?;
+    let mut params = json!({"program": program, "args": args, "working_directory": working_directory, "wait_secs": 15, "output": &shot});
+    if include_tree {
+        params["ui_tree"] = json!(&tree);
+    }
+    Some(RuntimeCapture { params, shot, tree })
+}
+
 /// Start the build normally and picture it the way Study pictured the original, when it did
 /// (`capture/window.png`, and `capture/ui-tree.json` when its controls were read): how alike the
 /// windows look and the controls are, and a claim for each of the original's interactive
@@ -118,15 +149,11 @@ fn running_note(cx: &CheckCx, program: &Path, args: &[String], dir: &Path) -> (S
     if !original.is_file() {
         return (String::new(), Vec::new());
     }
-    let (shot, tree) = (dir.join("window.png"), dir.join("ui-tree.json"));
-    let program = if program.is_absolute() { Some(program.to_path_buf()) } else { program.to_str().and_then(craft_anything_platform::which::which) };
-    let Some(program) = program else {
-        return (" Started normally, its window couldn't be pictured because its interpreter or runner wasn't found.".into(), Vec::new());
+    let Some(RuntimeCapture { params, shot, tree }) =
+        capture_request(&cx.ws.app_dir(), program, args, dir, original_tree.is_file(), craft_anything_platform::which::which)
+    else {
+        return (" Started normally, its window couldn't be pictured because its project paths or interpreter couldn't be resolved.".into(), Vec::new());
     };
-    let mut params = json!({"program": program, "args": args, "working_directory": cx.ws.app_dir(), "wait_secs": 15, "output": &shot});
-    if original_tree.is_file() {
-        params["ui_tree"] = json!(&tree);
-    }
     if let Err(e) = cx.call("native_window_capture", params) {
         return (format!(" Started normally, its window couldn't be pictured: {}", e.message), Vec::new());
     }
@@ -356,6 +383,46 @@ fn last_lines(stderr: &str, stdout: &str) -> String {
 mod tests {
     use super::*;
     use craft_anything_engine::tools::web_common::encode_png;
+
+    /// Relative placements produce the absolute paths required by native_window_capture,
+    /// without looking up a project-local interpreter or resolving away its virtualenv path.
+    #[test]
+    fn runtime_capture_normalizes_relative_project_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let app = Path::new("projects with spaces/sample.cany/app");
+        let interpreter = app.join(".venv/bin/python");
+        let dir = Path::new("projects with spaces/sample.cany/checks/round-1");
+        let args = vec!["main.py".to_string()];
+        let request = capture_request(app, &interpreter, &args, dir, true, |_| panic!("a selected filesystem path must not use PATH lookup")).unwrap();
+        assert_eq!(request.params["working_directory"], json!(cwd.join(app)));
+        assert_eq!(request.params["program"], json!(cwd.join(interpreter)));
+        assert_eq!(request.params["output"], json!(cwd.join(dir).join("window.png")));
+        assert_eq!(request.params["ui_tree"], json!(cwd.join(dir).join("ui-tree.json")));
+        assert_eq!(request.params["args"], json!(args));
+        assert_eq!(request.shot, cwd.join(dir).join("window.png"));
+        assert_eq!(request.tree, cwd.join(dir).join("ui-tree.json"));
+    }
+
+    /// Bare runners keep PATH lookup, including relative PATH results; missing runners stop
+    /// capture cleanly, and absolute executables are left at their selected location.
+    #[test]
+    fn runtime_capture_preserves_runner_lookup_and_optional_tree() {
+        let cwd = std::env::current_dir().unwrap();
+        let app = cwd.join("project/app");
+        let dir = cwd.join("project/checks/round-1");
+        let request = capture_request(&app, Path::new("python3"), &[], &dir, false, |name| {
+            assert_eq!(name, "python3");
+            Some(PathBuf::from("relative tools/python3"))
+        })
+        .unwrap();
+        assert_eq!(request.params["program"], json!(cwd.join("relative tools/python3")));
+        assert_eq!(request.params["working_directory"], json!(app));
+        assert!(request.params.get("ui_tree").is_none());
+        assert!(capture_request(&app, Path::new("missing-runner"), &[], &dir, false, |_| None).is_none());
+        let program = app.join(".venv/bin/python");
+        let request = capture_request(&app, &program, &[], &dir, false, |_| panic!("an absolute executable must not use PATH lookup")).unwrap();
+        assert_eq!(request.params["program"], json!(program));
+    }
 
     fn img(w: u32, h: u32, f: &dyn Fn(u32, u32) -> [u8; 3]) -> Image {
         let mut rgba = Vec::new();
