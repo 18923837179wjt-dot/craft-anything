@@ -115,7 +115,11 @@ pub fn header(data: &[u8], file_len: u64) -> Result<Header, FormatError> {
 /// Decompress one piece of a bundle with compression `kind` (the low six bits of a flags field).
 pub fn decompress(kind: u32, input: &[u8], out_len: u32) -> Result<Vec<u8>, FormatError> {
     let bad = |e: decompress::DecompressError| FormatError::Malformed(format!("a {} block: {e}", compression_name(kind)));
-    match kind {
+    let bad_size = |actual: usize| FormatError::Malformed(format!("a {} block has {actual} decoded bytes, expected {out_len}", compression_name(kind)));
+    if kind == 0 && input.len() != out_len as usize {
+        return Err(bad_size(input.len()));
+    }
+    let output = match kind {
         0 => Ok(input.to_vec()),
         // Unity's LZMA is the 5 property bytes and the stream; the `.lzma` form adds the size.
         1 => {
@@ -127,7 +131,11 @@ pub fn decompress(kind: u32, input: &[u8], out_len: u32) -> Result<Vec<u8>, Form
         }
         2 | 3 => decompress::lz4_block(input, out_len as usize).map_err(bad),
         n => Err(FormatError::Unsupported(format!("compression {n}"))),
+    }?;
+    if output.len() != out_len as usize {
+        return Err(bad_size(output.len()));
     }
+    Ok(output)
 }
 
 /// Read the block table (`table` as stored in the file).
