@@ -88,3 +88,27 @@ fn zip64_does_not_erase_explicit_classic_volume_markers() {
         assert_eq!(zip::parse(&data, 10).unwrap().entries.len(), 1);
     }
 }
+
+#[test]
+fn zip64_does_not_erase_explicit_classic_entry_counts() {
+    for field in [8, 10] {
+        for count in [0u16, 2] {
+            let mut data = zip64_archive(0, 0, 0, 1, 1);
+            let end = data.len() - 22;
+            data[end + field..end + field + 2].copy_from_slice(&count.to_le_bytes());
+            assert!(matches!(zip::parse(&data, 10), Err(ZipError::Unsupported(_))), "field {field}, count {count}");
+        }
+    }
+}
+
+#[test]
+fn mixed_classic_and_zip64_entry_counts_can_describe_one_volume() {
+    for field in [8, 10] {
+        let mut data = zip64_archive(0, 0, 0, 1, 1);
+        let end = data.len() - 22;
+        data[end + field..end + field + 2].copy_from_slice(&1u16.to_le_bytes());
+        let archive = zip::parse(&data, 10).unwrap();
+        assert_eq!(archive.entries.len(), 1, "field {field}");
+        assert_eq!(zip::read_entry(&data, &archive.entries[0], 10).unwrap(), b"x");
+    }
+}

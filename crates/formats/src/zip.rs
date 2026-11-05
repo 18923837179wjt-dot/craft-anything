@@ -120,8 +120,13 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
             if r.slice(rec, 4) == Some(b"PK\x06\x06") {
                 disk = r.u32_le(rec + 16).ok_or(ZipError::Truncated("zip64 record"))?;
                 directory_disk = r.u32_le(rec + 20).ok_or(ZipError::Truncated("zip64 record"))?;
-                disk_entries = r.u64_le(rec + 24).ok_or(ZipError::Truncated("zip64 record"))?;
-                total = r.u64_le(rec + 32).ok_or(ZipError::Truncated("zip64 record"))?;
+                let zip64_disk_entries = r.u64_le(rec + 24).ok_or(ZipError::Truncated("zip64 record"))?;
+                let zip64_total = r.u64_le(rec + 32).ok_or(ZipError::Truncated("zip64 record"))?;
+                if (disk_entries != 0xffff && disk_entries != zip64_disk_entries) || (total != 0xffff && total != zip64_total) {
+                    return Err(ZipError::Unsupported("multi-volume ZIP archives".into()));
+                }
+                disk_entries = zip64_disk_entries;
+                total = zip64_total;
                 cd_size = r.u64_le(rec + 40).ok_or(ZipError::Truncated("zip64 record"))?;
                 cd_offset = r.u64_le(rec + 48).ok_or(ZipError::Truncated("zip64 record"))?;
                 zip64 = true;
