@@ -20,7 +20,9 @@ fn prerequisites(flags: u16, class: u16, ttl: u32, data: &[u8]) -> Dns {
     msg.extend(ttl.to_be_bytes());
     msg.extend((data.len() as u16).to_be_bytes());
     msg.extend(data);
-    // A following value-dependent TXT prerequisite must also survive.
+    // Different owners let NONE and value-dependent prerequisites hold together.
+    // The following TXT record must also survive.
+    msg.extend(b"\x05after");
     msg.extend([0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 0, 0, 3, 2, b'o', b'k']);
     decode(101, &ipv4_pkt(17, [1; 4], [2; 4], &udp(100, 53, &msg))).dns.unwrap()
 }
@@ -132,7 +134,9 @@ fn empty_update_prerequisites_preserve_following_records() {
         let dns = prerequisites(5 << 11, class, 0, &[]);
         assert!(!dns.incomplete, "class {class}");
         assert_eq!(dns.answers.len(), 2);
+        assert_eq!(dns.answers[0].name, "example.test");
         assert_eq!(dns.answers[0].value, "");
+        assert_eq!(dns.answers[1].name, "after.example.test");
         assert_eq!(dns.answers[1].value, "ok");
     }
 }
@@ -144,6 +148,13 @@ fn empty_txt_rdata_requires_update_and_a_prerequisite_class() {
         let dns = prerequisites(flags, class, ttl, &[]);
         assert!(dns.incomplete, "flags {flags:#x}, class {class}, ttl {ttl}");
         assert!(dns.answers.is_empty());
+    }
+    for opcode in [1, 2, 3, 4, 6] {
+        for class in [254, 255] {
+            let dns = prerequisites(opcode << 11, class, 0, &[]);
+            assert!(dns.incomplete, "opcode {opcode}, class {class}");
+            assert!(dns.answers.is_empty());
+        }
     }
 }
 
@@ -172,4 +183,14 @@ fn empty_and_multiple_complete_strings_remain_valid() {
         assert!(!dns.incomplete);
         assert_eq!(dns.answers[0].value, expected);
     }
+}
+
+#[test]
+fn value_dependent_update_accepts_an_empty_character_string() {
+    let dns = prerequisites(5 << 11, 1, 0, b"\x00");
+    assert!(!dns.incomplete);
+    assert_eq!(dns.answers.len(), 2);
+    assert_eq!(dns.answers[0].value, "");
+    assert_eq!(dns.answers[1].name, "after.example.test");
+    assert_eq!(dns.answers[1].value, "ok");
 }
