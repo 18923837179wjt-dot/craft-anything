@@ -279,7 +279,7 @@ se instalan. npm ejecuta los scripts de instalación de cada paquete por defecto
 compilación de Rust y los paquetes de código fuente de Python ejecutan su propio código de setup.
 Craft Anything pregunta antes de un comando de un tipo que no ha visto en este proyecto (`npm`,
 `cargo`…). Elegir "always allow" para `npm` deja que todos los comandos npm posteriores se ejecuten
-sin preguntar, así que hazlo solo con un proyecto cuyas dependencias confíes. Para instalar paquetes
+sin preguntar, así que hazlo solo en un proyecto cuyas dependencias sean de confianza. Para instalar paquetes
 npm sin sus scripts de instalación, usa `npm install --ignore-scripts`.
 
 <a id="downloads"></a>
