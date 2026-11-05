@@ -128,10 +128,18 @@ impl<'a> Cur<'a> {
         if chars > MAX_STRING {
             return Err(FormatError::Malformed(format!("{what} is {chars} characters long")));
         }
+        let no_terminator = || FormatError::Malformed(format!("{what} has no terminating NUL"));
         let s = if n >= 0 {
-            String::from_utf8_lossy(self.take(chars, what)?).into_owned()
+            let b = self.take(chars, what)?;
+            if chars != 0 && b.last() != Some(&0) {
+                return Err(no_terminator());
+            }
+            String::from_utf8_lossy(b).into_owned()
         } else {
             let b = self.take(chars * 2, what)?;
+            if !b.ends_with(&[0, 0]) {
+                return Err(no_terminator());
+            }
             String::from_utf16_lossy(&b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect::<Vec<_>>())
         };
         Ok(s.trim_end_matches('\0').to_string())
