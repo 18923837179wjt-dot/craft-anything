@@ -649,6 +649,7 @@ Owner: open · Status: in progress
       and hold it only to what it broke
 - [ ] A new project in Python, Go or the like still fails the build check ("No project to build
       found") and has no program for the screenshot check: `[[toolchain]]` could build it too
+      — claimed: Codex, branch bugfix/r2.7-new-project-toolchains
 
 ### R2.8 Clean room means clean room
 Owner: maintainers · Status: in progress
