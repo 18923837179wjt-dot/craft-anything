@@ -336,7 +336,9 @@ Owner: open · Status: todo
 - [x] An API-key build works alone: it shares the app's session, whose `attach` points at whichever
       project started last, so another build beside it sent its files and asset spending to the
       wrong project (`build.parallel` is 2 by default). Others wait their turn in the queue
-- [ ] Let API-key builds run side by side: give each an engine of its own, as a question has
+- [ ] Let API-key builds run side by side: give each an engine of its own, as a question has. This
+      also closes the gap left in working alone: the app and the `rebuild_start` tool each keep a
+      queue, so a build the in-app chat starts isn't kept apart from one the app started
 - [ ] Check #369 live with Kimi K3 and a key limited to Kimi/Moonshot models (needs the person's
       OpenRouter key): that the build starts, or that the error now names the provider's reason
 - [ ] A live API-key build (needs a key on the test machine)

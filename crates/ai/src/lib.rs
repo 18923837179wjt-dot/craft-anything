@@ -698,11 +698,15 @@ impl AiHub {
 
     /// Remove a backend and its stored key. Returns false when there was no such backend.
     pub fn remove_backend(&self, name: &str) -> Result<bool, ToolError> {
+        if self.config_to_change()?.get(name).is_none() {
+            return Ok(false);
+        }
+        // The key first: if it can't be removed the backend stays, so this can be tried again. The
+        // settings are read after it, because the keychain can take seconds and they may change.
+        self.keys.delete(name)?;
         let mut cfg = self.config_to_change()?;
         let removed = cfg.remove(name);
         if removed {
-            // The key first: if it can't be removed the backend stays, so this can be tried again.
-            self.keys.delete(name)?;
             self.save_config(&cfg)?;
         }
         Ok(removed)
