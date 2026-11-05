@@ -53,7 +53,7 @@ fn complete_build_commands_are_read_in_both_byte_orders() {
     for big in [false, true] {
         let mut bytes = data.clone();
         if big {
-            for word in bytes.chunks_exact_mut(4) {
+            for word in bytes.as_chunks_mut::<4>().0 {
                 word.reverse();
             }
         }
