@@ -28,12 +28,14 @@ impl TargetKind for GameKind {
         }
     }
 
+    /// A game wins when the stack is a game engine, or when the request says game, gameplay,
+    /// player, or the matching word in another language the catalogues translate.
     fn detect(&self, cx: &DetectCx) -> Option<u32> {
         // Built with a game engine (the person picked a game on Make): a game whatever its words
         // say ("Clone <its title> 1:1" never says "game").
         if game::Builder::from_stack(cx.stack).is_some() {
             Some(200)
-        } else if cx.says(&["game", "gameplay", "steam", "level", "player", "游戏", "遊戲", "玩法", " spiel", "-spiel"]) {
+        } else if cx.says(&["game", "gameplay", "steam", "level", "player", "游戏", "遊戲", "玩法", " spiel", "-spiel"]) || says_game_in_spanish(cx) {
             Some(60)
         } else {
             None
@@ -133,6 +135,13 @@ impl Check for CreditsCheck {
 }
 
 /// Whether `app/` credits the original's files and says they're private, with the note.
+/// Spanish for "game" is *juego*, which also names a set: *un juego de herramientas* is a tool set,
+/// not a game. Only the game sense counts, so that phrase is excluded and the rest of *juego* is kept.
+fn says_game_in_spanish(cx: &DetectCx) -> bool {
+    let tool_set = cx.says(&["juego de herramienta"]);
+    (cx.says(&[" juego", " juegos"]) && !tool_set) || cx.says(&["jugabilidad", "videojuego"])
+}
+
 fn credits(app: &Path) -> (bool, String) {
     // Whitespace collapsed, so a wrapped line still counts.
     let read = |name: &str| std::fs::read_to_string(app.join(name)).unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
