@@ -64,6 +64,8 @@ impl<'ast> Visit<'ast> for Lookups {
     }
 }
 
+/// Compare every key the UI looks up against each catalogue, print what a catalogue is missing, and
+/// report whether all of them resolve.
 pub fn check(root: &Path) -> bool {
     let mut lookups = Lookups::default();
     let source = root.join("crates/ui-egui/src");

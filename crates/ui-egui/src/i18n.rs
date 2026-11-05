@@ -131,6 +131,8 @@ mod tests {
         assert_eq!(tr("Untranslated"), "Untranslated");
     }
 
+    /// Script and region matching: an explicit script wins over a region, a registered language
+    /// resolves from any of its regions, and a locale with no catalogue falls back to English.
     #[test]
     fn chinese_scripts_regions_and_fallback() {
         for tag in ["zh", "zh-CN", "zh_SG.UTF-8", "ZH-Hans", "zh-Hans-TW"] {
@@ -154,6 +156,8 @@ mod tests {
         assert_eq!(preferred_language(std::iter::empty::<&str>()), "en");
     }
 
+    /// Every registered catalogue parses, and all of them carry the same key set: a language that
+    /// missed keys would fall back to English mid-interface.
     #[test]
     fn catalogs_are_valid_and_have_matching_keys() {
         fn placeholders(s: &str) -> Vec<&str> {

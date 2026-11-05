@@ -73,6 +73,8 @@ fn german_requests_keep_their_project_kind() {
 }
 
 #[test]
+/// A request written in Spanish keeps the project kind its English equivalent would get, which is
+/// what the German and Chinese cases assert for their own words.
 fn spanish_requests_keep_their_project_kind() {
     for request in ["Un juego de serpiente sencillo", "El mismo juego, con una tabla de récords"] {
         assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
