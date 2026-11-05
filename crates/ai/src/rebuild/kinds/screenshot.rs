@@ -15,6 +15,19 @@ use craft_anything_platform::process::Process;
 /// What every app and game brief asks for, so the check can see the result.
 pub const SCREENSHOT_CONTRACT: &str = "Give the program a `--screenshot <file.png>` option: start normally, draw about 120 frames, save the window's picture as a PNG to that file and exit. Craft Anything runs it that way after each build to check the result, and a build without the option, or with a blank picture, doesn't pass. Try it yourself: run it with a file inside app/ (for example app/shots/now.png) and look at the picture.";
 
+/// Include the shared catalogue's supported entrypoints so the builder knows how checks start it.
+pub fn contract() -> String {
+    let entries = craft_anything_engine::toolchains::catalogue()
+        .iter()
+        .filter(|t| !t.launch.is_empty())
+        .map(|t| format!("{}: {}", t.name, t.launch.iter().map(|r| r.file.as_str()).collect::<Vec<_>>().join(" or ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "{SCREENSHOT_CONTRACT} If not packaging an executable, keep a supported entrypoint directly in app/ ({entries}); wildcard entrypoints must match exactly one file."
+    )
+}
+
 /// How long the program may take to start, draw and save its picture (or play its self-test).
 const RUN_LIMIT: Duration = Duration::from_secs(90);
 /// The size both pictures are brought to before comparing.
@@ -106,7 +119,11 @@ fn running_note(cx: &CheckCx, program: &Path, args: &[String], dir: &Path) -> (S
         return (String::new(), Vec::new());
     }
     let (shot, tree) = (dir.join("window.png"), dir.join("ui-tree.json"));
-    let mut params = json!({"program": program, "args": args, "wait_secs": 15, "output": &shot});
+    let program = if program.is_absolute() { Some(program.to_path_buf()) } else { program.to_str().and_then(craft_anything_platform::which::which) };
+    let Some(program) = program else {
+        return (" Started normally, its window couldn't be pictured because its interpreter or runner wasn't found.".into(), Vec::new());
+    };
+    let mut params = json!({"program": program, "args": args, "working_directory": cx.ws.app_dir(), "wait_secs": 15, "output": &shot});
     if original_tree.is_file() {
         params["ui_tree"] = json!(&tree);
     }
