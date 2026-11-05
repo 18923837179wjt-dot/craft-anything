@@ -253,11 +253,13 @@ impl RebuildRun {
             reset_progress_after_notes: false,
         };
         let r2 = running.clone();
+        let key_store = hub.keys.clone();
         std::thread::Builder::new()
             .name("rebuild".into())
             .spawn(move || {
                 let mut ctx = ctx;
                 let mut ws = ws;
+                ctx.load_asset_keys(&key_store);
                 // A clone can run for hours: keep the computer from sleeping until it ends.
                 let awake = craft_anything_platform::keep_awake();
                 let _here = self_check::BuildingHere::new(&ws.root);
@@ -489,6 +491,16 @@ impl Worker {
         let result = self.engine.call(tool, params, opts);
         self.emit(RunEvent::Agent(AgentEvent::ToolFinished { call_id, tool: tool.to_string(), ok: result.is_ok(), summary: String::new(), evidence_id: None }));
         result
+    }
+
+    /// An API backend's builder runs its tools in this session, not in a tool server that loads the
+    /// keys itself (#923). Read on the worker because the keychain can block, and for each run so a
+    /// key saved or removed since the last one counts.
+    // shortcut: a key removed mid-run stays loaded until the next run, like a CLI agent's tool server; clear it on removal if people expect it to stop at once.
+    fn load_asset_keys(&self, store: &crate::KeyStore) {
+        let providers = self.engine.session().ext.get::<craft_anything_engines::assets::AssetProviders>().map(|p| p.as_ref().clone()).unwrap_or_default();
+        let keys = crate::keys::asset_keys(store, &providers);
+        self.engine.session().ext.insert(Arc::new(keys));
     }
 
     /// Point the engine at this workspace: its investigation project and inbox.

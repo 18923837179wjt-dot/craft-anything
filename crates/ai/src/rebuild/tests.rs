@@ -1308,6 +1308,17 @@ mod picking_up_a_build {
         Bench { _dir: dir, hub, projects, prompts }
     }
 
+    /// #923: starting a run is what loads the keys, for builders that use this session's tools.
+    #[test]
+    fn a_run_loads_the_saved_asset_keys_into_its_session() {
+        let b = bench();
+        b.hub.set_asset_key("fal", "k-1").unwrap();
+        let ws = Workspace::create(&b.projects, "x", "Build a notes app", TargetRef::None).unwrap();
+        let _ = try_it(&b, &ws);
+        let keys = b.hub.engine.session().ext.get::<craft_anything_engine::tools::asset_tools::AssetKeys>().unwrap_or_default();
+        assert_eq!(keys.get("fal"), Some("k-1"));
+    }
+
     fn try_it(b: &Bench, ws: &Workspace) -> (bool, Vec<feed::FeedItem>) {
         try_with(b, ws, RunOptions::default())
     }
@@ -1904,6 +1915,23 @@ mod picking_up_a_build {
         assert!(!written.message.contains("has no files"), "{written:?}");
         assert_eq!(written.message, "The build stopped after two builder turns changed no files in app/.");
     }
+}
+
+/// #923: with OpenRouter as the builder, every asset call said "No fal.ai key" with one saved. The
+/// project hasn't turned on generated assets, so nothing is sent or spent.
+#[test]
+fn a_saved_asset_key_gets_an_api_builders_tool_past_the_key_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(dir.path(), "x", "Make a game", TargetRef::None).unwrap();
+    let worker = check_worker(&ws, false);
+    worker.attach(&ws).unwrap();
+    let call =
+        || worker.engine.call("assets_image_generate", json!({"prompt": "a crate", "save_as": "crate.png"}), CallOptions::new(Caller::Ui)).err().unwrap();
+    assert_eq!(call().code, ErrorCode::BadSettings, "no key loaded yet");
+    let store = crate::KeyStore::file_only(dir.path().join("keys.toml"));
+    store.set(crate::keys::FAL_KEY, "k-1").unwrap();
+    worker.load_asset_keys(&store);
+    assert_eq!(call().code, ErrorCode::NoPermission);
 }
 
 fn check_worker(ws: &Workspace, deep: bool) -> Worker {
