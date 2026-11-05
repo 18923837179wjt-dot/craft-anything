@@ -392,7 +392,11 @@ pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Durat
         if let Some(pid) = child.process_id() {
             let taskkill =
                 std::env::var_os("SystemRoot").map_or_else(|| "taskkill".into(), |r| std::path::PathBuf::from(r).join("System32").join("taskkill.exe"));
-            let _ = crate::process::Process::new(taskkill).args(["/T", "/F", "/PID", &pid.to_string()]).timeout(Duration::from_secs(10)).run();
+            match crate::process::Process::new(taskkill).args(["/T", "/F", "/PID", &pid.to_string()]).timeout(Duration::from_secs(10)).run() {
+                Ok(out) if out.success => {}
+                Ok(out) => log::warn!("taskkill didn't end everything {} started: {}", program.display(), out.stderr_text().trim()),
+                Err(e) => log::warn!("couldn't run taskkill to end what {} started: {}", program.display(), e.message),
+            }
         }
         let _ = child.kill();
     } else {
@@ -894,7 +898,11 @@ mod unix {
         cmd.env("TERM", "xterm-256color");
 
         let portable_pty::PtyPair { master, slave } = pair;
-        let mut child = slave.spawn_command(cmd).map_err(|e| to_err("starting the program", e))?;
+        let mut child = {
+            // Started like any other program, so it can't inherit a terminal another capture is opening.
+            let _starting = crate::process::STARTING.read().unwrap_or_else(PoisonError::into_inner);
+            slave.spawn_command(cmd).map_err(|e| to_err("starting the program", e))?
+        };
         // Drop the slave so the reader sees EOF when the child and our writer are gone.
         drop(slave);
         let leader_pid = child.process_id();
