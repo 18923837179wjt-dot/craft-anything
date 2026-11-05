@@ -180,9 +180,10 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
       it can still hang the console host on Windows Server 2022 (only a timeout ends the tree)
 - [ ] `process::launch_tests::a_watched_program_can_be_stopped` leaves its `sleep 30` (Windows:
       `ping -n 30`) running, on `main` too: `stop` ends the shell but not what the shell started
-- [ ] `a_helper_is_judged_by_whether_it_runs` (ai crate) sometimes fails when several crates'
-      tests run at once and passes alone: it writes a script and runs it straight away, which a
-      busy machine can refuse while another test's child still holds the file open
+- [x] `a_helper_is_judged_by_whether_it_runs` (ai crate) sometimes failed when several crates'
+      tests ran at once: a script just written can't start while another thread's child still
+      holds it open ("Text file busy"). #787 tries again: on Linux 4 of 72 runs failed before
+      it, none after
 - [ ] `a_remote_query_expands_only_the_remote_working_directory` (ai crate) fails on a Mac: the
       temp folder is `/var/…`, a link to `/private/var/…`, and the shell's `$PWD` gives the second.
       Compare with the folder's canonical path
