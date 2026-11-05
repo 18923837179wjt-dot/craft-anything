@@ -535,7 +535,12 @@ pub fn decode(link_type: u32, data: &[u8]) -> Decoded {
         }
         12 | 14 | 101 | 228 | 229 => {
             d.protocols.push("raw");
-            (r.u8(0).map(|b| if b >> 4 == 6 { 0x86dd } else { 0x0800 }), 0)
+            let ethertype = match link_type {
+                228 => Some(0x0800),
+                229 => Some(0x86dd),
+                _ => r.u8(0).map(|b| if b >> 4 == 6 { 0x86dd } else { 0x0800 }),
+            };
+            (ethertype, 0)
         }
         _ => {
             d.note = Some(format!("link type {link_type} ({}) is not decoded", link_name(link_type)));
