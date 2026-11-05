@@ -660,24 +660,27 @@ fn find_pclntab(file: &object::File<'_>, data: &[u8], container: &str, text_va: 
     let r = Reader::new(data);
     let want = if container == "macho" { "__gopclntab" } else { ".gopclntab" };
     let mut named_section = None;
+    let mut partial = None;
     if let Some(s) = file.sections().find(|s| s.name().ok() == Some(want))
         && let Some((fo, fs)) = s.file_range()
         && let Ok(off) = usize::try_from(fo)
     {
         let size = usize::try_from(fs).unwrap_or(usize::MAX);
         named_section = Some((off, off.saturating_add(size).min(data.len())));
-        if let Some(t) = read_pclntab(&r, off, size, "section", Some(want.to_string()), text_va) {
-            return Some(t);
+        match read_pclntab(&r, off, size, "section", Some(want.to_string()), text_va) {
+            Some(t) if t.declared_functions == 0 || !t.functions.is_empty() => return Some(t),
+            Some(t) => partial = Some(t),
+            None => warnings.push(format!("{want} is present but could not be read within its declared section")),
         }
-        warnings.push(format!("{want} is present but could not be read within its declared section"));
     }
     // Scan for a header with plausible fields (PE files and stripped section tables).
     let mut i = 0usize;
     let mut tries = 0usize;
     while i.checked_add(8).is_some_and(|e| e <= data.len()) && tries < 4096 {
-        let hay = data.get(i..)?;
-        let pos = hay.windows(4).position(|w| matches!(w, [0xfb | 0xfa | 0xf0 | 0xf1, 0xff, 0xff, 0xff] | [0xff, 0xff, 0xff, 0xfb | 0xfa | 0xf0 | 0xf1]))?;
-        let at = i.checked_add(pos)?;
+        let Some(hay) = data.get(i..) else { break };
+        let pos = hay.windows(4).position(|w| matches!(w, [0xfb | 0xfa | 0xf0 | 0xf1, 0xff, 0xff, 0xff] | [0xff, 0xff, 0xff, 0xfb | 0xfa | 0xf0 | 0xf1]));
+        let Some(pos) = pos else { break };
+        let Some(at) = i.checked_add(pos) else { break };
         tries += 1;
         // A scan may recover a later header, but cannot widen a known section's extent.
         let size = named_section.filter(|&(start, end)| at == start || (at >= start && at < end)).map_or(data.len() - at, |(_, end)| end.saturating_sub(at));
@@ -687,9 +690,10 @@ fn find_pclntab(file: &object::File<'_>, data: &[u8], container: &str, text_va: 
         {
             return Some(t);
         }
-        i = at.checked_add(1)?;
+        let Some(next) = at.checked_add(1) else { break };
+        i = next;
     }
-    None
+    partial
 }
 
 fn read_pclntab(r: &Reader<'_>, base: usize, size: usize, located_by: &'static str, section: Option<String>, text_va: Option<u64>) -> Option<GoPclntab> {
@@ -861,6 +865,46 @@ mod tests {
 
         data[header + 32..header + 40].copy_from_slice(&((8 + functab + 4) as u64).to_le_bytes());
         assert!(inspect(&data, None).unwrap().pclntab.is_none());
+        assert!(functions(&data).is_empty());
+    }
+
+    fn named_pclntab_with_unreadable_names(interior: bool) -> (Vec<u8>, usize, GoPclntab) {
+        let mut data = fx::go_elf();
+        let (header, start, size) = pclntab_section(&data);
+        let recovered = start + size;
+        let mut end = recovered;
+        if interior {
+            let table = data[start..recovered].to_vec();
+            data[recovered..recovered + size].copy_from_slice(&table);
+            end += size;
+        }
+        // The name base is inside the section, but no complete name follows it.
+        data[end] = b'x';
+        data[start + 32..start + 40].copy_from_slice(&((end - start) as u64).to_le_bytes());
+        data[header + 32..header + 40].copy_from_slice(&((end + 1 - start) as u64).to_le_bytes());
+        let partial = read_pclntab(&Reader::new(&data), start, end + 1 - start, "section", Some(".gopclntab".into()), None).unwrap();
+        assert_eq!(partial.declared_functions, fx::GO_FUNCS.len() as u64);
+        assert!(partial.functions.is_empty());
+        assert!(!partial.warnings.is_empty());
+        (data, recovered, partial)
+    }
+
+    #[test]
+    fn pclntab_scan_recovers_after_an_unreadable_named_table() {
+        let (data, interior, _) = named_pclntab_with_unreadable_names(true);
+        let recovered = inspect(&data, None).unwrap().pclntab.unwrap();
+        assert_eq!(recovered.located_by, "scan");
+        assert_eq!(recovered.offset, interior as u64);
+        let expected: Vec<_> = fx::GO_FUNCS.iter().map(|(name, off)| GoFunction { name: (*name).to_string(), entry: fx::GO_TEXT_VA + *off }).collect();
+        assert_eq!(recovered.functions, expected);
+        assert!(recovered.warnings.is_empty());
+        assert_eq!(functions(&data), recovered.functions);
+    }
+
+    #[test]
+    fn pclntab_scan_preserves_an_unreadable_named_table_without_replacement() {
+        let (data, _, partial) = named_pclntab_with_unreadable_names(false);
+        assert_eq!(inspect(&data, None).unwrap().pclntab, Some(partial));
         assert!(functions(&data).is_empty());
     }
 
