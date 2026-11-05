@@ -127,8 +127,13 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
                 }
                 disk_entries = zip64_disk_entries;
                 total = zip64_total;
-                cd_size = r.u64_le(rec + 40).ok_or(ZipError::Truncated("zip64 record"))?;
-                cd_offset = r.u64_le(rec + 48).ok_or(ZipError::Truncated("zip64 record"))?;
+                let zip64_cd_size = r.u64_le(rec + 40).ok_or(ZipError::Truncated("zip64 record"))?;
+                let zip64_cd_offset = r.u64_le(rec + 48).ok_or(ZipError::Truncated("zip64 record"))?;
+                if (cd_size != 0xffff_ffff && cd_size != zip64_cd_size) || (cd_offset != 0xffff_ffff && cd_offset != zip64_cd_offset) {
+                    return Err(ZipError::Corrupt("ZIP64 and classic directory bounds disagree".into()));
+                }
+                cd_size = zip64_cd_size;
+                cd_offset = zip64_cd_offset;
                 zip64 = true;
                 eocd_record_start = rec as u64;
             }

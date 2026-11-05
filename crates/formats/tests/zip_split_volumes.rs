@@ -133,3 +133,31 @@ fn mixed_classic_and_zip64_entry_counts_can_describe_one_volume() {
         assert_eq!(zip::read_entry(&data, &archive.entries[0], 10).unwrap(), b"x");
     }
 }
+
+#[test]
+fn zip64_cannot_replace_explicit_classic_directory_bounds() {
+    for field in [12, 16] {
+        let mut data = zip64_archive(0, 0, 0, 1, 1);
+        let end = data.len() - 22;
+        let value = u32::from_le_bytes(data[end + field..end + field + 4].try_into().unwrap());
+        data[end + field..end + field + 4].copy_from_slice(&(value + 1).to_le_bytes());
+        assert!(matches!(zip::parse(&data, 10), Err(ZipError::Corrupt(_))), "field {field}");
+    }
+}
+
+#[test]
+fn each_zip64_field_can_resolve_its_own_classic_sentinel() {
+    for (field, width) in [(4, 2), (6, 2), (8, 2), (10, 2), (12, 4), (16, 4)] {
+        let mut data = zip64_archive(0, 0, 0, 1, 1);
+        let end = data.len() - 22;
+        data[end + 8..end + 10].copy_from_slice(&1u16.to_le_bytes());
+        data[end + 10..end + 12].copy_from_slice(&1u16.to_le_bytes());
+        data[end + field..end + field + width].fill(0xff);
+        let archive = zip::parse(&data, 10).unwrap();
+        assert!(archive.zip64, "field {field}");
+        assert_eq!(archive.declared_entries, 1, "field {field}");
+        assert_eq!(archive.entries.len(), 1, "field {field}");
+        assert_eq!(archive.prefix_bytes, 0, "field {field}");
+        assert_eq!(zip::read_entry(&data, &archive.entries[0], 10).unwrap(), b"x", "field {field}");
+    }
+}
