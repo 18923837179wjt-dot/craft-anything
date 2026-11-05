@@ -845,21 +845,24 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
                     // first one and skip the rest of the RDATA.
                     let mut txt = String::new();
                     let mut pos = 0;
+                    out.incomplete |= rd.is_empty();
                     while let Some(&len) = rd.get(pos) {
                         let len = usize::from(len);
-                        let end = (pos + 1).saturating_add(len).min(rd.len());
-                        match rd.get(pos + 1..end) {
-                            Some(part) => {
-                                txt.push_str(&String::from_utf8_lossy(part));
-                                pos = end;
-                            }
-                            None => break,
-                        }
+                        let end = pos + 1 + len;
+                        let Some(part) = rd.get(pos + 1..end) else {
+                            out.incomplete = true;
+                            break;
+                        };
+                        txt.push_str(&String::from_utf8_lossy(part));
+                        pos = end;
                     }
                     txt
                 }
                 (_, n) => format!("<{n} bytes>"),
             };
+            if out.incomplete {
+                break;
+            }
             out.answers.push(DnsAnswer { name, rtype: qtype_name(rt), ttl, value });
             off = rd_off + usize::from(rdlen);
         }
