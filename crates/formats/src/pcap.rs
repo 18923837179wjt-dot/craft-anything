@@ -896,12 +896,21 @@ fn tcp_app(p: &[u8], d: &mut Decoded) {
         && METHODS.contains(&m)
         && v.starts_with("HTTP/1.")
     {
-        let lower = String::from_utf8_lossy(head).to_ascii_lowercase();
-        let host = lower.find("\r\nhost:").and_then(|i| {
-            let start = i + 7;
-            let raw = String::from_utf8_lossy(head.get(start..)?).into_owned();
-            Some(raw.split("\r\n").next().unwrap_or("").trim().to_string())
-        });
+        let mut remaining = head.get(line_end + 2..).unwrap_or(&[]);
+        let mut host = None;
+        while let Some(end) = remaining.windows(2).position(|w| w == b"\r\n") {
+            let field = remaining.get(..end).unwrap_or(&[]);
+            if field.is_empty() {
+                break;
+            }
+            if let Some(colon) = field.iter().position(|&b| b == b':')
+                && field.get(..colon).is_some_and(|name| name.eq_ignore_ascii_case(b"host"))
+            {
+                host = field.get(colon + 1..).map(|value| String::from_utf8_lossy(value).trim().to_string());
+                break;
+            }
+            remaining = remaining.get(end + 2..).unwrap_or(&[]);
+        }
         d.protocols.push("http");
         d.http = Some(Http { kind: "request", method: Some(m.to_string()), target: Some(strip_userinfo(t)), status: None, version: v.to_string(), host });
         return;
