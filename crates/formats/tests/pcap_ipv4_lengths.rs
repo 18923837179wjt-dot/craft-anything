@@ -43,6 +43,13 @@ fn complete_options_and_truncated_transport_keep_their_valid_fields() {
     let mut packet = ipv4_pkt(17, [1; 4], [2; 4], &payload);
     packet[0] = 0x46;
     assert_eq!(decode(101, &packet).transport.unwrap().payload_len, 4);
+    packet.truncate(34);
+    let decoded = decode(101, &packet);
+    assert!(decoded.ip.is_some());
+    let transport = decoded.transport.unwrap();
+    assert_eq!(transport.src_port, Some(100));
+    assert_eq!(transport.dst_port, Some(200));
+    assert_eq!(transport.payload_len, 2);
     packet.truncate(28);
     let decoded = decode(101, &packet);
     assert!(decoded.ip.is_some());
