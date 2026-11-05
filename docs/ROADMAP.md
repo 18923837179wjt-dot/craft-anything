@@ -817,7 +817,7 @@ Owner: open · Status: in progress
 
 ### R3.12 Format parser correctness
 Owner: open · Status: in progress
-- [ ] Count every compression block spanned by an IoStore chunk.
+- [x] Count every compression block spanned by an IoStore chunk.
       — claimed: Afloat16, branch bugfix/r3.12-iostore-unaligned-chunk-blocks-20261105
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
       area and reject unrepresentable widths, base64 (plists, source maps) refuses damaged tails
