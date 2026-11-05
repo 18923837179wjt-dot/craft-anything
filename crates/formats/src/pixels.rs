@@ -159,12 +159,17 @@ fn blocks(out: &mut [u8], w: usize, h: usize, texels: impl Iterator<Item = [[u8;
 /// Decode a `width`×`height` picture (`data` starts with it) into RGBA, rows in stored order.
 pub fn decode(layout: Layout, width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>, FormatError> {
     let need = size(layout, width, height).ok_or_else(|| FormatError::TooLarge(format!("a {width}×{height} picture")))?;
-    let data = data.get(..need).ok_or_else(|| FormatError::Truncated(format!("{} bytes of pixels, {need} needed", data.len())))?;
     let (w, h) = (width as usize, height as usize);
+    let out_len = w
+        .checked_mul(h)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .ok_or_else(|| FormatError::TooLarge(format!("a {width}×{height} RGBA picture")))?;
+    let data = data.get(..need).ok_or_else(|| FormatError::Truncated(format!("{} bytes of pixels, {need} needed", data.len())))?;
     if w == 0 || h == 0 {
         return Err(FormatError::Malformed("an empty picture".into()));
     }
-    let mut out = vec![0u8; w * h * 4];
+    let mut out = vec![0u8; out_len];
     let mut put = |px: &mut dyn Iterator<Item = [u8; 4]>| {
         for (dst, p) in out.as_chunks_mut::<4>().0.iter_mut().zip(px) {
             *dst = p;
