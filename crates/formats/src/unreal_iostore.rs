@@ -124,6 +124,7 @@ pub fn header(data: &[u8]) -> Result<Header, FormatError> {
     let hash_seeds = c.u32("perfect hash seeds")?;
     let partition_size = c.u64("partition size")?;
     let without_hash = c.u32("chunks without perfect hash")?;
+    c.take(44, "reserved header fields")?;
     let flags = Flags { compressed: bits & 1 != 0, encrypted: bits & 2 != 0, signed: bits & 4 != 0, indexed: bits & 8 != 0 };
     Ok(Header {
         version,
