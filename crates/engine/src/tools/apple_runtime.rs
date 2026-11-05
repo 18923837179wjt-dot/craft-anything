@@ -439,11 +439,16 @@ mod macos {
         let request = json!({"command": "observe", "pid": pid, "window_id": p.window_id, "screenshot": p.screenshot, "accessibility": p.accessibility, "max_nodes": p.max_nodes});
         let result = run_helper(ctx, request, 10_000)?;
         let nodes = result.get("nodes").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+        let summary = if p.accessibility {
+            format!("Read {nodes} accessibility node(s) from pid {pid}.")
+        } else {
+            format!("Skipped the accessibility tree for pid {pid}, as requested.")
+        };
         let b =
             EvidenceBuilder::new("runtime_ui_read", Subject { kind: "ui".into(), sha256: None, name: Some(format!("pid {pid}")) }, env(ctx, "accessibility"))
-                .params(json!({"pid": pid, "max_nodes": p.max_nodes, "screenshot": p.screenshot}))
+                .params(json!({"pid": pid, "max_nodes": p.max_nodes, "screenshot": p.screenshot, "accessibility": p.accessibility}))
                 .result(result)
-                .summary(format!("Read {nodes} accessibility node(s) from pid {pid}."))
+                .summary(summary)
                 .confidence(Confidence::Observed)
                 .authority(Authority::OurRun);
         Ok(ToolOutput::evidence(b.build()?))
@@ -602,6 +607,23 @@ mod tests {
             assert_eq!(err.code, craft_anything_evidence::ErrorCode::FeatureMissing, "{id}");
             let spec = *e.registry().get(id).unwrap();
             assert!(!e.availability(&spec, &e.session()).available, "{id}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_can_skip_accessibility_without_reading_a_tree() {
+        let e = Engine::new(crate::testing::session());
+        // Compile and run the real Swift helper. This process has no app UI, and the test
+        // must work even when the invoking terminal has no Accessibility permission.
+        // A zero node limit must not mark a deliberately skipped tree as truncated.
+        for max_nodes in [0, 1] {
+            let output =
+                e.call("runtime_ui_read", json!({"pid": std::process::id(), "accessibility": false, "max_nodes": max_nodes}), granted()).unwrap().to_json();
+            assert_eq!(output["result"]["nodes"], json!([]), "{output}");
+            assert_eq!(output["result"]["truncated"], false, "{output}");
+            assert_eq!(output["params"]["accessibility"], false, "{output}");
+            assert!(output["summary"].as_str().unwrap().contains("Skipped the accessibility tree"), "{output}");
         }
     }
 
