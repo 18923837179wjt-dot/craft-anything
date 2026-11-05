@@ -32,6 +32,9 @@ fn directory_count_is_bounded_by_complete_entries_in_the_optional_header() {
             data[0x98 + fixed..0x98 + fixed + 16].fill(0x55);
             let parsed = pe::headers(&data).unwrap();
             assert_eq!(parsed.data_dirs.len(), available / 8, "plus={plus}, available={available}");
+            if available >= 8 {
+                assert_eq!(parsed.data_dirs[0], (0x5555_5555, 0x5555_5555), "plus={plus}, available={available}");
+            }
         }
     }
 }
