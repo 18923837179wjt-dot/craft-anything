@@ -1270,8 +1270,9 @@ pub fn summarize(data: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Summary, F
                     row.packets_b_to_a += 1;
                     row.bytes_b_to_a += u64::from(f.original_len);
                 }
-                if f.ts_ns.is_some() {
-                    row.last_ts_ns = f.ts_ns;
+                if let Some(t) = f.ts_ns {
+                    row.first_ts_ns = Some(row.first_ts_ns.map_or(t, |first| first.min(t)));
+                    row.last_ts_ns = Some(row.last_ts_ns.map_or(t, |last| last.max(t)));
                 }
                 for app in d.protocols.iter().skip_while(|p| !matches!(**p, "tcp" | "udp")).skip(1) {
                     row.applications.insert(app);
