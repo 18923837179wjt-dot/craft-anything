@@ -121,13 +121,12 @@ pub fn decompress(kind: u32, input: &[u8], out_len: u32) -> Result<Vec<u8>, Form
     }
     let output = match kind {
         0 => Ok(input.to_vec()),
-        // Unity's LZMA is the 5 property bytes and the stream; the `.lzma` form adds the size.
+        // Unity stores the properties and stream without a size header; check its end before trusting out_len.
         1 => {
-            let props = input.get(..5).ok_or_else(|| FormatError::Truncated("LZMA properties".into()))?;
-            let mut alone = props.to_vec();
-            alone.extend_from_slice(&u64::from(out_len).to_le_bytes());
-            alone.extend_from_slice(&input[5..]);
-            decompress::lzma(&alone, u64::from(out_len)).map_err(bad)
+            if input.len() < 5 {
+                return Err(FormatError::Truncated("LZMA properties".into()));
+            }
+            decompress::lzma_raw_complete(input, out_len).map_err(bad)
         }
         2 | 3 => decompress::lz4_block(input, out_len as usize).map_err(bad),
         n => Err(FormatError::Unsupported(format!("compression {n}"))),
