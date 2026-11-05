@@ -591,6 +591,10 @@ fn ipv6(p: &[u8], d: &mut Decoded) {
         d.note = Some("IPv6 header cut short".into());
         return;
     };
+    if r.u8(0).is_none_or(|version| version >> 4 != 6) {
+        d.note = Some("not a valid IPv6 header".into());
+        return;
+    }
     d.protocols.push("ipv6");
     let ip6 = |b: &[u8]| IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(b).unwrap_or([0; 16])));
     let end = (40 + usize::from(plen)).min(p.len());
