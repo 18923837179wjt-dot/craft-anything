@@ -168,9 +168,12 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
       says so), yet the bot asks them for details. About half the open issues came that way. Get
       replies back to them, or stop asking
 - [ ] `which::tests::usual_windows_dirs_come_after_path` (platform) fails on a Windows machine
-      whose environment adds a folder (10 found, 9 expected, "nothing twice"), on `main` too; and
-      `capture::console_tests::reads_what_the_program_drew_and_stops_at_the_deadline` failed once
-      with the whole platform suite running and passes alone. Find what each depends on
+      whose environment adds a folder (10 found, 9 expected, "nothing twice"), on `main` too. Find
+      what it depends on
+- [ ] `capture::console_tests` (platform) time out now and then with the whole platform suite
+      running and pass alone: `reads_what_the_program_drew_and_stops_at_the_deadline`, and
+      `nothing_it_started_outlives_the_deadline` too, on `main` as well. Find what they depend on
+      — claimed: SoldierPePe, branch test/r5.2-console-capture-flake
 - [ ] `a_helper_is_judged_by_whether_it_runs` (ai crate) sometimes fails when several crates'
       tests run at once and passes alone: it writes a script and runs it straight away, which a
       busy machine can refuse while another test's child still holds the file open
