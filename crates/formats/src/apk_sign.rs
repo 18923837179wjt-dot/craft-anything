@@ -6,6 +6,8 @@ use crate::bytes::Reader;
 use serde::Serialize;
 
 const MAGIC: &[u8; 16] = b"APK Sig Block 42";
+const EOCD_SEARCH: usize = 22 + 0xffff;
+const CD_HEADER_LEN: usize = 46;
 const MAX_PAIRS: usize = 256;
 const MAX_ITEMS: usize = 64;
 /// Most certificate bytes kept per certificate.
@@ -105,17 +107,58 @@ fn signing_block_extent(r: &Reader<'_>, cd: usize) -> Option<(usize, u64)> {
     Some((cd.checked_sub(total)?, size))
 }
 
+/// `None` means the scan-wide record budget ran out; `Some(false)` means bad framing.
+fn framed_directory(directory: &[u8], count: u16, records_left: &mut usize) -> Option<bool> {
+    if usize::from(count) > directory.len() / CD_HEADER_LEN {
+        return Some(false);
+    }
+    let r = Reader::new(directory);
+    let mut pos = 0usize;
+    for _ in 0..count {
+        *records_left = records_left.checked_sub(1)?;
+        let Some(header) = r.slice(pos, CD_HEADER_LEN).map(Reader::new) else { return Some(false) };
+        if header.slice(0, 4) != Some(b"PK\x01\x02") {
+            return Some(false);
+        }
+        let Some(len) = [28, 30, 32].into_iter().try_fold(CD_HEADER_LEN, |len, field| len.checked_add(usize::from(header.u16_le(field)?))) else {
+            return Some(false);
+        };
+        let Some(next) = pos.checked_add(len).filter(|next| *next <= directory.len()) else { return Some(false) };
+        pos = next;
+    }
+    if pos == directory.len() {
+        return Some(true);
+    }
+    // Classic ZIP permits one digital-signature record after the directory's file headers.
+    let Some(tail) = directory.get(pos..) else { return Some(false) };
+    let tail_reader = Reader::new(tail);
+    Some(tail_reader.slice(0, 4) == Some(b"PK\x05\x05") && tail_reader.u16_le(4).is_some_and(|len| usize::from(len).checked_add(6) == Some(tail.len())))
+}
+
 fn find_eocd(data: &[u8]) -> Option<usize> {
+    // One input-sized pass plus the search window's allowance, shared by every candidate.
+    let records_left = (data.len() / CD_HEADER_LEN).checked_add(EOCD_SEARCH)?;
+    find_eocd_with_budget(data, records_left)
+}
+
+fn find_eocd_with_budget(data: &[u8], mut records_left: usize) -> Option<usize> {
     let r = Reader::new(data);
-    let from = data.len().saturating_sub(22 + 0xffff);
+    let from = data.len().saturating_sub(EOCD_SEARCH);
     let mut i = data.len().checked_sub(22)?;
     // Prefer the enclosing record when its comment contains another framed marker. A candidate
-    // must point backward to a readable signing block, not to a footer beyond its own position.
+    // must follow its complete central directory, with a readable signing block before it.
     let mut found = None;
     loop {
-        if data.get(i..i + 4) == Some(b"PK\x05\x06")
-            && r.u16_le(i + 20).is_some_and(|n| usize::from(n) == data.len() - i - 22)
-            && r.u32_le(i + 16).is_some_and(|cd| cd as usize <= i && signing_block_extent(&r, cd as usize).is_some())
+        if let Some(end) = r.slice(i, 22).map(Reader::new)
+            && end.slice(0, 4) == Some(b"PK\x05\x06")
+            && end.u16_le(20).is_some_and(|n| usize::from(n) == data.len() - i - 22)
+            && let Some(cd) = end.u32_le(16).and_then(|n| usize::try_from(n).ok())
+            && let Some(size) = end.u32_le(12).and_then(|n| usize::try_from(n).ok())
+            && cd.checked_add(size) == Some(i)
+            && signing_block_extent(&r, cd).is_some()
+            && let Some(count) = end.u16_le(10)
+            && let Some(directory) = r.slice(cd, size)
+            && framed_directory(directory, count, &mut records_left)?
         {
             found = Some(i);
         }
@@ -273,6 +316,29 @@ pub fn parse(data: &[u8]) -> Option<SigningBlock> {
 mod tests {
     use super::*;
     use craft_anything_testkit::android as fx;
+
+    #[test]
+    fn directory_checks_share_the_record_budget() {
+        let zip = craft_anything_testkit::electron::zip_stored(&[("a", b"a"), ("b", b"b")]);
+        let eocd = zip.len() - 22;
+        let cd = Reader::new(&zip).u32_le(eocd + 16).unwrap() as usize;
+        let directory = &zip[cd..eocd];
+        let mut records_left = 3;
+        assert_eq!(framed_directory(directory, 2, &mut records_left), Some(true));
+        assert_eq!(records_left, 1);
+        assert_eq!(framed_directory(directory, 2, &mut records_left), None);
+        assert_eq!(records_left, 0);
+    }
+
+    #[test]
+    fn eocd_lookup_rejects_an_exhausted_directory_budget() {
+        let apk = fx::notes_apk();
+        let eocd = apk.len() - 22;
+        let count = usize::from(Reader::new(&apk).u16_le(eocd + 10).unwrap());
+        assert!(count > 0);
+        assert_eq!(find_eocd_with_budget(&apk, count), Some(eocd));
+        assert_eq!(find_eocd_with_budget(&apk, count - 1), None);
+    }
 
     #[test]
     fn reads_v2_and_v3_signers() {
