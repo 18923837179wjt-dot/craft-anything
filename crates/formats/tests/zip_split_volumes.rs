@@ -24,26 +24,47 @@ fn central_entries_cannot_point_to_another_volume() {
     assert_split(&data);
 }
 
-fn zip64_entry_disk(disk: u32) -> Vec<u8> {
+fn zip64_entry_disk(disk: u32, with_sizes_and_offset: bool) -> Vec<u8> {
     let mut data = zip_stored(&[("a", b"x")]);
     let central = data.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
     let end = data.len() - 22;
     data[central + 34..central + 36].copy_from_slice(&u16::MAX.to_le_bytes());
-    data[central + 30..central + 32].copy_from_slice(&8u16.to_le_bytes());
     let mut extra = vec![1, 0, 4, 0];
+    if with_sizes_and_offset {
+        data[central + 20..central + 28].fill(0xff);
+        data[central + 42..central + 46].fill(0xff);
+        extra[2..4].copy_from_slice(&28u16.to_le_bytes());
+        // Uncompressed size, compressed size, and local header offset precede the disk.
+        for value in [1u64, 1, 0] {
+            extra.extend(value.to_le_bytes());
+        }
+    }
     extra.extend(disk.to_le_bytes());
+    data[central + 30..central + 32].copy_from_slice(&(extra.len() as u16).to_le_bytes());
+    let directory_size = (end - central + extra.len()) as u32;
     data.splice(end..end, extra);
     let end = data.len() - 22;
-    data[end + 12..end + 16].copy_from_slice(&55u32.to_le_bytes());
+    data[end + 12..end + 16].copy_from_slice(&directory_size.to_le_bytes());
     data
 }
 
 #[test]
 fn a_zip64_disk_sentinel_is_resolved_before_rejecting_the_entry() {
-    let data = zip64_entry_disk(0);
+    let data = zip64_entry_disk(0, false);
     let archive = zip::parse(&data, 10).unwrap();
     assert_eq!(zip::read_entry(&data, &archive.entries[0], 10).unwrap(), b"x");
-    assert_split(&zip64_entry_disk(1));
+    assert_split(&zip64_entry_disk(1, false));
+}
+
+#[test]
+fn a_zip64_disk_sentinel_follows_sizes_and_the_local_offset() {
+    let data = zip64_entry_disk(0, true);
+    let archive = zip::parse(&data, 10).unwrap();
+    assert_eq!(archive.entries[0].uncompressed_size, 1);
+    assert_eq!(archive.entries[0].compressed_size, 1);
+    assert_eq!(archive.entries[0].local_header_offset, 0);
+    assert_eq!(zip::read_entry(&data, &archive.entries[0], 10).unwrap(), b"x");
+    assert_split(&zip64_entry_disk(1, true));
 }
 
 fn zip64_archive(record_disk: u32, central_disk: u32, locator_disk: u32, disks: u32, entries_on_disk: u64) -> Vec<u8> {
