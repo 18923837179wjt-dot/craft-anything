@@ -167,9 +167,8 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
 - [ ] **decision** Replies don't reach people who file through the ticket relay (each such ticket
       says so), yet the bot asks them for details. About half the open issues came that way. Get
       replies back to them, or stop asking
-- [ ] `which::tests::usual_windows_dirs_come_after_path` (platform) fails on a Windows machine
-      whose environment adds a folder (10 found, 9 expected, "nothing twice"), on `main` too. Find
-      what it depends on
+- [x] `which::tests::usual_windows_dirs_come_after_path` (platform) failed on Windows with 10
+      found, 9 expected ("nothing twice"): #748's second Antigravity folder, counted since #770
 - [x] `capture::console_tests` (platform) timed out now and then with the whole platform suite
       running. On Windows Server 2022 a program another thread starts while a console opens
       inherits its handles and holds it open until it ends, and closing a console that programs
