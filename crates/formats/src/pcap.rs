@@ -795,8 +795,9 @@ fn dns_name(msg: &[u8], mut off: usize) -> Option<(String, usize)> {
 fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
     let r = Reader::new(msg);
     let (Some(id), Some(flags), Some(qd), Some(an)) = (r.u16_be(0), r.u16_be(2), r.u16_be(4), r.u16_be(6)) else { return };
+    let opcode = (flags >> 11) & 0xf;
     // Sanity: opcode 0–6 and no absurd counts, so random payload on port 53 isn't misread.
-    if (flags >> 11) & 0xf > 6 || qd > 64 || qd == 0 && an == 0 {
+    if opcode > 6 || qd > 64 || qd == 0 && an == 0 {
         return;
     }
     d.protocols.push(label);
@@ -820,7 +821,7 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
                 out.incomplete = true;
                 break;
             };
-            let (Some(rt), Some(ttl), Some(rdlen)) = (r.u16_be(next), r.u32_be(next + 4), r.u16_be(next + 8)) else {
+            let (Some(rt), Some(class), Some(ttl), Some(rdlen)) = (r.u16_be(next), r.u16_be(next + 2), r.u32_be(next + 4), r.u16_be(next + 8)) else {
                 out.incomplete = true;
                 break;
             };
@@ -838,8 +839,19 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
                 )
                 .to_string(),
                 (28, 16) => Ipv6Addr::from(<[u8; 16]>::try_from(rd).unwrap_or([0; 16])).to_string(),
-                (2 | 5 | 12, _) => dns_name(msg, rd_off).map(|(n, _)| n).unwrap_or_default(),
-                (15, _) => dns_name(msg, rd_off + 2).map(|(n, _)| n).unwrap_or_default(),
+                (2 | 5 | 12 | 15, _) => {
+                    // RFC 2136 prerequisites can name an RRset without carrying its value.
+                    if rd.is_empty() && opcode == 5 && matches!(class, 254 | 255) && ttl == 0 {
+                        String::new()
+                    } else {
+                        let name_off = rd_off + if rt == 15 { 2 } else { 0 };
+                        let Some((value, _)) = dns_name(msg, name_off).filter(|(_, end)| *end <= rd_off + rd.len()) else {
+                            out.incomplete = true;
+                            break;
+                        };
+                        value
+                    }
+                }
                 (16, _) => {
                     // RFC 1035 §3.3.14: one TXT RDATA holds any number of
                     // length-prefixed character strings, and a zero-length
