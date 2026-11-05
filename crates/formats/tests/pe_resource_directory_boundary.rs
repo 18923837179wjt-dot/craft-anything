@@ -203,12 +203,9 @@ fn resource_metadata_obeys_section_table_priority() {
 fn header_resource_metadata_stops_at_section_mapping_changes() {
     let metadata_size = 0x60 + 2 + 6 * 2;
     let last_unit = metadata_size - 2;
-    for (virtual_size, raw_size, distance, rejected) in [
-        (2, 2, last_unit, true),
-        (2, 0, last_unit, true),
-        (0, 0, last_unit, false),
-        (2, 2, metadata_size, false),
-    ] {
+    for (virtual_size, raw_size, distance, rejected) in
+        [(2, 2, last_unit, true), (2, 0, last_unit, true), (0, 0, last_unit, false), (2, 2, metadata_size, false)]
+    {
         let mut data = pe_rcdata("inside", b"payload");
         let headers = pe::headers(&data).unwrap();
         let root = headers.rva_to_offset(headers.dir(2).unwrap().0).unwrap();
