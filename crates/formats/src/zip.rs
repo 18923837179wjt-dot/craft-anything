@@ -135,15 +135,15 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
             truncated = true;
             break;
         }
+        if pos.checked_add(46).is_none_or(|end| end > directory_end) {
+            return Err(ZipError::Truncated("directory entry"));
+        }
         if r.slice(pos, 4) != Some(b"PK\x01\x02") {
             if entries.is_empty() {
                 return Err(ZipError::Corrupt(format!("no central directory header at offset {pos}")));
             }
             truncated = true;
             break;
-        }
-        if pos.checked_add(46).is_none_or(|end| end > directory_end) {
-            return Err(ZipError::Truncated("directory entry"));
         }
         let flags = r.u16_le(pos + 8).ok_or(ZipError::Truncated("directory entry"))?;
         let method = r.u16_le(pos + 10).ok_or(ZipError::Truncated("directory entry"))?;

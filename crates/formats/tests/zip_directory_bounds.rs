@@ -1,5 +1,18 @@
-use craft_anything_formats::zip;
+use craft_anything_formats::zip::{self, ZipError};
 use craft_anything_testkit::electron::zip_stored;
+
+#[test]
+fn a_short_declared_entry_is_rejected_before_its_signature_is_checked() {
+    for remaining in 0..46 {
+        let mut data = zip_stored(&[("a", b"x")]);
+        let end = data.len() - 22;
+        let size = u32::from_le_bytes(data[end + 12..end + 16].try_into().unwrap());
+        data[end + 8..end + 12].copy_from_slice(&[2, 0, 2, 0]);
+        data[end + 12..end + 16].copy_from_slice(&(size + remaining).to_le_bytes());
+        data.splice(end..end, vec![0; remaining as usize]);
+        assert!(matches!(zip::parse(&data, 10), Err(ZipError::Truncated("directory entry"))), "remaining {remaining} bytes");
+    }
+}
 
 #[test]
 fn directory_names_and_comments_cannot_borrow_end_record_bytes() {
