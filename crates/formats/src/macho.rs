@@ -309,15 +309,24 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
     }
     // Function starts: ULEB deltas from the start of __TEXT.
     if let (Some((off, size)), Some(t)) = (fstarts, &text) {
-        let mut o = off as usize;
+        let start = off as usize;
         let end = (off as usize).saturating_add(size as usize).min(data.len());
+        let starts = Reader::new(data.get(start..end).unwrap_or(&[]));
+        let mut o = 0;
         let mut addr = t.vmaddr;
-        while o < end && b.function_starts.len() < 2_000_000 {
-            let Some((delta, n)) = r.uleb128(o) else { break };
+        while o < starts.len() && b.function_starts.len() < 2_000_000 {
+            let Some((delta, n)) = starts.uleb128(o) else {
+                b.warnings.push("function-start delta is cut short or invalid".into());
+                break;
+            };
             if delta == 0 {
                 break;
             }
-            addr = addr.wrapping_add(delta);
+            let Some(next) = addr.checked_add(delta) else {
+                b.warnings.push("function-start address overflows".into());
+                break;
+            };
+            addr = next;
             b.function_starts.push(addr);
             o += n;
         }
