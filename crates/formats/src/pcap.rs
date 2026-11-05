@@ -312,7 +312,11 @@ impl<'a> Capture<'a> {
                     let iface = self.section_base;
                     let snap = self.interfaces.get(iface).map(|i| i.snaplen).filter(|&s| s > 0).unwrap_or(u32::MAX);
                     let room = body_end.saturating_sub(body + 4);
-                    let cap = (orig.min(snap) as usize).min(room);
+                    let cap = orig.min(snap) as usize;
+                    if cap.checked_add(3).map(|n| n & !3) != Some(room) {
+                        self.warnings.push(format!("simple packet block at offset {p} has an inconsistent captured length; skipped"));
+                        continue;
+                    }
                     let Some(data) = r.slice(body + 4, cap) else { continue };
                     if iface >= self.interfaces.len() {
                         continue;
