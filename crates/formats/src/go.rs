@@ -659,14 +659,17 @@ fn pcln_header(r: &Reader<'_>, off: usize) -> Option<(&'static str, bool, u8, u8
 fn find_pclntab(file: &object::File<'_>, data: &[u8], container: &str, text_va: Option<u64>, warnings: &mut Vec<String>) -> Option<GoPclntab> {
     let r = Reader::new(data);
     let want = if container == "macho" { "__gopclntab" } else { ".gopclntab" };
+    let mut named_section = None;
     if let Some(s) = file.sections().find(|s| s.name().ok() == Some(want))
         && let Some((fo, fs)) = s.file_range()
         && let Ok(off) = usize::try_from(fo)
     {
-        if let Some(t) = read_pclntab(&r, off, usize::try_from(fs).unwrap_or(0), "section", Some(want.to_string()), text_va) {
+        let size = usize::try_from(fs).unwrap_or(usize::MAX);
+        named_section = Some((off, off.saturating_add(size).min(data.len())));
+        if let Some(t) = read_pclntab(&r, off, size, "section", Some(want.to_string()), text_va) {
             return Some(t);
         }
-        warnings.push(format!("{want} is present but its header is not one we know"));
+        warnings.push(format!("{want} is present but could not be read within its declared section"));
     }
     // Scan for a header with plausible fields (PE files and stripped section tables).
     let mut i = 0usize;
@@ -676,8 +679,10 @@ fn find_pclntab(file: &object::File<'_>, data: &[u8], container: &str, text_va: 
         let pos = hay.windows(4).position(|w| matches!(w, [0xfb | 0xfa | 0xf0 | 0xf1, 0xff, 0xff, 0xff] | [0xff, 0xff, 0xff, 0xfb | 0xfa | 0xf0 | 0xf1]))?;
         let at = i.checked_add(pos)?;
         tries += 1;
+        // A scan may recover a later header, but cannot widen a known section's extent.
+        let size = named_section.filter(|&(start, end)| at == start || (at >= start && at < end)).map_or(data.len() - at, |(_, end)| end.saturating_sub(at));
         if pcln_header(&r, at).is_some()
-            && let Some(t) = read_pclntab(&r, at, data.len() - at, "scan", None, text_va)
+            && let Some(t) = read_pclntab(&r, at, size, "scan", None, text_va)
             && !t.functions.is_empty()
         {
             return Some(t);
@@ -688,14 +693,15 @@ fn find_pclntab(file: &object::File<'_>, data: &[u8], container: &str, text_va: 
 }
 
 fn read_pclntab(r: &Reader<'_>, base: usize, size: usize, located_by: &'static str, section: Option<String>, text_va: Option<u64>) -> Option<GoPclntab> {
-    let (layout, big, quantum, ps) = pcln_header(r, base)?;
+    let end = base.checked_add(size)?.min(r.len());
+    let r = Reader::new(r.slice(0, end)?);
+    let (layout, big, quantum, ps) = pcln_header(&r, base)?;
     let psz = usize::from(ps);
-    let word = |off: usize| -> Option<u64> { uint(r, base.checked_add(off)?, ps, big) };
+    let word = |off: usize| -> Option<u64> { uint(&r, base.checked_add(off)?, ps, big) };
     let u32at = |off: usize| -> Option<u32> {
         let o = base.checked_add(off)?;
         if big { r.u32_be(o) } else { r.u32_le(o) }
     };
-    let end = base.saturating_add(size).min(r.len());
     let in_table = |abs: usize| abs < end;
     let mut warnings = Vec::new();
     let nfunc = word(8)?;
@@ -709,7 +715,9 @@ fn read_pclntab(r: &Reader<'_>, base: usize, size: usize, located_by: &'static s
         if !in_table(abs) {
             return None;
         }
-        let s = r.cstr(abs, MAX_NAME)?;
+        let bytes = r.slice(abs, (end - abs).min(MAX_NAME + 1))?;
+        let length = bytes.iter().position(|&byte| byte == 0)?;
+        let s = r.cstr(abs, length)?;
         (!s.is_empty()).then_some(s)
     };
     match layout {
@@ -791,6 +799,70 @@ fn read_pclntab(r: &Reader<'_>, base: usize, size: usize, located_by: &'static s
 mod tests {
     use super::*;
     use craft_anything_testkit::formats as fx;
+
+    #[test]
+    fn pclntab_entries_cannot_borrow_bytes_after_the_section() {
+        for data in [fx::pclntab_120(0x1000, &[("main.main", 0)]), fx::pclntab_116(0x1000, &[("main.main", 0)])] {
+            let r = Reader::new(&data);
+            let field = if r.u32_le(0) == Some(0xffff_fff1) { 64 } else { 56 };
+            let functab = r.u64_le(field).unwrap() as usize;
+            assert!(read_pclntab(&r, 0, functab + 4, "section", None, None).is_none());
+            let complete = read_pclntab(&r, 0, data.len(), "section", None, None).unwrap();
+            assert_eq!(complete.functions[0].name, "main.main");
+        }
+    }
+
+    #[test]
+    fn pclntab_names_must_terminate_inside_the_section() {
+        let mut data = fx::pclntab_120(0x1000, &[("main.main", 0)]);
+        let name = data.len();
+        data[32..40].copy_from_slice(&(name as u64).to_le_bytes());
+        data.extend_from_slice(b"main.outside\0");
+        let r = Reader::new(&data);
+        let partial = read_pclntab(&r, 0, name + 4, "section", None, None).unwrap();
+        assert!(partial.functions.is_empty());
+        assert!(!partial.warnings.is_empty());
+        let complete = read_pclntab(&r, 0, data.len(), "section", None, None).unwrap();
+        assert_eq!(complete.functions[0].name, "main.outside");
+    }
+
+    fn pclntab_section(data: &[u8]) -> (usize, usize, usize) {
+        let r = Reader::new(data);
+        let header = r.u64_le(40).unwrap() as usize + 2 * 64;
+        (header, r.u64_le(header + 24).unwrap() as usize, r.u64_le(header + 32).unwrap() as usize)
+    }
+
+    #[test]
+    fn pclntab_scan_does_not_widen_a_rejected_named_section() {
+        let original = fx::go_elf();
+        let (header, start, _) = pclntab_section(&original);
+        let functab = Reader::new(&original).u64_le(start + 64).unwrap() as usize;
+        for size in [functab + 4, 0] {
+            let mut data = original.clone();
+            data[header + 32..header + 40].copy_from_slice(&(size as u64).to_le_bytes());
+            let report = inspect(&data, None).unwrap();
+            assert!(report.pclntab.is_none(), "declared size={size}");
+            assert!(functions(&data).is_empty(), "declared size={size}");
+        }
+    }
+
+    #[test]
+    fn pclntab_scan_keeps_the_named_section_end_for_interior_headers() {
+        let mut data = fx::go_elf();
+        let (header, start, size) = pclntab_section(&data);
+        let table = data[start..start + size].to_vec();
+        let functab = Reader::new(&table).u64_le(64).unwrap() as usize;
+        data[start..start + 8].fill(0);
+        data[start + 8..start + 8 + size].copy_from_slice(&table);
+        data[header + 32..header + 40].copy_from_slice(&((size + 8) as u64).to_le_bytes());
+        let complete = inspect(&data, None).unwrap().pclntab.unwrap();
+        assert_eq!(complete.located_by, "scan");
+        assert_eq!(complete.functions.len(), fx::GO_FUNCS.len());
+
+        data[header + 32..header + 40].copy_from_slice(&((8 + functab + 4) as u64).to_le_bytes());
+        assert!(inspect(&data, None).unwrap().pclntab.is_none());
+        assert!(functions(&data).is_empty());
+    }
 
     #[test]
     fn elf_inline_buildinfo_and_pclntab_120() {
