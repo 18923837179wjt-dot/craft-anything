@@ -12,7 +12,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// Most frames read from one capture.
+/// Most frames and rejected simple packet blocks read from one capture.
 pub const MAX_PACKETS: u64 = 5_000_000;
 /// Most flows tracked; later flows are counted but get no id.
 pub const MAX_FLOWS: usize = 100_000;
@@ -89,6 +89,8 @@ pub struct Capture<'a> {
     /// The walk stopped at `MAX_PACKETS`.
     pub truncated: bool,
     count: u64,
+    rejected_simple_blocks: u64,
+    rejected_simple_reported: bool,
 }
 
 fn rd_u16(r: &Reader<'_>, le: bool, off: usize) -> Option<u16> {
@@ -126,6 +128,8 @@ impl<'a> Capture<'a> {
             warnings: Vec::new(),
             truncated: false,
             count: 0,
+            rejected_simple_blocks: 0,
+            rejected_simple_reported: false,
         };
         let classic = |le: bool, nanos: bool| -> Result<(Kind, String, Interface), FormatError> {
             let major = rd_u16(&r, le, 4).ok_or_else(|| FormatError::Truncated("pcap header".into()))?;
@@ -166,6 +170,26 @@ impl<'a> Capture<'a> {
         self.warnings.push(why.into());
         self.pos = self.data.len();
         None
+    }
+
+    fn packet_limit_reached(&mut self) -> bool {
+        if self.count.saturating_add(self.rejected_simple_blocks) < MAX_PACKETS {
+            return false;
+        }
+        if !self.truncated && self.pos < self.data.len() {
+            self.truncated = true;
+            self.warnings.push(format!("stopped after {MAX_PACKETS} packet records"));
+        }
+        true
+    }
+
+    fn report_rejected_simple_blocks(&mut self) {
+        if self.rejected_simple_blocks > 0 && !self.rejected_simple_reported {
+            let n = self.rejected_simple_blocks;
+            let suffix = if n == 1 { "" } else { "s" };
+            self.warnings.push(format!("skipped {n} simple packet block{suffix} with inconsistent captured lengths"));
+            self.rejected_simple_reported = true;
+        }
     }
 
     fn ts(&self, iface: usize, units: u64) -> Option<u64> {
@@ -211,6 +235,9 @@ impl<'a> Capture<'a> {
 
     fn next_ng(&mut self, mut le: bool) -> Option<Frame<'a>> {
         loop {
+            if self.packet_limit_reached() {
+                return None;
+            }
             let r = Reader::new(self.data);
             let p = self.pos;
             if p >= self.data.len() {
@@ -314,7 +341,7 @@ impl<'a> Capture<'a> {
                     let room = body_end.saturating_sub(body + 4);
                     let cap = orig.min(snap) as usize;
                     if cap.checked_add(3).map(|n| n & !3) != Some(room) {
-                        self.warnings.push(format!("simple packet block at offset {p} has an inconsistent captured length; skipped"));
+                        self.rejected_simple_blocks += 1;
                         continue;
                     }
                     let Some(data) = r.slice(body + 4, cap) else { continue };
@@ -342,17 +369,18 @@ impl<'a> Iterator for Capture<'a> {
     type Item = Frame<'a>;
 
     fn next(&mut self) -> Option<Frame<'a>> {
-        if self.count >= MAX_PACKETS {
-            if !self.truncated && self.pos < self.data.len() {
-                self.truncated = true;
-                self.warnings.push(format!("stopped after {MAX_PACKETS} frames"));
+        let frame = if self.packet_limit_reached() {
+            None
+        } else {
+            match self.kind {
+                Kind::Classic { le, nanos } => self.next_classic(le, nanos),
+                Kind::Ng { le } => self.next_ng(le),
             }
-            return None;
+        };
+        if frame.is_none() {
+            self.report_rejected_simple_blocks();
         }
-        match self.kind {
-            Kind::Classic { le, nanos } => self.next_classic(le, nanos),
-            Kind::Ng { le } => self.next_ng(le),
-        }
+        frame
     }
 }
 
@@ -1355,6 +1383,55 @@ pub fn iso8601(ns: u64) -> String {
 mod tests {
     use super::*;
     use craft_anything_testkit::pcap::{dns_query, eth, ipv4_pkt, pcap, pcapng, sample_frames, udp};
+
+    #[test]
+    fn rejected_simple_packets_count_toward_the_scan_limit() {
+        let mut data = pcapng(&[]);
+        let rejected = craft_anything_testkit::pcap::block(3, &1u32.to_le_bytes());
+        for _ in 0..3 {
+            data.extend(&rejected);
+        }
+        let mut cap = Capture::new(&data).unwrap();
+        // Reach the boundary without allocating millions of preceding valid frames.
+        cap.count = MAX_PACKETS - 2;
+        assert!(cap.next().is_none());
+        assert!(cap.truncated);
+        assert_eq!(cap.pos, data.len() - rejected.len());
+        assert_eq!(cap.warnings.len(), 2);
+        assert!(cap.warnings.iter().any(|w| w.contains("2 simple packet blocks")));
+        assert!(cap.next().is_none());
+        assert_eq!(cap.warnings.len(), 2);
+    }
+
+    #[test]
+    fn rejected_simple_packets_at_eof_do_not_report_a_truncated_scan() {
+        let mut data = pcapng(&[]);
+        let rejected = craft_anything_testkit::pcap::block(3, &1u32.to_le_bytes());
+        for _ in 0..2 {
+            data.extend(&rejected);
+        }
+        let mut cap = Capture::new(&data).unwrap();
+        cap.count = MAX_PACKETS - 2;
+        assert!(cap.next().is_none());
+        assert!(!cap.truncated);
+        assert_eq!(cap.warnings.len(), 1);
+        assert!(cap.warnings[0].contains("2 simple packet blocks"));
+    }
+
+    #[test]
+    fn valid_and_rejected_simple_packets_share_the_scan_limit() {
+        let mut data = pcapng(&[]);
+        data.extend(craft_anything_testkit::pcap::block(3, &1u32.to_le_bytes()));
+        let valid = craft_anything_testkit::pcap::block(3, &0u32.to_le_bytes());
+        data.extend(&valid);
+        data.extend(&valid);
+        let mut cap = Capture::new(&data).unwrap();
+        cap.count = MAX_PACKETS - 2;
+        assert_eq!(cap.next().unwrap().number, MAX_PACKETS - 1);
+        assert!(cap.next().is_none());
+        assert!(cap.truncated);
+        assert_eq!(cap.pos, data.len() - valid.len());
+    }
 
     #[test]
     fn tcp_cut_inside_header_keeps_ports() {

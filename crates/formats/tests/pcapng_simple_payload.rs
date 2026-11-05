@@ -38,3 +38,25 @@ fn snaplen_truncation_and_alignment_padding_are_preserved() {
         assert!(cap.warnings.is_empty());
     }
 }
+
+#[test]
+fn rejected_simple_packets_share_one_warning_and_preserve_later_frames() {
+    let mut data = pcapng(&[]);
+    let rejected = block(3, &1u32.to_le_bytes());
+    for _ in 0..128 {
+        data.extend(&rejected);
+    }
+    let mut valid = 3u32.to_le_bytes().to_vec();
+    valid.extend([1, 2, 3]);
+    data.extend(block(3, &valid));
+    let mut cap = Capture::new(&data).unwrap();
+    let frame = cap.next().unwrap();
+    assert_eq!(frame.number, 1);
+    assert_eq!(frame.data, [1, 2, 3]);
+    assert!(cap.next().is_none());
+    assert!(!cap.truncated);
+    assert_eq!(cap.warnings.len(), 1);
+    assert!(cap.warnings[0].contains("128 simple packet blocks"));
+    assert!(cap.next().is_none());
+    assert_eq!(cap.warnings.len(), 1);
+}

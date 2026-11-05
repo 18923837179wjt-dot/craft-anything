@@ -819,6 +819,7 @@ Owner: open · Status: in progress
 Owner: open · Status: in progress
 - [x] Reject incomplete simple packet block payloads.
       — claimed: Afloat16, branch bugfix/r3.12-pcapng-simple-block-length-20261105
+      Count rejected lengths against the packet scan limit and summarize them once at the end of the walk.
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
       area and reject unrepresentable widths, base64 (plists, source maps) refuses damaged tails
       and incomplete quanta through one shared decoder, OIDs must be minimally encoded, and string
