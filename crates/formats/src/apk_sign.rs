@@ -96,16 +96,34 @@ pub struct SigningBlock {
     pub warnings: Vec<String>,
 }
 
+fn signing_block_extent(r: &Reader<'_>, cd: usize) -> Option<(usize, u64)> {
+    if r.slice(cd.checked_sub(16)?, 16)? != MAGIC {
+        return None;
+    }
+    let size = r.u64_le(cd.checked_sub(24)?)?;
+    let total = usize::try_from(size).ok()?.checked_add(8)?;
+    Some((cd.checked_sub(total)?, size))
+}
+
 fn find_eocd(data: &[u8]) -> Option<usize> {
+    let r = Reader::new(data);
     let from = data.len().saturating_sub(22 + 0xffff);
     let mut i = data.len().checked_sub(22)?;
-    while i >= from {
-        if data.get(i..i + 4) == Some(b"PK\x05\x06") {
-            return Some(i);
+    // Prefer the enclosing record when its comment contains another framed marker. A candidate
+    // must point backward to a readable signing block, not to a footer beyond its own position.
+    let mut found = None;
+    loop {
+        if data.get(i..i + 4) == Some(b"PK\x05\x06")
+            && r.u16_le(i + 20).is_some_and(|n| usize::from(n) == data.len() - i - 22)
+            && r.u32_le(i + 16).is_some_and(|cd| cd as usize <= i && signing_block_extent(&r, cd as usize).is_some())
+        {
+            found = Some(i);
         }
-        i = i.checked_sub(1)?;
+        if i == from {
+            return found;
+        }
+        i -= 1;
     }
-    None
 }
 
 struct Lp<'a> {
@@ -213,13 +231,7 @@ pub fn parse(data: &[u8]) -> Option<SigningBlock> {
     let r = Reader::new(data);
     let eocd = find_eocd(data)?;
     let cd = r.u32_le(eocd + 16)? as usize;
-    let magic_at = cd.checked_sub(16)?;
-    if r.slice(magic_at, 16)? != MAGIC {
-        return None;
-    }
-    let size_footer = r.u64_le(cd.checked_sub(24)?)?;
-    let total = usize::try_from(size_footer).ok()?.checked_add(8)?;
-    let start = cd.checked_sub(total)?;
+    let (start, size_footer) = signing_block_extent(&r, cd)?;
     let mut block = SigningBlock { offset: start as u64, size: size_footer, ..SigningBlock::default() };
     if r.u64_le(start) != Some(size_footer) {
         block.warnings.push("the block's two size fields disagree".into());
