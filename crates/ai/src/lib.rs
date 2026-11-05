@@ -701,8 +701,9 @@ impl AiHub {
         let mut cfg = self.config_to_change()?;
         let removed = cfg.remove(name);
         if removed {
-            self.save_config(&cfg)?;
+            // The key first: if it can't be removed the backend stays, so this can be tried again.
             self.keys.delete(name)?;
+            self.save_config(&cfg)?;
         }
         Ok(removed)
     }

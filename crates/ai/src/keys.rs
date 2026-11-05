@@ -264,6 +264,34 @@ mod tests {
         assert_eq!(session.ext.get::<AssetKeys>().unwrap().get("other"), None, "a removed key");
     }
 
+    /// Its key can't be removed: the AI stays in the list, so removing it can be tried again.
+    #[test]
+    fn an_ai_whose_key_cannot_be_removed_stays_to_try_again() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("keys.toml");
+        let engine = std::sync::Arc::new(craft_anything_engine::Engine::new(craft_anything_engine::testing::session()));
+        let hub = crate::AiHub::with_stores(engine, d.path().join("settings.toml"), KeyStore::file_only(file.clone()));
+        let mut cfg = hub.config();
+        cfg.upsert(crate::BackendEntry {
+            config: crate::BackendConfig {
+                name: "Mine".into(),
+                kind: BackendKind::Openrouter,
+                model: "m".into(),
+                base_url: None,
+                ssh_host: None,
+                enabled: true,
+            },
+            options: Default::default(),
+        });
+        hub.engine.session().settings.ai = cfg.to_table().unwrap();
+        std::fs::write(&file, "not [ toml").unwrap();
+        assert!(hub.remove_backend("Mine").is_err());
+        assert!(hub.config().get("Mine").is_some(), "it can still be picked to try again");
+        std::fs::remove_file(&file).unwrap();
+        assert!(hub.remove_backend("Mine").unwrap());
+        assert!(hub.config().get("Mine").is_none());
+    }
+
     /// #262: a key file that can't be read is left as it is, with every other key in it.
     #[test]
     fn an_unreadable_key_file_is_never_replaced() {

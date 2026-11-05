@@ -35,23 +35,26 @@ pub struct RunSet {
     limit: usize,
     /// Running and finished runs (a finished one keeps its preview and unsent notes).
     runs: HashMap<PathBuf, RebuildRun>,
-    /// Waiting runs, and whether each must work alone (decided when queued: `poll` runs every frame
-    /// and looking it up can read the settings file).
+    /// Waiting runs, and whether each last looked like it must work alone: `poll` runs every frame
+    /// and looking it up can read the settings file, so it's looked up again only when a run may
+    /// be about to start.
     queue: VecDeque<(Workspace, RunOptions, bool)>,
-    /// The last run that had to work alone; nothing else starts while it's working.
+    /// The latest run to start, if it had to work alone; nothing else starts while it's working.
     alone: Option<PathBuf>,
     starter: Starter,
     /// A [`keep_queue_moving`] thread is looking after the queue.
     watched: bool,
 }
 
-/// Whether this run's tools would run in the app's session: its Builder, or the Extractor that may
-/// work for it, is an API backend. Agent apps have a tool server of their own.
+/// Whether this run's tools would run in the app's session: its Builder is an API backend, or the
+/// Extractor that only works on a fresh study is (the same test as [`RebuildRun::start`]). Agent
+/// apps have a tool server of their own.
 fn must_work_alone(hub: &AiHub, ws: &Workspace, opts: &RunOptions) -> bool {
     let cfg = hub.config();
     let in_session = |e: &crate::BackendEntry| e.config.kind != BackendKind::AgentCli;
+    let fresh = opts.message.is_none() || !ws.capture_dir().exists();
     builder_backend(&cfg, opts.backend.as_deref().or_else(|| super::project_builder(&cfg, ws))).is_ok_and(|e| in_session(&e))
-        || hub.chosen(Role::Extractor).and_then(|n| cfg.get(&n).cloned()).is_some_and(|e| in_session(&e))
+        || (fresh && hub.chosen(Role::Extractor).and_then(|n| cfg.get(&n).cloned()).is_some_and(|e| in_session(&e)))
 }
 
 impl std::fmt::Debug for RunSet {
@@ -100,9 +103,7 @@ impl RunSet {
         if self.queue.is_empty() && self.has_room(alone) {
             let root = ws.root.clone();
             let run = (self.starter)(hub, ws, opts)?;
-            if alone {
-                self.alone = Some(root.clone());
-            }
+            self.alone = alone.then(|| root.clone());
             self.runs.insert(root, run);
             return Ok(Started::Running);
         }
@@ -121,14 +122,18 @@ impl RunSet {
             out.extend(run.poll().into_iter().map(|e| (root.clone(), e)));
         }
         while self.queue.front().is_some_and(|(_, _, alone)| self.has_room(*alone)) {
-            let Some((ws, opts, alone)) = self.queue.pop_front() else { break };
+            let Some((ws, opts, _)) = self.queue.pop_front() else { break };
+            // The Builder may have been changed while it waited.
+            let alone = must_work_alone(hub, &ws, &opts);
+            if !self.has_room(alone) {
+                self.queue.push_front((ws, opts, alone));
+                break;
+            }
             let root = ws.root.clone();
             let mut keep = ws.clone();
             match (self.starter)(hub, ws, opts) {
                 Ok(run) => {
-                    if alone {
-                        self.alone = Some(root.clone());
-                    }
+                    self.alone = alone.then(|| root.clone());
                     self.runs.insert(root, run);
                 }
                 Err(e) => {
@@ -292,18 +297,23 @@ mod tests {
         assert!(set.position(&a.root).is_none());
     }
 
+    /// An agent app, which has a tool server of its own, and an API backend, which uses the session.
+    fn two_backends() -> AiHub {
+        let mut s = craft_anything_engine::testing::session();
+        s.settings.ai = toml::from_str(
+            "[[backends]]\nname = \"Agent\"\nkind = \"agent_cli\"\nmodel = \"claude-code\"\n[[backends]]\nname = \"Key\"\nkind = \"openrouter\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        AiHub::new(Arc::new(Engine::new(s)))
+    }
+
     /// #923: two builds in one session wrote into one project, and spent its asset budget.
     #[test]
     fn a_run_in_the_apps_session_works_alone_and_nothing_overtakes_it() {
         let d = tempfile::tempdir().unwrap();
         let ws = |n: &str| Workspace::create(d.path(), n, "A game", TargetRef::None).unwrap();
         let (agent, key, later) = (ws("Agent"), ws("Key"), ws("Later"));
-        let mut s = craft_anything_engine::testing::session();
-        s.settings.ai = toml::from_str(
-            "[[backends]]\nname = \"Agent\"\nkind = \"agent_cli\"\nmodel = \"claude-code\"\n[[backends]]\nname = \"Key\"\nkind = \"openrouter\"\nmodel = \"m\"\n",
-        )
-        .unwrap();
-        let hub = AiHub::new(Arc::new(Engine::new(s)));
+        let hub = two_backends();
         let by = |name: &str| RunOptions { backend: Some(name.into()), ..RunOptions::default() };
         let fake = StandIns::new();
         let mut set = RunSet::new(4).with_starter(fake.starter());
@@ -322,6 +332,67 @@ mod tests {
         assert!(set.is_running(&later.root));
         assert_eq!(set.start(&hub, agent.clone(), by("Agent")).unwrap(), Started::Running, "agent apps still work side by side");
         set.stop_all();
+    }
+
+    /// The marker follows the run, not the project: the same folder rebuilt with an agent app
+    /// doesn't keep others waiting.
+    #[test]
+    fn a_project_that_worked_alone_can_build_beside_others_with_an_agent_app() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = |n: &str| Workspace::create(d.path(), n, "A game", TargetRef::None).unwrap();
+        let (a, b) = (ws("A"), ws("B"));
+        let hub = two_backends();
+        let by = |name: &str| RunOptions { backend: Some(name.into()), ..RunOptions::default() };
+        let fake = StandIns::new();
+        let mut set = RunSet::new(2).with_starter(fake.starter());
+        assert_eq!(set.start(&hub, a.clone(), by("Key")).unwrap(), Started::Running);
+        fake.finish(&a.root);
+        set.poll(&hub);
+        assert_eq!(set.start(&hub, a.clone(), by("Agent")).unwrap(), Started::Running);
+        assert_eq!(set.start(&hub, b.clone(), by("Agent")).unwrap(), Started::Running);
+        set.stop_all();
+    }
+
+    /// Queued for an agent app, then the only AI left is an API backend: it mustn't start beside
+    /// the run still working.
+    #[test]
+    fn a_queued_run_is_checked_again_when_its_turn_comes() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = |n: &str| Workspace::create(d.path(), n, "A game", TargetRef::None).unwrap();
+        let (a, b, c) = (ws("A"), ws("B"), ws("C"));
+        let hub = two_backends();
+        let by = |name: &str| RunOptions { backend: Some(name.into()), ..RunOptions::default() };
+        let fake = StandIns::new();
+        let mut set = RunSet::new(2).with_starter(fake.starter());
+        set.start(&hub, a.clone(), by("Agent")).unwrap();
+        set.start(&hub, b.clone(), by("Agent")).unwrap();
+        assert_eq!(set.start(&hub, c.clone(), RunOptions::default()).unwrap(), Started::Queued { position: 1 });
+        hub.engine.session().settings.ai = toml::from_str("[[backends]]\nname = \"Key\"\nkind = \"openrouter\"\nmodel = \"m\"\n").unwrap();
+
+        fake.finish(&a.root);
+        set.poll(&hub);
+        assert!(!set.is_running(&c.root), "B is still working");
+        fake.finish(&b.root);
+        set.poll(&hub);
+        assert!(set.is_running(&c.root));
+        set.stop_all();
+    }
+
+    #[test]
+    fn a_follow_up_with_an_api_extractor_can_build_beside_others() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "A", "A game", TargetRef::None).unwrap();
+        let mut s = craft_anything_engine::testing::session();
+        s.settings.ai = toml::from_str(
+            "[roles]\nextractor = \"Key\"\n[[backends]]\nname = \"Agent\"\nkind = \"agent_cli\"\nmodel = \"claude-code\"\n[[backends]]\nname = \"Key\"\nkind = \"openrouter\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        let hub = AiHub::new(Arc::new(Engine::new(s)));
+        let by_agent = |message: Option<&str>| RunOptions { backend: Some("Agent".into()), message: message.map(str::to_string), ..RunOptions::default() };
+        assert!(must_work_alone(&hub, &ws, &by_agent(None)), "a fresh study may use the Extractor");
+        assert!(must_work_alone(&hub, &ws, &by_agent(Some("make it blue"))), "with nothing studied yet, so may this");
+        std::fs::create_dir_all(ws.capture_dir()).unwrap();
+        assert!(!must_work_alone(&hub, &ws, &by_agent(Some("make it blue"))), "a follow-up doesn't");
     }
 
     #[test]
