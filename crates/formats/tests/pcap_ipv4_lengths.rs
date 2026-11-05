@@ -2,6 +2,17 @@ use craft_anything_formats::pcap::decode;
 use craft_anything_testkit::pcap::{ipv4_pkt, udp};
 
 #[test]
+fn incomplete_ipv4_base_headers_explain_why_decoding_stopped() {
+    let packet = ipv4_pkt(17, [1; 4], [2; 4], &[]);
+    for captured in 10..20 {
+        let decoded = decode(101, &packet[..captured]);
+        assert!(decoded.ip.is_none(), "captured {captured} bytes");
+        assert!(decoded.transport.is_none(), "captured {captured} bytes");
+        assert_eq!(decoded.note.as_deref(), Some("IPv4 header cut short"), "captured {captured} bytes");
+    }
+}
+
+#[test]
 fn an_ipv4_total_length_cannot_be_shorter_than_its_header() {
     for total in [0u16, 19, 23] {
         let mut packet = ipv4_pkt(17, [1, 2, 3, 4], [5, 6, 7, 8], &udp(100, 200, b"body"));

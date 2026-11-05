@@ -560,7 +560,6 @@ fn ipv4(p: &[u8], d: &mut Decoded) {
         return;
     };
     let ihl = usize::from(vihl & 0x0f) * 4;
-    let (Some(src), Some(dst)) = (r.slice(12, 4), r.slice(16, 4)) else { return };
     if vihl >> 4 != 4 || ihl < 20 || usize::from(total) < ihl {
         d.note = Some("not a valid IPv4 header".into());
         return;
@@ -569,6 +568,7 @@ fn ipv4(p: &[u8], d: &mut Decoded) {
         d.note = Some("IPv4 header cut short".into());
         return;
     }
+    let (Some(src), Some(dst)) = (r.slice(12, 4), r.slice(16, 4)) else { return };
     d.protocols.push("ipv4");
     let ip4 = |b: &[u8]| {
         IpAddr::V4(Ipv4Addr::new(
