@@ -434,6 +434,9 @@ mod macos {
         serde_json::from_slice(&out.stdout).map_err(|e| ToolError::new(ErrorCode::GarbledOutput, format!("accessibility helper output was not JSON: {e}")))
     }
 
+    /// Observe a running macOS app through the native helper and return its UI evidence.
+    /// Records the accessibility selection and reports a deliberately skipped tree in the
+    /// summary; with accessibility disabled, the helper needs no Accessibility permission.
     pub fn runtime_ui_read(ctx: &mut Ctx<'_>, p: ObserveUiParams) -> Result<ToolOutput, ToolError> {
         let pid = p.pid.ok_or_else(|| ToolError::invalid("pid is required to read a running app's UI"))?;
         let request = json!({"command": "observe", "pid": pid, "window_id": p.window_id, "screenshot": p.screenshot, "accessibility": p.accessibility, "max_nodes": p.max_nodes});
@@ -610,13 +613,13 @@ mod tests {
         }
     }
 
+    /// Run the real Swift helper without reading app UI or requiring Accessibility permission.
+    /// Both zero and positive node limits must return an empty, non-truncated tree and evidence
+    /// that records the skipped read.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_can_skip_accessibility_without_reading_a_tree() {
         let e = Engine::new(crate::testing::session());
-        // Compile and run the real Swift helper. This process has no app UI, and the test
-        // must work even when the invoking terminal has no Accessibility permission.
-        // A zero node limit must not mark a deliberately skipped tree as truncated.
         for max_nodes in [0, 1] {
             let output =
                 e.call("runtime_ui_read", json!({"pid": std::process::id(), "accessibility": false, "max_nodes": max_nodes}), granted()).unwrap().to_json();
