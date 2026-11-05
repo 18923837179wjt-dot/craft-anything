@@ -495,11 +495,14 @@ impl Worker {
 
     /// An API backend's builder runs its tools in this session, not in a tool server that loads the
     /// keys itself (#923). Read on the worker because the keychain can block, and for each run so a
-    /// key saved outside the app since the last one counts.
+    /// key saved outside the app since the last one counts. The session stays held through the
+    /// read, so a key removed meanwhile can't be put back by keys read before it went.
     fn load_asset_keys(&self, store: &crate::KeyStore) {
-        let providers = self.engine.session().ext.get::<craft_anything_engines::assets::AssetProviders>().map(|p| p.as_ref().clone()).unwrap_or_default();
+        let mut session = self.engine.session();
+        session.label("Load the asset keys");
+        let providers = session.ext.get::<craft_anything_engines::assets::AssetProviders>().map(|p| p.as_ref().clone()).unwrap_or_default();
         let keys = crate::keys::asset_keys(store, &providers);
-        self.engine.session().ext.insert(Arc::new(keys));
+        session.ext.insert(Arc::new(keys));
     }
 
     /// Point the engine at this workspace: its investigation project and inbox.
