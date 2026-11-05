@@ -729,10 +729,20 @@ pub fn parse_resources(data: &[u8], max_entries: usize) -> Result<Resources, For
     let Some((rva, size)) = h.dir(2) else { return Ok(res) };
     let base = h.rva_to_offset(rva).ok_or_else(|| FormatError::Malformed("resource directory is not in the file".into()))?;
     let available = data.get(base..).ok_or_else(|| FormatError::Truncated("resource directory".into()))?;
+    // Use the same first matching section and header-prefix fallback as rva_to_offset.
+    let mapped_len = match h.sections.iter().find(|s| rva.checked_sub(s.rva).is_some_and(|delta| delta < s.virtual_size.max(s.raw_size))) {
+        Some(s) => rva.checked_sub(s.rva).and_then(|delta| s.raw_size.checked_sub(delta)),
+        None => h.sections.iter().map(|s| s.raw_offset).filter(|&o| o > 0).min().unwrap_or(u32::MAX).checked_sub(rva),
+    }
+    .and_then(|len| usize::try_from(len).ok())
+    .ok_or_else(|| FormatError::Malformed("resource directory is not in the file".into()))?;
     if size as usize > available.len() {
         res.warnings.push("resource directory runs past the end of the file; reading the available bytes".into());
     }
-    let r = Reader::new(available.get(..(size as usize).min(available.len())).unwrap_or(&[]));
+    if size as usize > mapped_len {
+        res.warnings.push("resource directory runs past its mapped extent; reading the available bytes".into());
+    }
+    let r = Reader::new(available.get(..(size as usize).min(mapped_len).min(available.len())).unwrap_or(&[]));
     let mut visited = BTreeSet::new();
     // (dir offset relative to base, depth, path)
     type Path = Vec<(Option<u32>, String)>;

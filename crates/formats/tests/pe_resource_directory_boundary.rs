@@ -91,6 +91,59 @@ fn a_long_resource_name_must_fit_its_full_declared_span() {
 }
 
 #[test]
+fn a_long_resource_name_cannot_cross_the_mapped_raw_extent() {
+    for delta in [0u32, 32] {
+        let mut data = resource_with_long_name();
+        let headers = pe::headers(&data).unwrap();
+        let (rva, size) = headers.dir(2).unwrap();
+        let root = headers.rva_to_offset(rva).unwrap();
+        let section = &headers.sections[0];
+        let optional_size = u16::from_le_bytes(data[headers.pe_offset + 20..headers.pe_offset + 22].try_into().unwrap());
+        let section_at = headers.pe_offset + 24 + usize::from(optional_size);
+        // Keep the resource at the same file offset, either at the section start or inside it.
+        data[section_at + 8..section_at + 12].copy_from_slice(&(section.virtual_size + delta).to_le_bytes());
+        data[section_at + 12..section_at + 16].copy_from_slice(&(section.rva - delta).to_le_bytes());
+        data[section_at + 16..section_at + 20].copy_from_slice(&(delta + size - 2).to_le_bytes());
+        data[section_at + 20..section_at + 24].copy_from_slice(&(section.raw_offset - delta).to_le_bytes());
+        let mapped = pe::headers(&data).unwrap();
+        let last_rva = rva + size - 2;
+        let last_unit = root + size as usize - 2;
+        assert_eq!(mapped.rva_to_offset(rva), Some(root));
+        assert_eq!(rva - mapped.sections[0].rva, delta);
+        assert!(last_rva - mapped.sections[0].rva < mapped.sections[0].virtual_size);
+        assert_eq!(mapped.rva_to_offset(last_rva), None);
+        assert_eq!(&data[last_unit..last_unit + 2], b"z\0");
+        let resources = pe::parse_resources(&data, 10).unwrap();
+        assert!(resources.entries.is_empty(), "delta={delta}");
+        assert!(resources.warnings.iter().any(|warning| warning == "resource name runs past the directory; skipped an entry"), "delta={delta}");
+    }
+}
+
+#[test]
+fn resource_metadata_in_the_header_prefix_still_parses() {
+    let mut data = pe_rcdata("inside", b"payload");
+    let headers = pe::headers(&data).unwrap();
+    let root = headers.rva_to_offset(headers.dir(2).unwrap().0).unwrap();
+    let header_rva = 0x300u32;
+    let metadata_size = 0x60 + 2 + 6 * 2;
+    assert!(header_rva as usize + metadata_size <= headers.sections[0].raw_offset as usize);
+    assert_eq!(headers.rva_to_offset(header_rva), Some(header_rva as usize));
+    // Move only metadata into header padding; its payload keeps the original section RVA.
+    data.copy_within(root..root + metadata_size, header_rva as usize);
+    let dirs = headers.pe_offset + 24 + if headers.pe32_plus { 112 } else { 96 };
+    data[dirs + 16..dirs + 20].copy_from_slice(&header_rva.to_le_bytes());
+    set_directory_size(&mut data, metadata_size as u32);
+    let resources = pe::parse_resources(&data, 10).unwrap();
+    assert_eq!(resources.entries.len(), 1);
+    let entry = &resources.entries[0];
+    assert_eq!(entry.name, "inside");
+    assert_eq!(entry.size, 7);
+    let off = entry.file_offset.unwrap() as usize;
+    assert_eq!(&data[off..off + 7], b"payload");
+    assert!(resources.warnings.is_empty());
+}
+
+#[test]
 fn a_complete_long_resource_name_keeps_the_existing_output_limit() {
     let data = resource_with_long_name();
     let resources = pe::parse_resources(&data, 10).unwrap();
