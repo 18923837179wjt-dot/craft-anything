@@ -775,6 +775,8 @@ pub fn qtype_name(t: u16) -> String {
 /// A (possibly compressed) DNS name at `off`; returns the name and the offset after it.
 fn dns_name(msg: &[u8], mut off: usize) -> Option<(String, usize)> {
     let mut out = String::new();
+    // Count the expanded wire name, including label lengths and the terminating root.
+    let mut wire_len = 1usize;
     let mut after: Option<usize> = None;
     for _ in 0..128 {
         let len = *msg.get(off)?;
@@ -790,13 +792,14 @@ fn dns_name(msg: &[u8], mut off: usize) -> Option<(String, usize)> {
             }
             l if l < 64 => {
                 let label = msg.get(off + 1..off + 1 + usize::from(l))?;
+                wire_len += 1 + label.len();
+                if wire_len > 255 {
+                    return None;
+                }
                 if !out.is_empty() {
                     out.push('.');
                 }
                 out.extend(label.iter().map(|&c| if c.is_ascii_graphic() { char::from(c) } else { '?' }));
-                if out.len() > 255 {
-                    return None;
-                }
                 off += 1 + usize::from(l);
             }
             _ => return None,
