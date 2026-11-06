@@ -195,6 +195,33 @@ fn general(app: &mut CraftApp, ui: &mut Ui) {
             app.settings_changed();
         }
     });
+    missing_fonts(ui);
+}
+
+/// A build without the script fallbacks shows boxes wherever a language needs one. Say so, rather
+/// than leaving the person to guess what a box means.
+///
+/// The text is English on purpose: this is the one place a translation would be unreadable, since
+/// a build without the fallbacks cannot draw the very scripts a translation needs. Latin text is
+/// always available (DM Sans), so this line reads in every build.
+fn missing_fonts(ui: &mut Ui) {
+    if theme::has_script_fallbacks() {
+        return;
+    }
+    let t = Tokens::get(ui.ctx());
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(220.0);
+            ui.label(RichText::new("Missing fonts").font(theme::medium(theme::SMALL)));
+        });
+        ui.label(
+            RichText::new("This build has no fonts for some languages, so it shows boxes instead of Chinese, Japanese, Korean, Thai, Arabic, Hebrew, Devanagari or symbols.")
+                .color(t.text_faint)
+                .size(theme::CAPTION)
+                .line_height(Some(16.0)),
+        );
+    });
+    ui.add_space(10.0);
 }
 
 fn language(app: &mut CraftApp, ui: &mut Ui) {

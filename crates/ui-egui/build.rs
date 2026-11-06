@@ -4,6 +4,11 @@
 //! Unset `CRAFT_FONTS_DIR` (the default) embeds nothing and the app uses its own DM Sans/JetBrains
 //! Mono. Set it to an absolute path of a craft-fonts checkout to embed every font its manifest
 //! lists. A bad path is a warning unless `CRAFT_FONTS_REQUIRED=1`.
+//!
+//! Without these fallbacks the interface shows boxes wherever a script needs one (Chinese,
+//! Japanese, Korean, Thai, Arabic, Hebrew, Devanagari, symbols). A build that ships them says so
+//! loudly, because the boxes only show up once someone runs the app. `cargo xtask fonts` fetches
+//! a checkout and prints the `CRAFT_FONTS_DIR` to set.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -20,6 +25,14 @@ fn main() {
                 println!("cargo::error=CRAFT_FONTS_DIR={}: {e}", dir.display());
             }
             Err(e) => println!("cargo::warning=building without craft-fonts: CRAFT_FONTS_DIR={}: {e}", dir.display()),
+        }
+    } else if std::env::var_os("CRAFT_FONTS_REQUIRED").is_none() {
+        // The wasm build ships one font (BIZ UDPGothic) and the browser viewer uses egui's own
+        // defaults, so only a desktop build without fallbacks needs the warning.
+        if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32") {
+            println!(
+                "cargo::warning=CRAFT_FONTS_DIR is not set: the app will show boxes for Chinese, Japanese, Korean, Thai, Arabic, Hebrew, Devanagari and symbol characters. Run `cargo xtask fonts` to fetch a craft-fonts checkout, then build with CRAFT_FONTS_DIR pointing at it."
+            );
         }
     }
     src.push_str("];\n");
