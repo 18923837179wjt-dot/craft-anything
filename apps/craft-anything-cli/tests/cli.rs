@@ -306,4 +306,3 @@ fn mcp_restricted_mode_cli() {
     let err_obj: Value = serde_json::from_str(call_res["content"][0]["text"].as_str().unwrap()).unwrap();
     assert!(err_obj["error"]["message"].as_str().unwrap().contains("turned off in restricted mode"));
 }
-

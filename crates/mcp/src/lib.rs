@@ -18,7 +18,7 @@
 pub mod prompts;
 
 use craft_anything_engine::tools::investigation_tools;
-use craft_anything_engine::{CallOptions, Caller, CancelToken, Consent, Engine, Progress, ToolOutput, Toolset};
+use craft_anything_engine::{CallOptions, Caller, CancelToken, Consent, Effects, Engine, Progress, ToolOutput, Toolset};
 use craft_anything_evidence::{ErrorCode, ToolError, is_evidence_id};
 use craft_anything_platform::sync::Mutex;
 use serde_json::{Value, json};
@@ -61,15 +61,18 @@ pub struct ServerOptions {
     /// Restricted mode for shared hosts (#855, #856): hide tools that act on the host machine,
     /// and turn off web and capture tools unless explicitly allowed.
     pub restricted: bool,
-    /// Allow web tools (`web_site_open`) in restricted mode.
+    /// Allow tools that open or reach websites (`web_site_open`) in restricted mode.
     pub allow_web: bool,
-    /// Allow capture tools (`web_site_capture`, `web_page_states_capture`) in restricted mode.
+    /// Allow website capture tools (`web_site_capture`, `web_page_states_capture`) in restricted mode.
     pub allow_capture: bool,
     pub max_response_bytes: usize,
     /// Lower the budget for a client known to take less (Claude Code), from its name in
     /// `initialize`. Off when the budget was set explicitly.
     pub budget_for_client: bool,
 }
+
+/// Tools that change the machine without an effect that says so.
+const ACTS_ON_MACHINE: [&str; 3] = ["plugins_add", "engines_install", "native_cutter_command_run"];
 
 impl Default for ServerOptions {
     fn default() -> Self {
@@ -346,45 +349,31 @@ impl Server {
 
     // ---- tools ----
 
-    /// If restricted mode is enabled and `name` (resolved canonically) is disallowed, returns the
-    /// refusal `ToolError`.
+    /// In restricted mode, the refusal for `name` when it's off: tools that act on the machine or
+    /// reach the network, going by what each declares, not a list that can drift. Web and capture
+    /// tools have flags of their own (#855, #856).
     fn restricted_refusal(&self, name: &str) -> Option<ToolError> {
         if !self.opts.restricted {
             return None;
         }
-        let canonical = self.engine.registry().canonical(name).unwrap_or(name);
-
-        // Machine-acting tools (#855): build_command_run, plugins_add, engines_install, and adb_* tools.
-        if canonical == "build_command_run"
-            || canonical == "plugins_add"
-            || canonical == "engines_install"
-            || canonical.starts_with("adb_")
-        {
-            return Some(
-                ToolError::new(
-                    craft_anything_evidence::ErrorCode::FeatureMissing,
-                    format!("{canonical} is turned off in restricted mode."),
-                )
-                .with_remediation("Start the MCP server without --restricted to allow tools that act on the machine.")
-                .with_details(json!({"reason": "restricted_mode", "tool": canonical})),
-            );
-        }
-
-        // Web and capture tools (#856): web_site_open, web_site_capture, web_page_states_capture.
-        let is_web = canonical == "web_site_open";
-        let is_capture = canonical == "web_site_capture" || canonical == "web_page_states_capture";
-        if (is_web || is_capture) && !(self.opts.allow_web || self.opts.allow_capture) {
-            return Some(
-                ToolError::new(
-                    craft_anything_evidence::ErrorCode::FeatureMissing,
-                    format!("{canonical} is turned off in restricted mode."),
-                )
-                .with_remediation("Start the MCP server with --allow-web to enable web and capture tools in restricted mode.")
-                .with_details(json!({"reason": "restricted_mode", "tool": canonical})),
-            );
-        }
-
-        None
+        let spec = self.engine.registry().get(self.engine.registry().canonical(name).unwrap_or(name))?;
+        let effects = spec.effects;
+        let web = spec.id.starts_with("web_") && effects.intersects(Effects::ACCESSES_NETWORK | Effects::LAUNCHES_PROCESS);
+        let capture = web && spec.id.contains("capture");
+        let (off, way_back) = if capture {
+            (!self.opts.allow_capture, "Start the MCP server with --allow-capture to turn capture tools on.")
+        } else if web {
+            (!self.opts.allow_web, "Start the MCP server with --allow-web to turn web tools on.")
+        } else {
+            let machine =
+                effects.needs_consent() || effects.contains(Effects::ACCESSES_NETWORK) || spec.id.starts_with("adb_") || ACTS_ON_MACHINE.contains(&spec.id);
+            (machine, "Start the MCP server without --restricted to allow tools that act on the machine.")
+        };
+        off.then(|| {
+            ToolError::new(craft_anything_evidence::ErrorCode::FeatureMissing, format!("{} is turned off in restricted mode.", spec.id))
+                .with_remediation(way_back)
+                .with_details(json!({"reason": "restricted_mode", "tool": spec.id}))
+        })
     }
 
     fn visible(&self, set: Toolset) -> bool {
@@ -624,7 +613,7 @@ impl Server {
 
     /// The tool declares that its results carry content from the target.
     fn carries_target_content(&self, name: &str) -> bool {
-        self.engine.registry().get(name).is_some_and(|s| s.effects.contains(craft_anything_engine::Effects::CARRIES_TARGET_CONTENT))
+        self.engine.registry().get(name).is_some_and(|s| s.effects.contains(Effects::CARRIES_TARGET_CONTENT))
     }
 
     fn attach_provenance(&self, body: &mut Value, name: &str) {

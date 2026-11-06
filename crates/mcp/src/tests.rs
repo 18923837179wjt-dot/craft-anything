@@ -382,6 +382,11 @@ fn restricted_mode_omits_machine_and_web_tools() {
     assert!(!names.contains(&"web_site_capture".to_string()));
     assert!(!names.contains(&"web_page_states_capture".to_string()));
 
+    // Tools no list named: what each declares keeps them off too.
+    for id in ["project_play", "web_browser_connect", "web_page_screenshot_take", "web_standin_start", "native_cutter_command_run"] {
+        assert!(!names.contains(&id.to_string()), "{id}");
+    }
+
     // Safe core tools remain available
     assert!(names.contains(&"core_session_show".to_string()));
     assert!(names.contains(&"core_investigation_show".to_string()));
@@ -437,8 +442,8 @@ fn restricted_mode_allows_web_and_capture_tools_when_operator_permits() {
     let out = run_with(opts, &[req(1, "tools/list", json!({}))]);
     let names = tool_names(&response(&out, 1));
     assert!(names.contains(&"web_site_open".to_string()));
-    assert!(names.contains(&"web_site_capture".to_string()));
-    assert!(names.contains(&"web_page_states_capture".to_string()));
+    assert!(!names.contains(&"web_site_capture".to_string()), "--allow-web is only for web tools");
+    assert!(!names.contains(&"web_page_states_capture".to_string()));
     assert!(!names.contains(&"build_command_run".to_string()));
     assert!(!names.iter().any(|n| n.starts_with("adb_")));
 
@@ -446,7 +451,7 @@ fn restricted_mode_allows_web_and_capture_tools_when_operator_permits() {
     let opts_cap = ServerOptions { restricted: true, all_tools: true, allow_capture: true, ..Default::default() };
     let out_cap = run_with(opts_cap, &[req(1, "tools/list", json!({}))]);
     let names_cap = tool_names(&response(&out_cap, 1));
-    assert!(names_cap.contains(&"web_site_open".to_string()));
+    assert!(!names_cap.contains(&"web_site_open".to_string()), "--allow-capture is only for capture tools");
     assert!(names_cap.contains(&"web_site_capture".to_string()));
     assert!(names_cap.contains(&"web_page_states_capture".to_string()));
     assert!(!names_cap.contains(&"build_command_run".to_string()));
@@ -455,17 +460,12 @@ fn restricted_mode_allows_web_and_capture_tools_when_operator_permits() {
 
 #[test]
 fn restricted_mode_server_options_from_env() {
-    let map = [
-        ("CRAFT_ANYTHING_MCP_RESTRICTED", "1"),
-        ("CRAFT_ANYTHING_MCP_ALLOW_WEB", "true"),
-        ("CRAFT_ANYTHING_MCP_ALLOW_CAPTURE", "1"),
-    ]
-    .into_iter()
-    .collect::<std::collections::HashMap<_, _>>();
+    let map = [("CRAFT_ANYTHING_MCP_RESTRICTED", "1"), ("CRAFT_ANYTHING_MCP_ALLOW_WEB", "true"), ("CRAFT_ANYTHING_MCP_ALLOW_CAPTURE", "1")]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
 
     let opts = ServerOptions::from_env_vars(|k| map.get(k).map(|s| s.to_string()));
     assert!(opts.restricted);
     assert!(opts.allow_web);
     assert!(opts.allow_capture);
 }
-
