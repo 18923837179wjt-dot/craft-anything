@@ -144,6 +144,17 @@ cheapest help we can give anyone, so nothing below should hold it up for long.
       skip hardware adapters; needs a different route (another renderer, or a helper that starts
       the app with only WARP visible)
 - [x] Add to `docs/releasing.md`: before publishing, a Deep build through Claude Code from the
+- [x] #794: on some systems DX12 refuses egui's own pipeline (`egui_pipeline`, 0x80070057 from
+      `CreatePipelineState`) on AMD, Intel and NVIDIA cards and on WARP too (lightcraft#812,
+      pdfcraft#1046, wgpu#10771), so the software retry failed the same way every start, and the
+      dialog only said to update the driver. Each failed start now moves on to the next renderer
+      (DX12 → WARP → Vulkan → GL, `apps/craft-anything/src/renderer.rs`), keeps the one that worked
+      for this app version, and starts again by itself after a wgpu error. Checked with a build
+      that failed every DX12 start; the real failure wasn't reproduced (STATUS.md)
+      — claimed: 00xJS, branch bugfix/r5.1-renderer-fallback
+- [ ] Live-check #794's fallback on a machine where DX12 refuses `egui_pipeline` (the reporter's
+      780M, or lightcraft#812's)
+- [ ] Add to `docs/releasing.md`: before publishing, a Deep build through Claude Code from the
       finished package, on a Mac and on Windows. Starting the CLI from the package (#91) doesn't
       show whether Claude Code accepts its tools — PR #982; claimed: doubektomas,
       branch docs/r5.1-packaged-deep-build-check. The checklist is documented; live package runs
