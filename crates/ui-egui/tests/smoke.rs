@@ -762,6 +762,30 @@ fn approvals_are_chosen_from_the_prompt_box_and_its_menu() {
 }
 
 #[test]
+fn an_approval_that_cant_be_saved_isnt_shown_as_chosen() {
+    use craft_anything_engine::workspace::{TargetRef, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+    let file = ws.root.join("craft.json");
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.workspace = Some(ws);
+        a.state.screen = Screen::Project;
+        a
+    });
+    h.run_steps(2);
+    // A newer Craft Anything saved it meanwhile: this one only reads it, so the choice is refused.
+    let newer = std::fs::read_to_string(&file).unwrap().replacen("\"version\": 3", "\"version\": 99", 1);
+    assert!(newer.contains("\"version\": 99"));
+    std::fs::write(&file, newer).unwrap();
+    h.state_mut().state.project_input = "/approvals push allow".into();
+    h.run_steps(1);
+    h.get_by_label("Send (Enter)").click();
+    assert!(wait(&mut h, |a| a.state.toasts.iter().any(|(t, _)| t.starts_with("Couldn't change the approvals:"))), "says it wasn't saved");
+    assert!(h.state().workspace.as_ref().unwrap().manifest.approvals.is_empty(), "the menu shows what's kept, not what was asked");
+}
+
+#[test]
 fn a_question_about_the_build_is_answered_without_building() {
     use craft_anything_engine::workspace::{TargetRef, Workspace};
     let d = tempfile::tempdir().unwrap();

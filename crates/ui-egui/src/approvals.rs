@@ -112,7 +112,13 @@ impl CraftApp {
                 };
                 self.toast(trf("In this project, {kind}: {choice}.", &[("kind", &tr(label(kind))), ("choice", &choice)]), false);
             }
-            Err(e) => self.toast(format!("{} {}", tr("Couldn't change the approvals:"), e.for_people()), true),
+            Err(e) => {
+                // The menu showed the choice before it was saved: show what's really kept again.
+                if let Some(ws) = self.workspace.as_mut() {
+                    let _ = ws.reload();
+                }
+                self.toast(format!("{} {}", tr("Couldn't change the approvals:"), e.for_people()), true);
+            }
         }
     }
 }
