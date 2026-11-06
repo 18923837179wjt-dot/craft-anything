@@ -1221,6 +1221,8 @@ mod tests {
         // The person allows pushes from the app; it's kept in craft.json.
         let set = call(crate::Caller::Ui, json!({"project": w.root, "kind": "publish", "mode": "allow"})).unwrap().to_json()["result"].clone();
         assert_eq!(gets(&set, "publish"), "allow");
+        assert_eq!((set["set"]["kind"].as_str(), set["set"]["gets"].as_str()), (Some("publish"), Some("allow")), "says what changed");
+        assert!(read["set"].is_null(), "a read changes nothing");
         assert_eq!(Workspace::open(&w.root).unwrap().manifest.approvals.get(&ActionKind::Publish), Some(&Approval::Allow));
         // A builder may make a kind stricter, not looser: not even back to a default that allows more.
         assert!(call(crate::Caller::Mcp, json!({"project": w.root, "kind": "publish", "mode": "ask"})).is_ok());

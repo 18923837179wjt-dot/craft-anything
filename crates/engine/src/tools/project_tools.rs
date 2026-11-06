@@ -423,8 +423,10 @@ fn project_approvals_set(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
     let p: ApprovalsParams = parse_params(params)?;
     let mut ws = open(&p.project)?;
     let auto_mode = ctx.session.settings.auto_mode;
+    let mut set = None;
     match (p.kind, p.mode) {
         (Some(kind), Some(mode)) => {
+            set = Some(kind);
             let chosen = match mode {
                 ApprovalChoice::Allow => Some(Approval::Allow),
                 ApprovalChoice::Ask => Some(Approval::Ask),
@@ -464,7 +466,9 @@ fn project_approvals_set(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
             })
         })
         .collect();
-    Ok(ToolOutput::Value(json!({"project": ws.root, "auto_mode": auto_mode, "kinds": kinds})))
+    // The kind just set and what it gets now, so a client can say what changed.
+    let set = set.map(|k| json!({"kind": k, "gets": ws.manifest.approval(k, auto_mode), "chosen": ws.manifest.approvals.get(&k)}));
+    Ok(ToolOutput::Value(json!({"project": ws.root, "auto_mode": auto_mode, "set": set, "kinds": kinds})))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
