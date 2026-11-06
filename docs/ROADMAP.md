@@ -405,12 +405,15 @@ Owner: open · Status: todo
 
 ### R5.6 Tools report only what they saw
 Owner: open · Status: todo
-Golden rule 3: the result is evidence. All four tickets are confirmed in the code, with no PR yet.
-Each fix needs a Mac to test on.
+Golden rule 3: the result is evidence. Each fix needs a Mac to test on.
 - [x] macOS: a denied Accessibility permission is reported as success with an empty tree (#240)
       — claimed: mavericzz, branch bugfix/r5.6-accessibility-denied; PR #887
-- [ ] macOS: `runtime_ui_read` ignores `screenshot` (#248) and `accessibility` (#307): the Swift
-      helper declares both and reads neither
+- [ ] macOS: `runtime_ui_read` ignores `screenshot` (#248): the Swift helper declares it but
+      never captures an image
+- [x] macOS: `runtime_ui_read` honours `accessibility: false` (#307): the Swift helper skips
+      the tree and its permission check, returns no nodes without truncation, and the evidence
+      records the flag and says the tree was skipped. Walkthroughs still require Accessibility
+      — claimed: Codex, branch bugfix/r5.6-macos-ui-flags
 - [ ] macOS: call observation writes a literal `\n` into its lldb callback, so the Python is
       invalid and it reports zero calls (#251)
 
