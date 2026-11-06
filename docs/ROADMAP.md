@@ -132,16 +132,22 @@ cheapest help we can give anyone, so nothing below should hold it up for long.
       #33) is remembered: `starting` beside `desktop.log` is written before the window is asked for
       and removed once it's open, and a start that finds it draws with WARP that once
       (`apps/craft-anything/src/start_guard.rs`)
-- [ ] Live-check the start fallback on Windows: make a start die before its window (kill the
+- [x] Live-check the start fallback on Windows: make a start die before its window (kill the
       process at launch), start again, and see `desktop.log` say it drew without the graphics card
-      and log `drawing with` an adapter of type `Cpu` (WARP), and that the window opens
+      and log `drawing with` an adapter of type `Cpu` (WARP), and that the window opens. Passed on
+      2026-11-04 (`main` at `869eb85`, release build, Windows 11, RX 6900 XT): a start killed right
+      after `drawing with` the Radeon left `starting`; the next logged "the last start never opened
+      its window", drew with "Microsoft Basic Render Driver" (`Cpu`, DX12), logged `window open` and
+      removed `starting` — claimed: 00xJS, branch docs/r5.1-start-fallback-live-check
 - [ ] The software retry still lets wgpu start every DX12 adapter before `pick_adapter` runs, so a
       driver that crashes while its device is created crashes the retry too. wgpu has no way to
       skip hardware adapters; needs a different route (another renderer, or a helper that starts
       the app with only WARP visible)
-- [ ] Add to `docs/releasing.md`: before publishing, a Deep build through Claude Code from the
+- [x] Add to `docs/releasing.md`: before publishing, a Deep build through Claude Code from the
       finished package, on a Mac and on Windows. Starting the CLI from the package (#91) doesn't
-      show whether Claude Code accepts its tools
+      show whether Claude Code accepts its tools — PR #982; claimed: doubektomas,
+      branch docs/r5.1-packaged-deep-build-check. The checklist is documented; live package runs
+      remain release validation work.
 - [ ] Add to `docs/releasing.md`: after a release, close every ticket marked as waiting for it, so
       they don't stay open marked `fixed`
 
@@ -348,7 +354,8 @@ Owner: open · Status: todo
 Owner: open · Status: todo
 Golden rule 3: the result is evidence. All four tickets are confirmed in the code, with no PR yet.
 Each fix needs a Mac to test on.
-- [ ] macOS: a denied Accessibility permission is reported as success with an empty tree (#240)
+- [x] macOS: a denied Accessibility permission is reported as success with an empty tree (#240)
+      — claimed: mavericzz, branch bugfix/r5.6-accessibility-denied; PR #887
 - [ ] macOS: `runtime_ui_read` ignores `screenshot` (#248) and `accessibility` (#307): the Swift
       helper declares both and reads neither
 - [ ] macOS: call observation writes a literal `\n` into its lldb callback, so the Python is
@@ -842,6 +849,74 @@ Owner: open · Status: in progress
 
 ### R3.12 Format parser correctness
 Owner: open · Status: in progress
+- [x] Require a complete DNS question's type and class fields before retaining it, and keep
+      truncated questions out of packet inventories while reporting the incomplete message
+      — claimed: Afloat16, branch bugfix/r3.12-dns-question-class-review-20261104
+- [x] Reject impossible IPv4 header and total lengths.
+      — claimed: Afloat16, branch bugfix/r3.12-ipv4-header-lengths-20261105
+- [x] Validate the version in IPv6 frames.
+      — claimed: Afloat16, branch bugfix/r3.12-ipv6-version-20261105
+- [x] Stop decoding extension headers inside noninitial IPv6 fragments.
+      — claimed: Afloat16, branch bugfix/r3.12-ipv6-fragment-payload-20261105
+- [x] Enforce the expanded DNS name wire-length limit.
+      — claimed: Afloat16, branch bugfix/r3.12-dns-name-wire-length-20261105
+- [x] Report truncated DNS TXT strings as incomplete.
+      — claimed: Afloat16, branch bugfix/r3.12-dns-txt-truncation-20261105
+      Preserve empty ANY/NONE UPDATE prerequisites with zero TTL; keep TXT validation scoped to parsed answers/prerequisites.
+      Preserve empty multicast/unicast DNS-SD TXT records using wire-label service instance names.
+- [x] Read HTTP Host fields only from the header section.
+      — claimed: Afloat16, branch bugfix/r3.12-http-host-boundary-20261105
+- [x] Keep capture flow timestamps in chronological order.
+      — claimed: Afloat16, branch bugfix/r3.12-capture-flow-time-range-20261105
+- [x] Reject incomplete simple packet block payloads.
+      — claimed: Afloat16, branch bugfix/r3.12-pcapng-simple-block-length-20261105
+      Count rejected lengths against the packet scan limit and summarize them once at the end of the walk.
+- [x] Keep ZIP directory entries within the declared directory.
+      — claimed: Afloat16, branch bugfix/r3.12-zip-directory-bounds-20261105
+- [x] Refuse split ZIP archives without their other volumes.
+      — claimed: Afloat16, branch bugfix/r3.12-zip-multidisk-20261105
+- [x] Check Unity bundle blocks against their declared output lengths.
+      — claimed: Afloat16, branch bugfix/r3.12-unity-bundle-decompressed-length-20261105
+- [x] Locate Unity bundle metadata within the declared bundle size.
+      — claimed: Afloat16, branch bugfix/r3.12-unity-bundle-declared-size-20261105
+- [ ] Check that Unity bundle compressed blocks end before the trailing block table, or the declared
+      bundle end for front-positioned tables, so bytes outside the data region cannot supply block contents.
+- [x] Reject Unity serialized objects outside their declared file.
+      — claimed: Afloat16, branch bugfix/r3.12-unity-serialized-object-ranges-20261105
+- [x] Preserve compression method slots in Unreal pak indexes.
+      — claimed: Afloat16, branch bugfix/r3.12-unreal-pak-compression-slots-20261105
+- [x] Require complete terminators in Unreal FString values.
+      — claimed: Afloat16, branch bugfix/r3.12-unreal-fstring-terminators-20261105
+- [x] Count every compression block spanned by an IoStore chunk.
+      — claimed: Afloat16, branch bugfix/r3.12-iostore-unaligned-chunk-blocks-20261105
+- [x] Reject truncated IoStore fixed headers.
+      — claimed: Afloat16, branch bugfix/r3.12-iostore-complete-header-20261105
+- [x] Reject invalid marshal long integer digits.
+      — claimed: Afloat16, branch bugfix/r3.12-pyc-long-limb-validation-20261105
+- [x] Check expanded RGBA image sizes and enforce output budgets before allocation.
+      — claimed: Afloat16, branch bugfix/r3.12-pixel-rgba-output-overflow-20261105
+- [x] Count empty tensor shapes consistently across axis orders.
+      — claimed: Afloat16, branch bugfix/r3.12-tensor-zero-dimension-product-20261105
+- [x] Find APK signatures through valid ZIP comments and framed central directories.
+      — claimed: Afloat16, branch bugfix/r3.12-apk-sign-eocd-comment-boundary-20261105
+- [x] Keep Mach-O load-command facts within their command.
+      — claimed: Afloat16, branch bugfix/r3.12-macho-load-command-framing-20261105
+- [x] Keep Mach-O function starts within their declared payload.
+      — claimed: Afloat16, branch bugfix/r3.12-macho-function-starts-payload-boundary-20261105
+- [x] Keep code-signature children and verification reads within their declared superblob.
+      — claimed: Afloat16, branch bugfix/r3.12-codesign-superblob-length-boundary-20261105
+- [x] Keep PE optional-header reads within the declared header.
+      — claimed: Afloat16, branch bugfix/r3.12-pe-optional-header-framing-20261105
+- [x] Keep PE resource metadata within the resource directory.
+      — claimed: Afloat16, branch bugfix/r3.12-pe-resource-directory-boundary-20261105
+- [x] Keep Go function tables and names within their section.
+      — claimed: Afloat16, branch bugfix/r3.12-go-pclntab-section-boundary-20261105
+- [x] Preserve complete Unicode characters in shortened .NET strings.
+      — claimed: Afloat16, branch bugfix/r3.12-dotnet-user-string-surrogate-limit-20261105
+- [x] Locate ELF core mapping names after the complete declared table.
+      — claimed: Afloat16, branch bugfix/r3.12-elf-core-file-name-count-cap-20261105
+- [x] Keep DOS relocations inside the declared executable header.
+      — claimed: Afloat16, branch bugfix/r3.12-dos-relocation-header-boundary-20261105
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
       area and reject unrepresentable widths, base64 (plists, source maps) refuses damaged tails
       and incomplete quanta through one shared decoder, OIDs must be minimally encoded, and string
@@ -867,6 +942,11 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-parser-review-followups-main-20261104
       Shared-budget revision `29c48e03` passed [full Linux CI](https://github.com/storytold/craft-anything/actions/runs/41762780268).
       The merge with main `41d2175e` awaits a new CI run.
+
+- [x] Keep DNS answer names inside their declared RDATA, including compressed names and MX
+      exchanges, and report malformed records as incomplete instead of inventing answer values,
+      while preserving legal empty DNS UPDATE RRset prerequisites
+      — claimed: Afloat16, branch bugfix/r3.12-dns-rdata-names-review-20261104
 
 ### R3.13 Web inspection correctness
 Owner: open · Status: in progress
