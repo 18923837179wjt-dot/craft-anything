@@ -314,6 +314,10 @@ Node directly (`which::launch_target`); test a new program on Windows with a mul
 npm also writes an extensionless POSIX script beside each shim, and `which` returned that first,
 so OpenCode was offered and then every run said it wasn't installed (#41): look up the kinds
 Windows can start (`PATHEXT`) before the bare name.
+And when the shim's Node couldn't be found (nvm for Windows with no version in use, so its
+`C:\Program Files\nodejs` link was gone), we fell back to the `.cmd`, and Rust refused the
+multi-line prompt: "batch file arguments are invalid", which named neither Node nor nvm. Search
+nvm's version folders too, and when a shim's interpreter is missing, say so (`interpreter_missing`).
 
 **A first analysis that waited for a lock it could never take.** Ghidra's analysis lock is created
 with `create_new` in `ghidra-cache/`, which only existed on machines that had used it before; on a
@@ -554,6 +558,11 @@ and run `cargo xtask secrets` before every commit (the `.githooks/pre-commit` ho
 run, while the round numbers carried over, so "Try again" bought six more checks each press and a build that never
 worked reached check 40 and 49 (#736). A limit that must hold across runs is a count saved with the project, and
 it's reset only by a new request. Test it with several runs in a row, not one.
+
+**One field, two meanings.** `TurnDone`'s `input_tokens` included cached tokens from every coding agent but not
+from the built-in loop, which keeps them apart as Anthropic reports them. Once Ollama 0.40 reported its cache, a
+local build's `usage.json` said 5,323 input tokens for 75,014. When several producers fill one field, say on the
+field what it counts, and test each producer with the case where they differ (here, a cached prompt).
 
 **Docs that drift.** `STATUS.md` described a branch 25 commits old and the tool count was stale.
 Update STATUS, the roadmap and generated docs (`cargo xtask tools`, `cargo xtask schemas`) in the

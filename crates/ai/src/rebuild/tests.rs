@@ -103,11 +103,50 @@ fn the_word_player_alone_is_not_a_game() {
 }
 
 #[test]
+fn italian_requests_keep_their_project_kind() {
+    for request in ["Un semplice gioco del serpente", "Per esempio: lo stesso gioco, con una classifica", "Fai un gioco che si gioca così"] {
+        assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
+    }
+    for request in ["Un sito per la mia panetteria", "Ricostruisci questo sito", "Per esempio: ricostruisci questo sito"] {
+        assert_eq!(choose(request, &TargetRef::None), ("website", stacks::BUILDERS_CHOICE), "{request}");
+    }
+}
+
+#[test]
 fn german_requests_keep_their_project_kind() {
     for request in ["Ein einfaches Snake-Spiel", "Dasselbe Spiel mit einer Bestenliste"] {
         assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
     }
     for request in ["Eine Website für meine Bäckerei", "Diese Webseite nachbauen"] {
+        assert_eq!(choose(request, &TargetRef::None), ("website", stacks::BUILDERS_CHOICE), "{request}");
+    }
+}
+
+#[test]
+/// A request written in Spanish keeps the project kind its English equivalent would get, which is
+/// what the German and Chinese cases assert for their own words.
+fn spanish_requests_keep_their_project_kind() {
+    for request in ["Un juego de serpiente sencillo", "El mismo juego, con una tabla de récords"] {
+        assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
+    }
+    for request in ["Un sitio web para mi panadería", "Recrea este sitio web", "Una página web de mi taller"] {
+        assert_eq!(choose(request, &TargetRef::None), ("website", stacks::BUILDERS_CHOICE), "{request}");
+    }
+    assert_eq!(choose("La misma app, pero más simple", &TargetRef::None).0, "app");
+    // "juego" also names a set: a tool set is not a game.
+    assert_eq!(choose("Una app para llevar el inventario de mi juego de herramientas", &TargetRef::None).0, "app");
+    // "web" alone says nothing: a web app is built as an app, not as a website.
+    for request in ["Una aplicación web de notas", "A web app in Rust"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "app", "{request}");
+    }
+}
+
+#[test]
+fn vietnamese_requests_keep_their_project_kind() {
+    for request in ["Một trò chơi rắn săn mồi đơn giản", "Trò chơi đó, thêm bảng xếp hạng"] {
+        assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
+    }
+    for request in ["Một trang web cho tiệm bánh của tôi", "Dựng lại Trang web này"] {
         assert_eq!(choose(request, &TargetRef::None), ("website", stacks::BUILDERS_CHOICE), "{request}");
     }
 }
@@ -1461,6 +1500,67 @@ mod picking_up_a_build {
     }
 
     #[test]
+    fn a_message_after_just_ask_tells_the_builder_what_was_asked_once() {
+        use craft_anything_engine::questions::{self, AskedQuestion};
+        let b = bench();
+        let ws = worked_on(&b);
+        let ask = |q: &str| {
+            questions::add(&ws, AskedQuestion { deep: false, ..AskedQuestion::new(q.into(), "It's in src.".into(), true, "Stand-in".into(), None, 0) }).unwrap()
+        };
+        let say = |m: &str| {
+            try_with(&b, &ws, RunOptions { message: Some(m.into()), ..RunOptions::default() });
+            std::fs::read_to_string(&b.prompts).unwrap_or_default()
+        };
+        ask("where is the score kept");
+        let told = say("make it bigger");
+        assert!(told.contains("Q: where is the score kept\nA: It's in src.") && told.contains("make it bigger"), "{told}");
+        let again = say("and blue");
+        let later = again.strip_prefix(told.as_str()).unwrap_or_default();
+        assert!(later.contains("and blue") && !later.contains("where is the score kept"), "told once: {later}");
+        // Try again has no new message for it to go with, so it isn't used up.
+        ask("how does saving work");
+        let _ = try_it(&b, &ws);
+        let before = std::fs::read_to_string(&b.prompts).unwrap_or_default();
+        assert!(!before.contains("how does saving work"), "{before}");
+        let told = say("now add saving");
+        let later = told.strip_prefix(before.as_str()).unwrap_or_default();
+        assert!(later.contains("how does saving work") && later.contains("now add saving"), "{later}");
+    }
+
+    /// A turn that failed may never have reached the builder, so its questions are still to tell.
+    #[test]
+    fn a_failed_turn_leaves_just_ask_questions_to_tell_with_the_next_message() {
+        use craft_anything_engine::questions::{self, AskedQuestion};
+        let b = bench();
+        let ws = worked_on(&b);
+        questions::add(
+            &ws,
+            AskedQuestion { deep: false, ..AskedQuestion::new("where is the score kept".into(), "In src.".into(), true, "Stand-in".into(), None, 0) },
+        )
+        .unwrap();
+        // As in the test above: a typed failure, which isn't retried after a wait.
+        let mut config = b.hub.config();
+        let mut entry = config.get("Stand-in").unwrap().clone();
+        entry.config.model = "opencode".into();
+        config.upsert(entry);
+        b.hub.engine.session().settings.ai = config.to_table().unwrap();
+        let agent = b._dir.path().join("agent.sh");
+        let works = std::fs::read_to_string(&agent).unwrap().replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nif [ \"$2\" = '--help' ]; then printf '%s\\n' '--format'; exit 0; fi\n",
+            1,
+        );
+        let error = json!({"type":"error","error":{"name":"APIError","data":{"message":"fixture sign in needed","statusCode":401,"isRetryable":false}}});
+        std::fs::write(&agent, works.replace("echo Done.", &format!("printf '%s\\n' '{error}'\nexit 1"))).unwrap();
+        let say = |m: &str| try_with(&b, &ws, RunOptions { message: Some(m.into()), ..RunOptions::default() }).0;
+        assert!(!say("make it bigger"));
+        assert_eq!(questions::untold(&ws, false).len(), 1, "the turn failed");
+        std::fs::write(&agent, works).unwrap();
+        say("make it bigger");
+        assert!(questions::untold(&ws, false).is_empty(), "the turn finished");
+    }
+
+    #[test]
     fn try_again_after_the_builder_stopped_carries_on_instead_of_starting_over() {
         let b = bench();
         let ws = worked_on(&b);
@@ -1960,6 +2060,23 @@ mod picking_up_a_build {
         assert!(!written.message.contains("has no files"), "{written:?}");
         assert_eq!(written.message, "The build stopped after two builder turns changed no files in app/.");
     }
+}
+
+#[test]
+fn just_ask_is_told_to_the_builder_shortly_and_cut_on_a_character() {
+    use craft_anything_engine::questions::AskedQuestion;
+    assert_eq!(super::just_asked(&[]), "", "nothing asked, nothing added");
+    let q = |n: usize, answer: String| AskedQuestion::new(format!("question {n}"), answer, true, "Claude".into(), None, 0);
+    let mut asked: Vec<_> = (0..7).map(|n| q(n, "short".into())).collect();
+    asked.push(q(7, "é".repeat(3000)));
+    let told = super::just_asked(&asked);
+    assert!(!told.contains("question 2") && told.contains("question 3") && told.contains("question 7"), "the latest five: {told}");
+    assert!(told.contains(&format!("{}…", "é".repeat(1500))) && !told.contains(&"é".repeat(1501)), "a long answer is cut");
+    assert!(told.contains("A: short\n"), "a short one isn't marked as cut");
+    // The most a person can ask, five times over, still leaves room on a Windows command line, which
+    // counts UTF-16 units: an emoji is two.
+    let longest: Vec<_> = (0..5).map(|_| AskedQuestion::new("😀".repeat(4000), "😀".repeat(100_000), true, "Claude".into(), None, 0)).collect();
+    assert!(super::just_asked(&longest).encode_utf16().count() < 20_000);
 }
 
 fn check_worker(ws: &Workspace, deep: bool) -> Worker {
@@ -2682,6 +2799,19 @@ fn a_project_started_in_a_picked_folder_stays_in_the_list() {
 }
 
 #[test]
+fn starting_a_project_at_existing_project_folder_attaches_to_it() {
+    let session = craft_anything_engine::testing::session();
+    let d = tempfile::tempdir().unwrap();
+    let folder = d.path().join("mine");
+    let ws = project::new_project(&session.settings, "-", "Initial app", project::Place::At(&folder, None), None, false, None).unwrap();
+    assert_eq!(ws.root, folder);
+    // Starting again at the same folder attaches to the existing project rather than failing or duplicating
+    let reattached = project::new_project(&session.settings, "-", "Follow up", project::Place::At(&folder, None), None, false, None).unwrap();
+    assert_eq!(reattached.root, folder);
+    assert_eq!(reattached.manifest.name, ws.manifest.name);
+}
+
+#[test]
 fn a_project_edited_in_place_keeps_what_its_files_are_built_with() {
     use craft_anything_engine::workspace::ExistingFiles::{Edit, StartFrom};
     let first = |file: &str, request: &str, existing| {
@@ -2768,6 +2898,28 @@ fn a_project_is_built_by_the_ai_it_was_started_with_while_that_one_is_on() {
     cfg.backends.iter_mut().for_each(|b| b.config.enabled = b.config.name != "Codex");
     assert_eq!(super::project_builder(&cfg, &ws), None);
     assert_eq!(builder_backend(&cfg, super::project_builder(&cfg, &ws)).unwrap().config.name, "Claude Code");
+}
+
+/// A name given on purpose is never ignored: a backend that is off is refused in words that say
+/// how to fix it, and a name that matches nothing names the name instead of blaming the setup.
+#[test]
+fn a_named_backend_that_is_off_or_unknown_is_refused() {
+    use crate::{AiConfig, BackendConfig, BackendEntry, BackendKind};
+    let mut cfg = AiConfig::default();
+    for (name, enabled) in [("Claude Code", true), ("Codex", false)] {
+        let c = BackendConfig { name: name.into(), kind: BackendKind::AgentCli, model: String::new(), base_url: None, ssh_host: None, enabled };
+        cfg.upsert(BackendEntry { config: c, options: Default::default() });
+    }
+    assert_eq!(builder_backend(&cfg, Some("Claude Code")).unwrap().config.name, "Claude Code");
+
+    let off = builder_backend(&cfg, Some("Codex")).unwrap_err();
+    assert_eq!(off.code, ErrorCode::BadSettings);
+    assert!(off.message.contains("Codex") && off.message.contains("turned off"), "{off:?}");
+    assert!(off.remediation.as_deref().is_some_and(|r| r.contains("Turn it on")), "{off:?}");
+
+    let unknown = builder_backend(&cfg, Some("No Such AI")).unwrap_err();
+    assert!(unknown.message.contains("No AI backend named"), "{unknown:?}");
+    assert!(unknown.remediation.as_deref().is_some_and(|r| r.contains("ai list")), "{unknown:?}");
 }
 
 /// #446: a project copied from another computer keeps the id of a Claude Code session that lives

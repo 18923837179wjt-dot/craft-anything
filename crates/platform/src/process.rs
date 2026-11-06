@@ -385,6 +385,9 @@ fn use_search_path(cmd: &mut std::process::Command) {
 }
 
 fn spawn_error(name: &str, program: &OsStr, cwd: Option<&std::path::Path>, e: std::io::Error, remediation: Option<&str>) -> ToolError {
+    if let Some(interpreter) = crate::which::shim_missing_interpreter(program) {
+        return interpreter_missing_error(name, program, &interpreter, &e);
+    }
     // Unix starts a relative path from the folder the child runs in; Windows from ours.
     let looked_up = if cfg!(unix) { started_from(program, cwd) } else { std::path::PathBuf::from(program) };
     let found = crate::which::which_in(&looked_up.to_string_lossy(), crate::which::search_path()).into_iter().next();
@@ -417,6 +420,17 @@ fn spawn_error_for(name: &str, program: &OsStr, e: std::io::Error, remediation: 
         .with_details(serde_json::json!({"program": program.to_string_lossy(), "reason": "found_but_not_started", "path": path.to_string_lossy()})),
         (kind, _) => spawn_error_kind(name, program, e, kind, remediation),
     }
+}
+
+/// An npm shim whose interpreter isn't anywhere we look. Rust then refuses to hand the `.cmd` an
+/// argument with a line break ("batch file arguments are invalid"), which says nothing about Node.
+/// It's a missing program, so builder turns aren't retried.
+fn interpreter_missing_error(name: &str, program: &OsStr, interpreter: &str, e: &std::io::Error) -> ToolError {
+    ToolError::new(ErrorCode::EngineMissing, format!("{name} was installed with npm and needs `{interpreter}` (Node.js) to run, but `{interpreter}` wasn't found."))
+        .with_remediation(format!(
+            "Install Node.js, or if you use nvm for Windows, run `nvm use <version>` in a terminal opened as administrator. Then restart Craft Anything. Installing {name} without npm also works, when it offers that."
+        ))
+        .with_details(serde_json::json!({"program": program.to_string_lossy(), "reason": "interpreter_missing", "interpreter": interpreter, "error": e.to_string()}))
 }
 
 fn spawn_error_kind(name: &str, program: &OsStr, e: std::io::Error, kind: std::io::ErrorKind, remediation: Option<&str>) -> ToolError {
@@ -795,6 +809,13 @@ impl Supervisor {
                 }
             }
             if self.kill.load(Ordering::SeqCst) || self.cancel.as_ref().is_some_and(|c| c()) {
+                // A program that exited since the check above ended on its own (a launcher that
+                // handed off, or a run that finished): say how, not that it was stopped.
+                if handed_off.is_none()
+                    && let Ok(Some(status)) = self.child.try_wait()
+                {
+                    return Stop::Exited(status);
+                }
                 return handed_off.map_or(Stop::Cancelled, Stop::Exited);
             }
             let elapsed = self.start.elapsed();
@@ -1262,8 +1283,23 @@ mod launch_tests {
     fn a_launcher_that_hands_off_keeps_its_group_until_stopped() {
         // Plain: a clean exit ends the run.
         assert!(exits_with(0).run().unwrap().success);
-        // Handing off: the launcher's clean exit doesn't, so the browser it started lives on.
-        let mut p = exits_with(0).hands_off().spawn().unwrap();
+        // Handing off: the launcher's clean exit doesn't, so the browser it started lives on. The
+        // launcher leaves a mark as its last step and the kill waits for it: on a busy machine
+        // `cmd` could still be starting when a fixed 500 ms was up, and a launcher stopped before
+        // it handed off is a cancelled run, not a clean one.
+        let dir = tempfile::tempdir().unwrap();
+        let mark = dir.path().join("handed-off");
+        let launcher = if cfg!(windows) {
+            Process::new("cmd").args(["/C", "type nul > handed-off & exit 0"])
+        } else {
+            Process::new("sh").args(["-c", ": > handed-off; exit 0"])
+        };
+        let mut p = launcher.cwd(dir.path()).hands_off().spawn().unwrap();
+        let start = std::time::Instant::now();
+        while !mark.exists() && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(mark.exists(), "the launcher never ran");
         assert!(p.wait_timeout(Duration::from_millis(500)).is_none(), "a clean hand-off ended the run");
         assert!(p.kill_and_wait(Duration::from_secs(5)));
         assert!(p.wait().unwrap().success);
@@ -1300,6 +1336,19 @@ mod launch_tests {
 #[cfg(test)]
 mod error_tests {
     use super::*;
+
+    /// An npm shim whose Node is missing is a missing program, named, with what to do about it.
+    #[test]
+    fn a_shim_without_its_interpreter_says_so() {
+        let e = std::io::Error::new(std::io::ErrorKind::InvalidInput, "batch file arguments are invalid");
+        let err = interpreter_missing_error("Claude Code", OsStr::new("claude"), "node", &e);
+        assert_eq!(err.code, ErrorCode::EngineMissing);
+        assert!(err.message.contains("needs `node`") && !err.message.contains("batch file"), "{}", err.message);
+        assert!(err.remediation.as_deref().is_some_and(|r| r.contains("nvm use")), "{:?}", err.remediation);
+        let details = err.details.unwrap();
+        assert_eq!((details["reason"].as_str(), details["interpreter"].as_str()), (Some("interpreter_missing"), Some("node")));
+        assert_eq!(details["error"].as_str(), Some("batch file arguments are invalid"));
+    }
 
     /// A busy program file is tried again; any other error, or a file that stays busy, is returned.
     #[test]
