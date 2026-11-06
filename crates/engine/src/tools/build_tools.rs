@@ -222,9 +222,9 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     let ws = workspace(ctx)?;
     let default = if ws.manifest.app_in_root { "." } else { "app" };
     let root = in_project(&ws, p.path.as_deref().unwrap_or(default))?;
-    // The builder is told to read capture/README.md and capture.json, so an explicit listing of
-    // capture/ (or a folder inside it) is allowed; the root listing still hides it.
-    let listing_capture = really_inside(&ws.capture_dir(), &root);
+    // Our records are hidden from a listing of the project, but a listing of one of them (the
+    // builder is told to read capture/ and reference/) shows what is in it.
+    let listing_own = ws.is_own_record(&root);
     let depth = p.depth.unwrap_or(4).min(8);
     const SKIP: [&str; 9] = ["node_modules", "target", "vendor", "dist", "build", ".git", "Library", "Temp", "Intermediate"];
     let mut entries = Vec::new();
@@ -240,9 +240,8 @@ fn build_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
             }
             let path = e.path();
             // Craft Anything's own records are not the app, even when the app is the project
-            // folder; the brief names them and the builder must leave them alone. Capture is
-            // allowed because the builder is told to read its evidence files.
-            if !listing_capture && ws.is_own_record(&path) {
+            // folder; the brief names them and the builder must leave them alone.
+            if !listing_own && ws.is_own_record(&path) {
                 continue;
             }
             let name = e.file_name().to_string_lossy().into_owned();
@@ -458,6 +457,10 @@ mod tests {
         let pages = call(&e, "build_files_list", json!({"path": "capture/pages"})).unwrap();
         assert_eq!(pages["root"], "capture/pages");
         assert!(pages["entries"].to_string().contains("capture/pages/index.html"), "{pages}");
+        std::fs::create_dir_all(d.path().join("reference")).unwrap();
+        std::fs::write(d.path().join("reference/look.png"), "x").unwrap();
+        let reference = call(&e, "build_files_list", json!({"path": "reference"})).unwrap();
+        assert!(reference["entries"].to_string().contains("reference/look.png"), "{reference}");
 
         // An explicit nested folder is still listed by that path.
         let nested = call(&e, "build_files_list", json!({"path": "app"})).unwrap();
