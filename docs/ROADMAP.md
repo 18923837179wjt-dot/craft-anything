@@ -774,6 +774,8 @@ Gaps found while using the app for real projects.
       the system's Edit items need the text box to answer them, so they'd show greyed out today
 - [x] The Advanced console's prompt box starts tall enough to read what's typed (#942)
       — claimed: justinjohn0306, branch bugfix/942-console-input-height
+- [x] A French README (`README.fr.md`) translated from `README.md` and linked from the language
+      switcher in every README (#831)
 
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress
