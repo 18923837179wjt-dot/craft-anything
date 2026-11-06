@@ -1265,6 +1265,22 @@ fn clean_room_studies_nothing_inside_and_deep_mode_looks() {
     }
 }
 
+#[test]
+fn deep_mode_maps_the_javascript_beside_an_exe_target() {
+    let d = tempfile::tempdir().unwrap();
+    let app = d.path().join("App");
+    std::fs::create_dir_all(app.join("resources")).unwrap();
+    std::fs::write(app.join("App.exe"), b"MZ").unwrap();
+    std::fs::write(app.join("resources/app.asar"), craft_anything_testkit::electron::notes_app_asar()).unwrap();
+    for (name, target) in [("folder", app.clone()), ("exe", app.join("App.exe"))] {
+        let mut ws = Workspace::create(&d.path().join("projects"), name, "Recreate this app", TargetRef::Local { path: target }).unwrap();
+        let mut w = check_worker(&ws, true);
+        w.study(&mut ws, kind("game").as_ref()).unwrap();
+        let notes = std::fs::read_to_string(ws.capture_dir().join("README.md")).unwrap();
+        assert!(notes.contains("## JavaScript application"), "{name}: {notes}");
+    }
+}
+
 #[cfg(unix)]
 mod picking_up_a_build {
     use super::*;
@@ -2964,4 +2980,57 @@ fn the_builders_conversation_travels_with_the_project() {
 fn a_sign_in_that_stopped_working_is_called_that() {
     assert_eq!(not_signed_in("claude-code", false), "Claude Code isn't signed in on this computer.");
     assert_eq!(not_signed_in("claude-code", true), "Claude Code's sign-in on this computer has expired or was signed out.");
+}
+
+#[test]
+fn a_build_says_when_it_waits_for_an_analysis_started_earlier() {
+    let d = tempfile::Builder::new().prefix("ca").tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Game", "Copy this game", TargetRef::None).unwrap();
+    let launcher = d.path().join("analyzeHeadless");
+    std::fs::write(&launcher, "").unwrap();
+    let program = d.path().join("game.bin");
+    std::fs::write(&program, b"not really a program").unwrap();
+    let store = d.path().join("store");
+
+    let mut s = craft_anything_engine::testing::session();
+    s.settings.deep_mode = true;
+    s.settings.engines.store_dir = Some(store.clone());
+    s.settings.engines.ghidra.install_dir = Some(launcher);
+    s.settings.engines.ghidra.startup_timeout_secs = Some(3);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let w = Worker {
+        wake: Default::default(),
+        engine: Arc::new(Engine::new(s)),
+        tx,
+        stop: CancelToken::default(),
+        preview: Arc::default(),
+        seen: HashSet::new(),
+        inbox: Inbox::new(ws.inbox_dir()),
+        editor: None,
+        notes: Arc::default(),
+        feed: Arc::new(Mutex::new(feed::FeedLog::open(&ws))),
+        assets: false,
+        decompiled: false,
+        usage: None,
+        self_check: None,
+        reset_progress_after_notes: false,
+    };
+
+    // Another process is already analysing this program: a fresh lock beside its project.
+    let sha = craft_anything_evidence::sha256_hex(&std::fs::read(&program).unwrap());
+    let digest = craft_anything_evidence::sha256_hex(b"craft-anything-ghidra-fast-profile-v2|lang=");
+    let project = craft_anything_engines::ghidra::project_cache_dir(&store, &sha, &digest);
+    std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+    std::fs::write(project.with_extension("analysing"), "").unwrap();
+
+    let done = w.prepare_ghidra(&program).expect("deep mode with Ghidra prepares the analysis");
+    let _ = done.recv_timeout(Duration::from_secs(30));
+    let said: Vec<String> = rx
+        .try_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(said.iter().any(|t| t.contains("waiting for Ghidra's analysis of this program, started earlier")), "{said:?}");
 }

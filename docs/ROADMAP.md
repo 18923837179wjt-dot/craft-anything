@@ -174,9 +174,10 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
 - [ ] `a_helper_is_judged_by_whether_it_runs` (ai crate) sometimes fails when several crates'
       tests run at once and passes alone: it writes a script and runs it straight away, which a
       busy machine can refuse while another test's child still holds the file open
-- [ ] `a_remote_query_expands_only_the_remote_working_directory` (ai crate) fails on a Mac: the
-      temp folder is `/var/…`, a link to `/private/var/…`, and the shell's `$PWD` gives the second.
-      Compare with the folder's canonical path
+- [x] `a_remote_query_expands_only_the_remote_working_directory` compares the shell's `$PWD`
+      with the fixture's canonical path, so macOS's `/var` → `/private/var` alias does not fail
+      the test. Remote expansion and special-character quoting checks are retained — PR #949
+      — claimed: Codex, branch test/r5.2-macos-remote-query-path
 - [ ] Revisit the two advisory exceptions in `deny.toml`: `rsa` (no fix; we only verify with public
       keys) when rsa 0.10 lands, and unmaintained `zbus_names`/`zvariant` (Linux-only via keyring
       and accesskit) when those move on. `deny.toml`'s comments say this is tracked in R0.3: point
@@ -712,6 +713,9 @@ Gaps found while using the app for real projects.
       itself once the process it serves is gone: the Windows loop checks that process every 30 s,
       and macOS uses `caffeinate -w`. Live on Windows: a CLI build killed outright, its helper
       ended 30 s later. Not run on a Mac
+- [x] Zoom (Cmd/Ctrl + / − / 0) between 50% and 200%: egui's own limits are 20% and 500%, where
+      text is unreadable or the window has room for almost nothing
+      — claimed: sanketdofe, branch feature/r2.9-zoom-bounds
 - [ ] Find why a site capture lost its browser ("the WebSocket is closed", 419 ms into
       `web_site_capture` for a second page, seen once; the same capture passed 41 s earlier)
 - [x] Delete a private browser's temporary profile when it closes or fails to start (#810) — PR #822
@@ -754,6 +758,8 @@ Gaps found while using the app for real projects.
 - [ ] A live build with two Claude Code AIs signed in to two accounts, and one over SSH with a
       `~/` folder (the remote line is unit-tested, not run on another computer)
 
+- [x] The Advanced console's status stays clear of its tabs when the console is narrow
+      — claimed: justinjohn0306, branch bugfix/r2.9-console-status-overlap
 - [ ] Keep the builder-availability smoke regression independent of live agent discovery.
       — claimed: Afloat16, branch test/r2.9-builder-discovery-fixture-20261104
       Test fixture implemented with controlled discovery; automated validation remains pending.
