@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(language_from_tag("vi-VN"), Some("vi"));
         assert_eq!(language_from_tag("vi_VN.UTF-8"), Some("vi"));
         assert_eq!(preferred_language(["de-DE", "zh-HK"]), "de");
-        assert_eq!(preferred_language(["es-ES", "vi-VN", "en-US"]), "vi");
+        assert_eq!(preferred_language(["sv-SE", "vi-VN", "en-US"]), "vi");
         assert_eq!(preferred_language(["en-US", "zh-CN"]), "en");
         assert_eq!(preferred_language(["sv-SE"]), "en");
         assert_eq!(preferred_language(std::iter::empty::<&str>()), "en");
