@@ -629,6 +629,9 @@ fn ipv6(p: &[u8], d: &mut Decoded) {
                 next = n;
                 fragment = fo & 0xfff8 != 0;
                 off += 8;
+                if fragment {
+                    break;
+                }
             }
             51 => {
                 let (Some(n), Some(l)) = (payload_reader.u8(off), payload_reader.u8(off + 1)) else { break };
