@@ -2834,6 +2834,8 @@ fn the_switches_under_the_prompt_box_never_overlap() {
         assert!(!hint.intersects(title) && !hint.intersects(asking), "at {width}: {hint:?}, {title:?}, {asking:?}");
         assert!(title.left() >= 0.0 && asking.right() <= width, "at {width} they stay in the window: {title:?}, {asking:?}");
     }
+}
+
 #[test]
 fn a_very_long_app_file_name_keeps_start_inside_the_window() {
     use craft_anything_engine::workspace::TargetRef;
