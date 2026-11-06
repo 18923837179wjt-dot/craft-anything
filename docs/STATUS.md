@@ -1,7 +1,7 @@
 # Status
 
 What works today and how it was checked. The plan, owners and order of work are in
-[ROADMAP.md](ROADMAP.md). Last updated 2026-11-04. The baseline audit on 2026-10-23 from `main` had 923 tests passing;
+[ROADMAP.md](ROADMAP.md). Last updated 2026-11-05. The baseline audit on 2026-10-23 from `main` had 923 tests passing;
 workspace clippy, layers, fmt and the secret scan of all history were clean. Chinese UI checks are listed separately below.
 
 ## What works, and how it was checked
@@ -9,6 +9,7 @@ workspace clippy, layers, fmt and the secret scan of all history were clean. Chi
 | Area | State | Verified by |
 |---|---|---|
 | DNS question boundaries | A question is retained only when its name, type and class are complete. A missing class byte marks the DNS message incomplete; preceding complete questions remain available, and incomplete questions do not enter the query inventory | Four packet regressions cover both truncation lengths, multiple questions, complete class values and the capture summary. No live capture was used |
+| Reject impossible IPv4 header and total lengths | IPv4 decoding rejects impossible header lengths and reports incomplete base headers or options. | Synthetic byte fixtures in `pcap_ipv4_lengths` integration regressions. Cover 10–19 captured header bytes, total lengths below IHL, missing options, complete options, truncated transport headers with readable ports, and a cut UDP payload with both ports and its captured length preserved. |
 | Java decompilation | `java_vineflower_decompile` decompiles a real JAR to source with the pinned Vineflower 1.12.0, run through the configured Java | Live run on Linux x86-64 (OpenJDK 21.0.12.1) against Apache Commons IO 2.16.1 (497 KB, 374 entries): 253 source files, exit 0; `org.apache.commons.io.FileUtils` returned 1,350 lines with the class and its file-reading methods present. The engine install matched the pinned SHA-256. Not checked: Windows and macOS, a `.class` input, or a second JAR |
 | Conversation width | Agent paragraphs, inline code and fenced code stay within the message column, including glossary terms followed by long file links (#523) | UI regression checks painted text and subsequent answers against the composer bounds in Project and Ask at 1920 × 1032 and 1280 × 820; Unicode/formatted glossary hover check |
 | Settings saved on exit | Pending app settings merge the session's latest AI table when its guard is available. A busy session defers non-AI edits in `config.pending.toml` without waiting for the tool; startup recovers them with the latest committed AI table | Isolated child-process regression exercises idle and busy exit saves, a late AI commit, startup recovery and pending non-AI edits; engine tests cover sidecar migrations and damaged/newer files. No live desktop shutdown was exercised |
