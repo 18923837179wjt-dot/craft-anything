@@ -4,6 +4,8 @@
 //! - a coding agent that keeps a session (Claude Code) answers from a copy of the builder's own
 //!   session (`--fork-session`), which isn't kept, with only Read, Glob and Grep (none in Clean
 //!   room) and no tool server, so the builder's session and files stay as they are;
+//! - Copilot starts a fresh ACP session with no tool server: only view, glob and grep in Deep
+//!   mode, no tools in Clean room. It answers from the project context, not the builder's chat;
 //! - an AI with an API key answers with our agent loop on a [`ReadOnlyHost`]: the engine's tools
 //!   that change nothing, pointed at this project in an engine of its own;
 //! - any other agent is refused, since it can't be held to reading.
@@ -13,7 +15,7 @@
 
 use super::*;
 use crate::agent::{EngineHost, LoopConfig, ReadOnlyHost};
-use crate::cli_agents::{CliConversation, CliSpec};
+use crate::cli_agents::CliSpec;
 use craft_anything_engine::Toolset;
 use serde::Serialize;
 use std::time::{Duration, Instant, SystemTime};
@@ -71,19 +73,36 @@ pub fn ask(
     let cfg = crate::AiConfig::from_settings(settings);
     let entry = builder_backend(&cfg, project_builder(&cfg, ws))?;
     let deep = settings.deep_mode;
-    let (mut conv, from): (Box<dyn Conversation>, AnsweredFrom) = match entry.config.kind {
+    let cli = |resume: Option<String>| -> Box<dyn Conversation> {
+        let spec = CliSpec {
+            question: true,
+            deep,
+            logs: logs.clone(),
+            resume,
+            preamble: Some(PREAMBLE.into()),
+            ..CliSpec::new(entry.config.clone(), entry.options.clone(), false, Some(ws.root.clone()))
+        };
+        crate::cli_agents::conversation(spec)
+    };
+    let (mut conv, mut from): (Box<dyn Conversation>, AnsweredFrom) = match entry.config.kind {
         BackendKind::AgentCli => {
-            let session = ws.manifest.agent_session.clone();
-            let from = if session.is_some() { AnsweredFrom::BuildersSession } else { AnsweredFrom::TheFiles };
+            let session = ws.manifest.agent_session_for(&entry.config.model).map(str::to_string);
+            if let Some(id) = session.as_deref() {
+                bring_back_session(ws, &entry, id);
+            }
+            // Only a native adapter that resumes can answer from a copy of the builder's chat.
+            // Copilot's ACP question starts fresh, even when the project has a saved session id.
+            let native_session = crate::cli_agents::adapter_for(&entry.config.model).resumes();
+            let from = if session.is_some() && native_session { AnsweredFrom::BuildersSession } else { AnsweredFrom::TheFiles };
             let spec = CliSpec {
                 question: true,
                 deep,
-                logs,
+                logs: logs.clone(),
                 resume: session,
                 preamble: Some(PREAMBLE.into()),
                 ..CliSpec::new(entry.config.clone(), entry.options.clone(), false, Some(ws.root.clone()))
             };
-            (Box::new(CliConversation::new(spec)), from)
+            (crate::cli_agents::conversation(spec), from)
         }
         _ => {
             // An engine of its own, pointed at this project, so a build running meanwhile keeps its.
@@ -97,16 +116,58 @@ pub fn ask(
             (Box::new(conv), AnsweredFrom::TheFiles)
         }
     };
-    let prompt = match from {
+    let prompt = |from| match from {
         AnsweredFrom::BuildersSession => format!("{}\n\nQuestion: {question}", context(ws)),
         AnsweredFrom::TheFiles => format!("{PREAMBLE}{}\n\nQuestion: {question}", context(ws)),
     };
-    conv.send(&prompt);
-    let (answer, cost_usd) = collect(conv.as_mut(), cancel, WAIT)?;
+    conv.send(&prompt(from));
+    let mut answered = collect(conv.as_mut(), cancel, WAIT);
+    // The builder's session isn't on this computer (the project was copied here): the question
+    // is answered from the files instead.
+    if answered.is_err() && from == AnsweredFrom::BuildersSession && conv.session_lost() {
+        // Forgotten, so later questions don't ask for it again. Not saving it isn't worth failing
+        // the question over: the next build finds it missing too, forgets it and says so.
+        if let Some(lost) = ws.manifest.agent_session.as_deref() {
+            let _ = forget_lost_session(&ws.root, lost);
+        }
+        from = AnsweredFrom::TheFiles;
+        conv = cli(None);
+        conv.send(&prompt(from));
+        answered = collect(conv.as_mut(), cancel, WAIT);
+    }
+    let (answer, cost_usd) = answered?;
     // A copy of a session reports the whole session's running cost, not this question's (a
     // live run said $22.67 for a few cents of cache reads): say nothing rather than that.
     let cost_usd = cost_usd.filter(|_| from != AnsweredFrom::BuildersSession);
     Ok(Answered { answer, from, backend: entry.config.name.clone(), cost_usd })
+}
+
+/// The builder's session, kept in the project, put back where its agent looks when this computer
+/// doesn't have it (#451), so the question is answered from the builder's own conversation. Only
+/// for an agent here (a remote one keeps its sessions there). Without it the question is answered
+/// from the files, as when nothing was kept, so a failure here only costs that.
+fn bring_back_session(ws: &Workspace, entry: &crate::BackendEntry, id: &str) {
+    if entry.config.ssh_host.as_deref().is_some_and(|h| !h.trim().is_empty()) {
+        return;
+    }
+    if let Some(saved) = super::kept_session_bytes(ws) {
+        let adapter = crate::cli_agents::AgentAdapters::default().for_backend(&entry.config.model, &entry.options);
+        let _ = adapter.restore_session(id, &saved, &ws.root);
+    }
+}
+
+/// Forget the project's builder session `lost`, which this computer doesn't have, as the build
+/// does. A question may be asked while a build runs, so this reads the project again and only
+/// clears the id if it's still `lost`: a build may have saved another since. Returns whether it
+/// was cleared.
+fn forget_lost_session(root: &Path, lost: &str) -> Result<bool, ToolError> {
+    let mut now = Workspace::open(root)?;
+    if now.manifest.agent_session.as_deref() != Some(lost) {
+        return Ok(false);
+    }
+    now.manifest.agent_session = None;
+    now.save()?;
+    Ok(true)
 }
 
 /// The answer's text and cost, once its turn is done.
@@ -215,6 +276,28 @@ fn ago(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A question that finds the builder's session missing forgets it, unless a build has saved
+    /// another meanwhile: then that one stays.
+    #[test]
+    fn a_lost_session_is_forgotten_but_never_one_a_build_saved_since() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        ws.manifest.agent_session = Some("gone".into());
+        ws.manifest.last_reply = "Built it.".into();
+        ws.save().unwrap();
+        assert!(forget_lost_session(&ws.root, "gone").unwrap());
+        let now = Workspace::open(&ws.root).unwrap();
+        assert_eq!(now.manifest.agent_session, None);
+        assert_eq!(now.manifest.last_reply, "Built it.", "nothing else changes");
+
+        ws.manifest.agent_session = Some("new-from-a-build".into());
+        ws.save().unwrap();
+        assert!(!forget_lost_session(&ws.root, "gone").unwrap());
+        assert_eq!(Workspace::open(&ws.root).unwrap().manifest.agent_session.as_deref(), Some("new-from-a-build"));
+
+        assert!(forget_lost_session(&d.path().join("no-such-project"), "gone").is_err(), "an error, never a panic");
+    }
 
     #[test]
     fn the_newest_files_come_first_and_build_output_is_left_out() {

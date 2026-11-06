@@ -275,9 +275,10 @@ fn native_function_disassemble(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolO
             text.push_str(&line);
             text.push('\n');
         }
+        let name = name_of(t, &st.prog, f.entry).unwrap_or_else(|| f.name.clone());
         let e = ev(ctx, "native_function_disassemble", params_json(&p))?
             .result(json!({"function": f.name, "entry": hex(f.entry), "assembly": text, "instructions": insns.len()}))
-            .summary(format!("{} instructions of {}.", insns.len(), f.name))
+            .summary(format!("{} instructions of {name}.", insns.len()))
             .coverage(Coverage::complete(insns.len() as u64))
             .location(Location::address(f.entry))
             .build()?;
@@ -289,11 +290,12 @@ fn native_function_callees_list(ctx: &mut Ctx<'_>, params: Value) -> Result<Tool
     with_proc!(ctx, params, ProcParams, |p, st, t, f| {
         let user = user_names(t);
         let names = |a: u64| user.get(&a).cloned();
+        let name = name_of(t, &st.prog, f.entry).unwrap_or_else(|| f.name.clone());
         let list = an::callees(&st.prog, f, &names);
         let unresolved = list.iter().filter(|c| c["indirect"] == true).count();
         let mut b = ev(ctx, "native_function_callees_list", params_json(&p))?
             .result(json!({"function": f.name, "entry": hex(f.entry), "callees": list}))
-            .summary(format!("{} makes {} calls ({unresolved} unresolved).", f.name, list.len()))
+            .summary(format!("{name} makes {} calls ({unresolved} unresolved).", list.len()))
             .confidence(Confidence::Derived)
             .coverage(Coverage::complete(list.len() as u64))
             .location(Location::address(f.entry));
@@ -308,14 +310,14 @@ fn native_function_callers_list(ctx: &mut Ctx<'_>, params: Value) -> Result<Tool
     with_proc!(ctx, params, ProcParams, |p, st, t, f| {
         let user = user_names(t);
         let names = |a: u64| user.get(&a).cloned();
+        let name = name_of(t, &st.prog, f.entry).unwrap_or_else(|| f.name.clone());
         let list = an::callers(&st.prog, f, &names);
         let pointers =
             st.prog.xrefs_to.get(&f.entry).map(|v| v.iter().filter(|x| x.kind == XrefKind::Pointer || x.kind == XrefKind::Data).count()).unwrap_or(0);
         let mut b = ev(ctx, "native_function_callers_list", params_json(&p))?
             .result(json!({"function": f.name, "entry": hex(f.entry), "callers": list, "address_taken": pointers}))
             .summary(format!(
-                "{} is called from {} places{}.",
-                f.name,
+                "{name} is called from {} places{}.",
                 list.len(),
                 if pointers > 0 { format!(" and its address is taken {pointers} times") } else { String::new() }
             ))
@@ -356,9 +358,14 @@ fn native_function_references_list(ctx: &mut Ctx<'_>, params: Value) -> Result<T
                 }
             }
         }
+        let name = name_of(t, &st.prog, f.entry).unwrap_or_else(|| f.name.clone());
+        let dir = match p.direction {
+            Direction::Incoming => "incoming",
+            Direction::Outgoing => "outgoing",
+        };
         let e = ev(ctx, "native_function_references_list", params_json(&p))?
             .result(json!({"function": f.name, "entry": hex(f.entry), "direction": p.direction, "references": rows}))
-            .summary(format!("{} {:?} references for {}.", rows.len(), p.direction, f.name).to_lowercase())
+            .summary(format!("{} {dir} references for {name}.", rows.len()))
             .confidence(Confidence::Derived)
             .coverage(Coverage::complete(rows.len() as u64))
             .location(Location::address(f.entry))
@@ -374,20 +381,24 @@ fn native_function_pseudocode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOu
     // built-in analysis stops short on a huge program (a 200 MB game has far more functions than
     // it maps), so in Deep mode an address it can't place (0x…, FUN_…, sub_…) goes to Ghidra,
     // which analysed the whole program and finds the function containing it.
-    let (entry, unknown) = {
+    // Ghidra may load the program somewhere else (a position-independent ELF goes to 0x100000),
+    // so the deep hook is told whose address this is: ours, or one from a name Ghidra made.
+    let (at, our_base, unknown) = {
         let st = native(ctx)?;
         let t = ctx.session.active()?;
+        let our_base = st.img.bin.image_base;
         match resolve_function(t, &st.prog, &p.function) {
-            Ok(f) => (f.entry, None),
+            Ok(f) => (super::deep::At::Ours(f.entry), our_base, None),
             Err(e) => match ghidra_address(&p.function).filter(|_| !ctx.session.clean_room()) {
-                Some(a) => (a, Some(e)),
+                Some(a) if is_ghidra_name(&p.function) => (super::deep::At::Engine(a), our_base, Some(e)),
+                Some(a) => (super::deep::At::Ours(a), our_base, Some(e)),
                 None => return Err(e),
             },
         }
     };
     // Deep mode (Ghidra) is preferred through this same tool id when it is on and available;
     // otherwise, and whenever anything about it fails, we use the built-in clean-room lifter.
-    let why_not_deep = match super::deep::pseudo_code(ctx, entry, params_json(&p)) {
+    let why_not_deep = match super::deep::pseudo_code(ctx, at, our_base, params_json(&p)) {
         Ok(result) => return result,
         Err(why) => why,
     };
@@ -405,10 +416,11 @@ fn native_function_pseudocode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOu
     let f = resolve_function(t, &st.prog, &p.function)?;
     let user = user_names(t);
     let names = |a: u64| user.get(&a).cloned();
+    let name = name_of(t, &st.prog, f.entry).unwrap_or_else(|| f.name.clone());
     let ps = lift(&st.img, &st.prog, f, &names);
     let e = ev(ctx, "native_function_pseudocode", params_json(&p))?
         .result(json!({"function": name_of(t, &st.prog, f.entry), "entry": hex(f.entry), "signature": ps.signature, "pseudo_code": ps.text, "calls": ps.calls, "strings": ps.strings, "structured": ps.structured, "gotos": ps.gotos, "inline_asm": ps.asm_fallbacks, "engine": "clean-room lifter"}))
-        .summary(format!("Pseudo-C for {} ({} lines{}).", f.name, ps.text.lines().count(), if ps.structured { "" } else { ", partly unstructured" }))
+        .summary(format!("Pseudo-C for {name} ({} lines{}).", ps.text.lines().count(), if ps.structured { "" } else { ", partly unstructured" }))
         .confidence(Confidence::Inferred)
         .target_content(true)
         .limitations(ps.limitations.iter().map(|(c, m)| Limitation::new(c.clone(), m.clone())))
@@ -419,9 +431,19 @@ fn native_function_pseudocode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOu
 }
 
 /// An address Ghidra can look up: `0x…`, a bare hex address, or a generated name like `FUN_…`.
+/// Whether `function` is a name Ghidra made from an address (`FUN_00101160`), so the address in it
+/// is Ghidra's rather than ours.
+fn is_ghidra_name(function: &str) -> bool {
+    let s = function.trim();
+    ["FUN_", "SUB_", "sub_", "LAB_"].iter().any(|p| s.starts_with(p))
+}
+
 fn ghidra_address(function: &str) -> Option<u64> {
     let s = function.trim();
-    let s = ["FUN_", "SUB_", "sub_", "LAB_"].iter().find_map(|p| s.strip_prefix(p)).unwrap_or(s);
+    if let Some(hex) = ["FUN_", "SUB_", "sub_", "LAB_"].iter().find_map(|p| s.strip_prefix(p)) {
+        let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+        return u64::from_str_radix(hex, 16).ok();
+    }
     super::parse_address(s).ok()
 }
 
@@ -455,16 +477,35 @@ fn insn_json(st: &super::native_common::NativeState, t: &crate::session::OpenTar
 
 fn native_function_instructions_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     with_proc!(ctx, params, ProcParams, |p, st, t, f| {
+        let name = name_of(t, &st.prog, f.entry).unwrap_or_else(|| f.name.clone());
         let insns = st.prog.instructions(&st.img, f, true);
         let rows: Vec<Value> = insns.iter().map(|i| insn_json(&st, t, i)).collect();
         let e = ev(ctx, "native_function_instructions_list", params_json(&p))?
             .result(json!({"function": f.name, "entry": hex(f.entry), "instructions": rows}))
-            .summary(format!("{} instructions in {}.", rows.len(), f.name))
+            .summary(format!("{} instructions in {name}.", rows.len()))
             .coverage(Coverage::complete(rows.len() as u64))
             .location(Location::address(f.entry))
             .build()?;
         Ok(ToolOutput::evidence(e))
     })
+}
+
+/// How far `a` is from a function's entry. A function's blocks can lie below its entry (a cold
+/// part, or code reached by a jump back), so the offset can be negative.
+fn signed_offset(a: u64, entry: u64) -> i128 {
+    i128::from(a) - i128::from(entry)
+}
+
+/// An offset as a JSON number. JSON numbers here are 64-bit, and an offset can be anything from
+/// -(2^64 - 1) to 2^64 - 1, so one more than 2^63 below the entry is given as signed hex text.
+fn offset_json(off: i128) -> Value {
+    if let Ok(n) = i64::try_from(off) {
+        Value::from(n)
+    } else if let Ok(n) = u64::try_from(off) {
+        Value::from(n)
+    } else {
+        Value::from(format!("-{:#x}", off.unsigned_abs()))
+    }
 }
 
 fn native_function_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
@@ -475,13 +516,20 @@ fn native_function_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
     let t = ctx.session.active()?;
     let f = st.prog.function_containing(a);
     let result = match f {
-        Some(f) => json!({"address": hex(a), "function": name_of(t, &st.prog, f.entry), "entry": hex(f.entry), "offset": a - f.entry}),
+        Some(f) => {
+            json!({"address": hex(a), "function": name_of(t, &st.prog, f.entry), "entry": hex(f.entry), "offset": offset_json(signed_offset(a, f.entry))})
+        }
         None => {
             json!({"address": hex(a), "function": null, "reason": if st.img.is_exec(a) { "not inside any discovered function" } else { "not in executable code" }})
         }
     };
     let summary = match f {
-        Some(f) => format!("{a:#x} is inside {} (+{:#x}).", f.name, a - f.entry),
+        Some(f) => {
+            let name = name_of(t, &st.prog, f.entry).unwrap_or_else(|| f.name.clone());
+            let off = signed_offset(a, f.entry);
+            let sign = if off < 0 { "-" } else { "+" };
+            format!("{a:#x} is inside {name} ({sign}{:#x}).", off.unsigned_abs())
+        }
         None => format!("{a:#x} isn't inside a known function."),
     };
     let mut b =
@@ -557,7 +605,13 @@ fn native_call_site_resolve(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
     let jt = f.and_then(|f| f.jump_tables.iter().find(|j| j.site == a));
     let insn = st.img.decode(a, true);
     let (status, targets, mut lims): (&str, Vec<Value>, Vec<Limitation>) = match (call, jt, insn.as_ref().map(|i| i.flow)) {
-        (Some(c), _, _) if c.import.is_some() => ("resolved", vec![json!({"import": c.import, "slot": c.target.map(hex)})], vec![]),
+        (Some(c), _, flow) if c.import.is_some() => {
+            let slot = match flow {
+                Some(Flow::IndirectCall { slot: Some(s) } | Flow::IndirectJump { slot: Some(s) }) => Some(s),
+                _ => c.target.or_else(|| c.import.as_ref().and_then(|imp| st.prog.import_slots.iter().find(|(_, s)| s.name == *imp).map(|(s, _)| *s))),
+            };
+            ("resolved", vec![json!({"import": c.import, "slot": slot.map(hex)})], vec![])
+        }
         (Some(c), _, _) if c.target.is_some() => {
             ("resolved", vec![json!({"address": c.target.map(hex), "name": c.target.and_then(|x| name_of(t, &st.prog, x))})], vec![])
         }
@@ -692,6 +746,34 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn every_offset_fits_its_json() {
+        use super::{offset_json, signed_offset};
+        assert_eq!(offset_json(signed_offset(0x1010, 0x1020)), json!(-16));
+        assert_eq!(offset_json(signed_offset(u64::MAX, 0)), json!(u64::MAX));
+        assert_eq!(offset_json(signed_offset(1 << 63, 0)), json!(1u64 << 63));
+        assert_eq!(offset_json(signed_offset(0, 1 << 63)), json!(i64::MIN));
+        assert_eq!(offset_json(signed_offset(0, u64::MAX)), json!("-0xffffffffffffffff"));
+    }
+
+    #[test]
+    fn function_find_gives_a_negative_offset_for_a_block_below_the_entry() {
+        // `hot` at 0x1020 branches back to an unnamed block at 0x1010 (`mov eax, 1; ret`), which
+        // becomes part of `hot`: the address is inside it, 0x10 bytes before its entry. `start`
+        // is only there to be the program's entry point.
+        let below = vec![0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3];
+        let hot = vec![0x55, 0x48, 0x89, 0xe5, 0x85, 0xff, 0x0f, 0x84, 0xe4, 0xff, 0xff, 0xff, 0x5d, 0xc3];
+        let elf = tk::program_facts::elf_with_functions(&[("start", vec![0xc3]), ("", below), ("hot", hot)]);
+        let e = engine_with("prog", &elf);
+        let r = call(&e, "native_function_find", json!({"address": "0x1010"}));
+        assert_eq!(r["result"]["function"], "hot", "{r}");
+        assert_eq!(r["result"]["offset"], -0x10, "{r}");
+        assert_eq!(r["summary"], "0x1010 is inside hot (-0x10).");
+        let r = call(&e, "native_function_find", json!({"address": "0x1024"}));
+        assert_eq!(r["result"]["offset"], 4);
+        assert_eq!(r["summary"], "0x1024 is inside hot (+0x4).");
+    }
+
+    #[test]
     fn function_tools() {
         let (elf, l) = tk::elf64(tk::ElfArch::X86_64, true);
         let e = engine_with("prog", &elf);
@@ -734,10 +816,20 @@ mod tests {
         let err = call_err(&e, "native_function_pseudocode", json!({"function": "main"}));
         assert!(crate::clean_room::is_refusal(&err) && err.remediation.unwrap_or_default().contains("Deep mode"), "{}", err.message);
         e.session().settings.deep_mode = true;
-        assert_eq!(
-            (super::ghidra_address("FUN_145f7f5b0"), super::ghidra_address("0x10"), super::ghidra_address("main")),
-            (Some(0x145f7f5b0), Some(0x10), None)
-        );
+        for (input, expected) in [
+            ("FUN_145f7f5b0", Some(0x145f7f5b0)),
+            ("FUN_00401000", Some(0x401000)),
+            ("FUN_140001000", Some(0x140001000)),
+            ("SUB_00401000", Some(0x401000)),
+            ("sub_00401000", Some(0x401000)),
+            ("LAB_00401000", Some(0x401000)),
+            ("0x10", Some(0x10)),
+            ("401000h", Some(0x401000)),
+            ("4096", Some(4096)),
+            ("main", None),
+        ] {
+            assert_eq!(super::ghidra_address(input), expected, "{input}");
+        }
         let r = call(&e, "native_function_address_show", json!({"function": "dispatch"}));
         assert_eq!(r["result"]["address"], format!("{:#x}", l.code_va + tk::x64::DISPATCH));
         let r = call(&e, "native_function_instructions_list", json!({"function": "helper"}));
@@ -749,6 +841,7 @@ mod tests {
         assert_eq!(r["result"]["references"][0]["string"], tk::HELLO);
         let r = call(&e, "native_call_site_resolve", json!({"address": format!("{:#x}", l.code_va + 15)}));
         assert_eq!(r["result"]["targets"][0]["import"], "puts");
+        assert_eq!(r["result"]["targets"][0]["slot"], format!("{:#x}", l.got_va));
         let jmp = format!("{:#x}", l.code_va + tk::x64::DISPATCH + 0x15);
         let r = call(&e, "native_call_site_resolve", json!({"address": jmp}));
         assert_eq!(r["result"]["status"], "ambiguous");
@@ -762,5 +855,61 @@ mod tests {
         // by address works too
         let r = call(&e, "native_function_show", json!({"function": format!("{:#x}", l.code_va)}));
         assert_eq!(r["result"]["name"], "main");
+    }
+
+    /// #350: Function summaries use the annotated name after a rename.
+    #[test]
+    fn function_summaries_use_annotated_name_after_rename() {
+        let (bytes, l) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &bytes);
+        call(&e, "native_function_label", json!({"function": "main", "name": "RenamedEntry"}));
+
+        let dis = call(&e, "native_function_disassemble", json!({"function": "RenamedEntry"}));
+        assert!(dis["summary"].as_str().unwrap().contains("instructions of RenamedEntry."));
+
+        let callees = call(&e, "native_function_callees_list", json!({"function": "RenamedEntry"}));
+        assert!(callees["summary"].as_str().unwrap().starts_with("RenamedEntry makes "));
+
+        let callers = call(&e, "native_function_callers_list", json!({"function": "RenamedEntry"}));
+        assert!(callers["summary"].as_str().unwrap().starts_with("RenamedEntry is called from "));
+
+        let refs = call(&e, "native_function_references_list", json!({"function": "RenamedEntry"}));
+        assert!(refs["summary"].as_str().unwrap().contains("references for RenamedEntry."));
+
+        let insns = call(&e, "native_function_instructions_list", json!({"function": "RenamedEntry"}));
+        assert!(insns["summary"].as_str().unwrap().contains("instructions in RenamedEntry."));
+
+        let inside = format!("{:#x}", l.code_va + 4);
+        let find = call(&e, "native_function_find", json!({"address": inside}));
+        assert!(find["summary"].as_str().unwrap().contains("is inside RenamedEntry "));
+    }
+
+    #[test]
+    fn call_site_resolve_preserves_indirect_import_slot() {
+        let (bytes, layout) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &bytes);
+        let site = layout.code_va + 15;
+        let r = call(&e, "native_call_site_resolve", json!({"address": format!("{site:#x}")}));
+        assert_eq!(r["result"]["status"], "resolved");
+        assert_eq!(r["result"]["targets"][0]["import"], "puts");
+        assert_eq!(r["result"]["targets"][0]["slot"], format!("{:#x}", layout.got_va));
+
+        // Control 1: non-import indirect memory call retains slot
+        let mut nonimport = bytes.clone();
+        let off = (tk::ELF_TEXT_OFF as usize) + 15;
+        let disp = (layout.rodata_va as i64 - (site + 6) as i64) as i32;
+        nonimport[off + 2..off + 6].copy_from_slice(&disp.to_le_bytes());
+        let e_nonimport = engine_with("nonimport", &nonimport);
+        let r_nonimport = call(&e_nonimport, "native_call_site_resolve", json!({"address": format!("{site:#x}")}));
+        assert_eq!(r_nonimport["result"]["status"], "resolved");
+        assert_eq!(r_nonimport["result"]["targets"][0]["slot"], format!("{:#x}", layout.rodata_va));
+
+        // Control 2: register call (call rax) is unresolved
+        let mut register = bytes;
+        register[off..off + 6].copy_from_slice(&[0xff, 0xd0, 0x90, 0x90, 0x90, 0x90]);
+        let e_reg = engine_with("reg", &register);
+        let r_reg = call(&e_reg, "native_call_site_resolve", json!({"address": format!("{site:#x}")}));
+        assert_eq!(r_reg["result"]["status"], "unresolved");
+        assert_eq!(r_reg["result"]["targets"], json!([]));
     }
 }

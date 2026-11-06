@@ -16,6 +16,10 @@ enum Mode {
     Serve,
     /// Accept the connection and then stay silent forever.
     Silent,
+    /// Answer the first request with a reply line far longer than a test client accepts.
+    Huge,
+    /// Answer the first request with a reply sent in two halves, a few read ticks apart.
+    Split,
 }
 
 struct Fake {
@@ -50,6 +54,33 @@ impl Fake {
                         }
                     }
                     Mode::Serve => serve(stream, expected_token, &eof2),
+                    Mode::Huge | Mode::Split => {
+                        let mut writer = stream.try_clone().expect("clone");
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let id = serde_json::from_str::<Request>(line.trim()).map(|r| r.id).unwrap_or(1);
+                        let names = "f".repeat(64 * 1024);
+                        let reply = format!("{{\"id\":{id},\"ok\":true,\"result\":{{\"functions\":[{{\"name\":\"{names}\",\"address\":\"0x1\"}}]}}}}\n");
+                        if matches!(mode, Mode::Split) {
+                            let (a, b) = reply.as_bytes().split_at(reply.len() / 2);
+                            let _ = writer.write_all(a);
+                            let _ = writer.flush();
+                            std::thread::sleep(Duration::from_millis(600));
+                            let _ = writer.write_all(b);
+                        } else {
+                            let _ = writer.write_all(reply.as_bytes());
+                        }
+                        let _ = writer.flush();
+                        // Wait for the client to go away.
+                        line.clear();
+                        while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                            line.clear();
+                        }
+                        eof2.store(true, Ordering::SeqCst);
+                    }
                 }
             }
         });
@@ -95,7 +126,7 @@ fn serve(stream: TcpStream, expected: &str, saw_eof: &Arc<AtomicBool>) {
             break; // close on a bad token
         }
         let result = match req.method.as_str() {
-            "ping" => "{\"name\":\"fake\",\"provider\":{\"id\":\"ghidra\",\"version\":\"12.1.4\"},\"analysed\":true,\"analysis_cut_short\":false}"
+            "ping" => "{\"name\":\"fake\",\"provider\":{\"id\":\"ghidra\",\"version\":\"12.1.4\"},\"analysed\":true,\"analysis_cut_short\":false,\"target\":{\"name\":\"t\",\"image_base\":\"0x100000\"}}"
                 .to_string(),
             "native_functions_list" => "{\"functions\":[{\"name\":\"main\",\"address\":\"0x401000\"}]}".to_string(),
             // As the real bridge: a known function, code its analysis never made a function (made
@@ -134,6 +165,8 @@ fn framing_ping_and_methods() {
     let mut client = Client::connect(fake.addr, "secret-token", deadline).expect("connect");
     let info = client.ping(&no_cancel(), deadline).expect("ping");
     assert_eq!(info["provider"]["id"], "ghidra");
+    assert_eq!(image_base_of(&info), Some(0x10_0000), "the handshake says where Ghidra loaded the program");
+    assert_eq!(image_base_of(&serde_json::json!({"target": {"name": "t"}})), None, "an older bridge doesn't say");
 
     let list = client.request("native_functions_list", serde_json::json!({}), &no_cancel(), deadline).expect("list");
     assert_eq!(list["functions"][0]["name"], "main");
@@ -208,6 +241,35 @@ fn cancel_stops_a_request_quickly() {
     let err = client.request("ping", serde_json::json!({}), &move || flag.load(Ordering::SeqCst), Instant::now() + Duration::from_secs(30)).unwrap_err();
     assert!(matches!(err, GhidraError::Cancelled), "{err:?}");
     assert!(t.elapsed() < Duration::from_secs(3));
+    drop(client);
+    fake.join();
+}
+
+#[test]
+fn an_oversized_reply_is_refused_and_the_connection_closed() {
+    let fake = Fake::start(Mode::Huge, "tok");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut client = Client::connect(fake.addr, "tok", deadline).expect("connect").with_max_reply(4 * 1024);
+    match client.request("native_functions_list", serde_json::json!({}), &no_cancel(), deadline).unwrap_err() {
+        GhidraError::Protocol(m) => assert!(m.contains("larger than"), "{m}"),
+        other => panic!("expected a protocol error, got {other:?}"),
+    }
+    // The rest of that reply is still on the wire, so the client must not read on.
+    match client.request("ping", serde_json::json!({}), &no_cancel(), Instant::now() + Duration::from_secs(2)).unwrap_err() {
+        GhidraError::Connection(_) => {}
+        other => panic!("expected a connection error on the closed socket, got {other:?}"),
+    }
+    drop(client);
+    fake.join();
+}
+
+#[test]
+fn a_reply_arriving_over_several_read_ticks_is_read_whole() {
+    let fake = Fake::start(Mode::Split, "tok");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut client = Client::connect(fake.addr, "tok", deadline).expect("connect");
+    let list = client.request("native_functions_list", serde_json::json!({}), &no_cancel(), deadline).expect("the whole reply");
+    assert_eq!(list["functions"][0]["name"].as_str().map(str::len), Some(64 * 1024));
     drop(client);
     fake.join();
 }
@@ -292,6 +354,55 @@ fn ghidra_memory_follows_the_setting_within_its_bounds() {
 }
 
 #[test]
+fn a_dot_free_store_is_given_to_ghidra_as_it_is() {
+    let store = Path::new("/home/u/craft-anything/engines");
+    assert_eq!(ghidra_root(store).unwrap(), store);
+    assert!(has_dot_part(Path::new("/home/u/.config/craft-anything/engines")));
+    assert!(!has_dot_part(store));
+}
+
+/// Removes the link [`ghidra_root`] makes for a test's store when the test ends, passed or not: it
+/// lives outside the test's own temp folder, which is itself under a dot folder (`/tmp/.tmpXXXX`).
+struct LinkGuard(PathBuf);
+
+impl LinkGuard {
+    /// The folder to give Ghidra for `store`, with a guard that removes its link.
+    fn root(store: &Path) -> (LinkGuard, PathBuf) {
+        (LinkGuard(store.to_path_buf()), ghidra_root(store).unwrap())
+    }
+}
+
+impl Drop for LinkGuard {
+    fn drop(&mut self) {
+        if let Ok(link) = ghidra_root(&self.0)
+            && link != self.0
+            && std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            let _ = std::fs::remove_file(&link);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_under_a_dot_folder_reaches_ghidra_through_a_dot_free_link() {
+    let home = tempfile::tempdir().unwrap();
+    let store = home.path().join(".config").join("craft-anything").join("engines");
+    let (_link, root) = LinkGuard::root(&store);
+    assert!(!has_dot_part(&root), "{}", root.display());
+    assert!(!has_dot_part(&project_cache_dir(&root, &"ab".repeat(32), &"cd".repeat(32))));
+    // It is the store: what Ghidra saves there is in the store, and the next run finds the same link.
+    std::fs::write(root.join("saved"), "x").unwrap();
+    assert!(store.join("saved").is_file());
+    assert_eq!(ghidra_root(&store).unwrap(), root);
+    // A link left pointing elsewhere is replaced.
+    std::fs::remove_file(&root).unwrap();
+    std::os::unix::fs::symlink(home.path(), &root).unwrap();
+    assert_eq!(ghidra_root(&store).unwrap(), root);
+    assert_eq!(std::fs::read_link(&root).unwrap(), store);
+}
+
+#[test]
 fn project_cache_dir_is_keyed_and_dot_free() {
     let dir = project_cache_dir(Path::new("/store"), &"ab".repeat(32), &"cd".repeat(32));
     let s = dir.to_string_lossy();
@@ -313,7 +424,10 @@ fn a_second_analysis_waits_for_the_running_one_and_a_dead_ones_lock_is_taken_ove
         memory_gb: None,
     };
     let (sha, digest) = ("ab".repeat(32), "cd".repeat(32));
-    let project = project_cache_dir(d.path(), &sha, &digest);
+    // A temp folder can be under a dot folder (`/tmp/.tmpXXXX`): the project is then reached
+    // through the store's link, which is the path analyse() gives back.
+    let (_link, root) = LinkGuard::root(d.path());
+    let project = project_cache_dir(&root, &sha, &digest);
     std::fs::create_dir_all(project.parent().unwrap()).unwrap();
 
     // Someone is analysing (a fresh lock); their result appears a moment later.
@@ -350,6 +464,7 @@ fn the_first_analysis_in_a_fresh_store_starts_instead_of_waiting_for_a_lock_it_c
         compiler_spec: None,
         memory_gb: None,
     };
+    let _link = LinkGuard(cfg.store_dir.clone());
     let t = Instant::now();
     let err = analyse(&cfg, b"x", &"ab".repeat(32), &"cd".repeat(32), &|| false, &|_, _| {}).unwrap_err();
     assert!(matches!(err, GhidraError::Launch(_)), "tried to run Ghidra: {err:?}");
@@ -360,18 +475,23 @@ fn the_first_analysis_in_a_fresh_store_starts_instead_of_waiting_for_a_lock_it_c
 /// read-only data: `start` jumps through the table it is handed, so no code names them. Returns
 /// the program and the addresses of `triple`, the second function and the table.
 fn pointer_table_elf() -> (Vec<u8>, u64, u64, u64) {
-    const BASE: u64 = 0x40_0000;
-    let (start, triple, negate, table) = (BASE + 0x100, BASE + 0x110, BASE + 0x120, BASE + 0x1000);
+    pointer_table_elf_at(0x40_0000, 2)
+}
+
+/// [`pointer_table_elf`] loaded at `base`, with ELF type `e_type` (2 executable, 3 position
+/// independent).
+fn pointer_table_elf_at(base: u64, e_type: u8) -> (Vec<u8>, u64, u64, u64) {
+    let (start, triple, negate, table) = (base + 0x100, base + 0x110, base + 0x120, base + 0x1000);
     let mut b = vec![0u8; 0x1010];
     let put = |b: &mut Vec<u8>, off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
     // ELF header: ET_EXEC, x86-64, two program headers, no sections.
     put(&mut b, 0, b"\x7fELF\x02\x01\x01");
-    put(&mut b, 16, &[2, 0, 62, 0, 1, 0, 0, 0]);
+    put(&mut b, 16, &[e_type, 0, 62, 0, 1, 0, 0, 0]);
     put(&mut b, 24, &start.to_le_bytes());
     put(&mut b, 32, &0x40u64.to_le_bytes());
     put(&mut b, 52, &[64, 0, 56, 0, 2, 0, 64, 0]);
     // PT_LOAD r-x (headers and code), PT_LOAD r-- (the table).
-    for (i, (flags, off, va, size)) in [(5u32, 0u64, BASE, 0x1000u64), (4, 0x1000, table, 0x10)].into_iter().enumerate() {
+    for (i, (flags, off, va, size)) in [(5u32, 0u64, base, 0x1000u64), (4, 0x1000, table, 0x10)].into_iter().enumerate() {
         let o = 0x40 + i * 56;
         put(&mut b, o, &1u32.to_le_bytes());
         put(&mut b, o + 4, &flags.to_le_bytes());
@@ -419,6 +539,48 @@ fn live_ghidra_makes_and_decompiles_code_reached_only_through_a_pointer_table() 
     }
     // Made once, then found again, still marked as made on demand.
     assert!(session.decompile(triple).unwrap().expect("an answer").created);
+}
+
+#[test]
+fn addresses_move_between_our_image_base_and_the_engines() {
+    // Ghidra loads a position-independent ELF at 0x100000; we read it at 0.
+    let pie = Rebase::new(0, Some(0x10_0000));
+    assert!(!pie.is_identity());
+    assert_eq!((pie.to_engine(0x1160), pie.from_engine(0x10_1160)), (0x10_1160, 0x1160));
+    // Below the base it's moved from (not in the program): left as it is, never wrapped.
+    assert_eq!(pie.from_engine(0x40), 0x40);
+    let near_top = Rebase::new(0, Some(u64::MAX - 1));
+    assert_eq!(near_top.to_engine(0x10), 0x10, "no overflow");
+    // Same base, or an engine that didn't say: nothing moves.
+    for same in [Rebase::new(0x40_0000, Some(0x40_0000)), Rebase::new(0x40_0000, None)] {
+        assert!(same.is_identity());
+        assert_eq!((same.to_engine(0x40_1000), same.from_engine(0x40_1000)), (0x40_1000, 0x40_1000));
+    }
+}
+
+/// Real Ghidra (as above): a position-independent ELF is loaded away from 0, the handshake says
+/// where, and our addresses reach the right code once moved there.
+#[test]
+fn live_ghidra_reports_where_it_loaded_a_position_independent_elf() {
+    let Some(store) = std::env::var_os("CRAFT_ANYTHING_TEST_GHIDRA").map(PathBuf::from) else { return };
+    let temp = tempfile::Builder::new().prefix("ghidra-live").tempdir().unwrap();
+    let cfg = Config {
+        analyze_headless: get::headless(None, &store).expect("Ghidra in the engine store"),
+        java_home: get::java_home(None, &store),
+        startup_timeout: Duration::from_secs(600),
+        store_dir: temp.path().to_path_buf(),
+        language_id: None,
+        compiler_spec: None,
+        memory_gb: Some(4),
+    };
+    let (elf, triple, _, _) = pointer_table_elf_at(0, 3);
+    let session = Session::start(&cfg, &elf, &craft_anything_evidence::sha256_hex(&elf), &"ef".repeat(32), &|| false, &|_, _| {}).expect("Ghidra starts");
+    let base = session.image_base().expect("the handshake says where the program is");
+    assert_ne!(base, 0, "Ghidra moves a program whose lowest segment is at 0");
+    let rebase = Rebase::new(0, Some(base));
+    let made = session.decompile(rebase.to_engine(triple)).unwrap().expect("an answer");
+    assert_eq!(rebase.from_engine(made.entry), triple);
+    assert!(made.pseudocode.as_deref().unwrap_or_default().contains("* 3"), "{made:?}");
 }
 
 #[test]

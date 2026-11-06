@@ -6,10 +6,14 @@
 use super::*;
 
 mod antigravity;
+mod copilot;
 mod hermes;
+mod maki;
 mod opencode;
 pub use antigravity::Antigravity;
+pub use copilot::Copilot;
 pub use hermes::Hermes;
+pub use maki::Maki;
 pub use opencode::OpenCode;
 
 /// What a run's arguments are built from.
@@ -25,8 +29,8 @@ pub struct ArgsCx<'a> {
     pub builder: bool,
     /// Clean room: reads go through our approval tool too, so the original stays out of reach.
     pub reads_checked: bool,
-    /// A question about a build: only reading (none in Clean room), a resumed session forked and
-    /// not kept, no tool server.
+    /// A question about a build: only reading (none in Clean room), no tool server, and a fresh
+    /// session or a fork that leaves the builder's session unchanged.
     pub question: bool,
 }
 
@@ -36,6 +40,69 @@ pub trait AgentAdapter: Send + Sync {
     fn ids(&self) -> &'static [&'static str];
     /// argv after the program for one message.
     fn args(&self, cx: &ArgsCx) -> Vec<String>;
+    /// Whether this agent supplies its own live model and thinking choices.
+    fn has_model_catalog(&self) -> bool {
+        false
+    }
+
+    fn model_catalog_depends_on_selection(&self) -> bool {
+        false
+    }
+    /// Query models visible in this backend's execution context, respecting cancellation.
+    /// Agents without catalogue support return an empty list.
+    fn model_catalog(
+        &self,
+        _config: &BackendConfig,
+        _options: &BackendOptions,
+        _directory: Option<&Path>,
+        _stop: &Stop,
+    ) -> Result<Vec<models::AgentModel>, ToolError> {
+        Ok(Vec::new())
+    }
+    /// Check a saved choice in the actual run context before invoking the agent.
+    fn validate_model(&self, _config: &BackendConfig, _options: &BackendOptions, _directory: Option<&Path>, _stop: &Stop) -> Result<(), ToolError> {
+        Ok(())
+    }
+    /// Refuse options that the native transport cannot support, before preflight or process I/O.
+    /// Saving a model choice and discovering its catalogue do not imply native execution support.
+    fn check_native_options(&self, _options: &BackendOptions) -> Result<(), ToolError> {
+        Ok(())
+    }
+
+    /// Use ACP by default and refuse the per-message CLI runner. An explicit `acp = false` or
+    /// an SSH host must fail rather than opening an interactive agent with no approval channel.
+    fn requires_acp(&self) -> bool {
+        false
+    }
+    /// Startup arguments before the ACP flags: models, effort and the tools this access mode
+    /// may expose. The default keeps the backend's extra arguments unchanged.
+    fn acp_options(&self, options: &BackendOptions, _access: Access) -> Vec<String> {
+        options.args.clone()
+    }
+    /// Session-only MCP startup flags for an agent that needs more than `session/new`'s server
+    /// list. Questions never receive these flags, and the person's saved config isn't changed.
+    fn acp_mcp_options(&self, _mcp: &McpCommand) -> Vec<String> {
+        Vec::new()
+    }
+    /// Refuse backend options that could bypass this adapter's restrictions, before its ACP
+    /// process starts. The refusal is kept on the conversation and reported by `send`.
+    fn validate_options(&self, _options: &BackendOptions) -> Result<(), ToolError> {
+        Ok(())
+    }
+    /// The model shown in Settings: an explicit choice or the CLI's own default. `None` means
+    /// the agent picks its model and doesn't offer a model selector here.
+    fn model_in_use(&self, _options: Option<&BackendOptions>) -> Option<String> {
+        None
+    }
+    /// Models the person can choose, from a catalogue or a bounded agent query. May block:
+    /// call off the UI thread. Empty means this agent offers no choices.
+    fn model_choices(&self, _config: &BackendConfig, _options: &BackendOptions) -> Result<Vec<String>, ToolError> {
+        Ok(Vec::new())
+    }
+    /// Whether this adapter offers context and reasoning controls beyond the model selector.
+    fn supports_model_tuning(&self) -> bool {
+        false
+    }
     /// `(help invocation, substrings it must mention)`, checked once before the first run; when
     /// they're missing the run falls back to the plain adapter. Empty: nothing to check.
     fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
@@ -59,10 +126,20 @@ pub trait AgentAdapter: Send + Sync {
     fn resumes(&self) -> bool {
         false
     }
-    /// It honours [`ArgsCx::question`]: it can be held to reading only, and a resumed session
-    /// isn't changed. Questions about a build go only to adapters that say so.
+    /// It honours [`ArgsCx::question`]: it can be held to reading only, using a fresh session
+    /// or leaving a resumed session unchanged. Questions go only to adapters that say so.
     fn answers_questions(&self) -> bool {
         false
+    }
+    /// The message goes in on stdin, not in argv: a long one passes Windows' command-line limit
+    /// ("The filename or extension is too long", os error 206, #402).
+    fn prompt_on_stdin(&self) -> bool {
+        false
+    }
+    /// What goes in on stdin when [`prompt_on_stdin`](AgentAdapter::prompt_on_stdin) says so:
+    /// the message, with the preamble in front for an agent that takes no separate one.
+    fn stdin_text(&self, _preamble: &str, prompt: &str) -> String {
+        prompt.to_string()
     }
     /// The process for a local run of `program` (an adapter may clean its environment).
     fn process(&self, program: &str) -> Process {
@@ -70,10 +147,15 @@ pub trait AgentAdapter: Send + Sync {
     }
     /// Whether it's signed in, checked before a build starts. `None`: can't tell (the run itself
     /// reports any sign-in problem).
+    /// Whether it still names an account it was signed in to, so a sign-in that doesn't work any
+    /// more has expired (or was signed out) rather than never happened.
+    fn signed_in_before(&self) -> bool {
+        false
+    }
     fn signed_in(&self, _program: &str) -> Option<bool> {
         None
     }
-    /// The plain-words fix when [`signed_in`](AgentAdapter::signed_in) says no.
+    /// The plain-words fix when sign-in preflight or ACP startup fails. Login stays in the CLI.
     fn sign_in_fix(&self) -> Option<String> {
         None
     }
@@ -82,6 +164,34 @@ pub trait AgentAdapter: Send + Sync {
     /// `stop` ends the check when the person stops the build.
     fn check_tool_server(&self, _stop: &CancelToken) -> Result<(), ToolError> {
         Ok(())
+    }
+    /// The file in which this computer keeps the agent's saved session `id`, so the project can
+    /// keep a copy that travels with it. `None`: it keeps none we can copy, or not here.
+    fn session_file(&self, _id: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+    /// What a new session needs to know of an earlier one, read from a kept copy of its
+    /// [`session_file`](AgentAdapter::session_file): what it was asked and what it said, the
+    /// newest kept, within `max` characters. `None`: nothing to tell.
+    fn handoff(&self, _saved: &str, _max: usize) -> Option<String> {
+        None
+    }
+    /// Put a kept copy of session `id` back where the agent looks for it, for a run in `cwd`,
+    /// when this computer doesn't have it, so the same session carries on. `Ok(true)`: put
+    /// back; `Ok(false)`: nothing to do (it's here already, or this agent keeps none).
+    fn restore_session(&self, _id: &str, _saved: &[u8], _cwd: &std::path::Path) -> Result<bool, ToolError> {
+        Ok(false)
+    }
+    /// The environment variable that moves the agent's own folder (its sign-in, settings and
+    /// sessions), for [`BackendOptions::config_dir`]. `None`: it has none, and the setting is
+    /// ignored.
+    fn folder_var(&self) -> Option<&'static str> {
+        None
+    }
+    /// This adapter for the agent kept in `folder` on this computer: it runs there, checks the
+    /// sign-in there and keeps its sessions there. `None` when it has no such folder.
+    fn in_folder(&self, _folder: std::path::PathBuf) -> Option<Arc<dyn AgentAdapter>> {
+        None
     }
 }
 
@@ -104,10 +214,19 @@ impl Default for AgentAdapters {
 }
 
 impl AgentAdapters {
-    /// Claude Code, Codex, Gemini CLI, OpenCode, Antigravity and Hermes.
+    /// The built-in coding agents, including Copilot's ACP-only adapter.
     pub fn built_in() -> AgentAdapters {
         AgentAdapters {
-            adapters: vec![Arc::new(ClaudeCode), Arc::new(Codex), Arc::new(GeminiCli), Arc::new(OpenCode), Arc::new(Antigravity), Arc::new(Hermes)],
+            adapters: vec![
+                Arc::new(ClaudeCode::default()),
+                Arc::new(Codex),
+                Arc::new(GeminiCli),
+                Arc::new(OpenCode),
+                Arc::new(Antigravity),
+                Arc::new(Hermes),
+                Arc::new(Maki),
+                Arc::new(Copilot),
+            ],
         }
     }
 
@@ -120,6 +239,13 @@ impl AgentAdapters {
     /// The adapter for an agent id; one it doesn't know gets the plain adapter.
     pub fn for_agent(&self, agent: &str) -> Arc<dyn AgentAdapter> {
         self.adapters.iter().find(|a| a.ids().contains(&agent)).cloned().unwrap_or_else(|| Arc::new(Plain))
+    }
+
+    /// The adapter for an agent with a backend's options: in the folder they choose for it, when
+    /// it keeps one ([`AgentAdapter::in_folder`]).
+    pub fn for_backend(&self, agent: &str, options: &BackendOptions) -> Arc<dyn AgentAdapter> {
+        let adapter = self.for_agent(agent);
+        options.config_dir_here().and_then(|dir| adapter.in_folder(dir)).unwrap_or(adapter)
     }
 }
 
@@ -153,13 +279,16 @@ pub fn notes_hook_settings(cli: &str, dir: &std::path::Path) -> String {
 const CHANGING_TOOLS: &[&str] =
     &["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "PowerShell", "WebFetch", "WebSearch", "Task", "TodoWrite", "AskUserQuestion"];
 
+/// Claude Code's tools that read files, refused outright in Clean room (#564): its defaults let it
+/// read in its own folder and refuse elsewhere only until a release or a setting changes that.
+const READING_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS", "NotebookRead"];
+
 /// Claude Code answering a question about a build: the builder's session copied
 /// (`--fork-session`) and the copy not kept, no tool server, and only Read, Glob and Grep (none in
 /// Clean room).
 fn question_args(mut a: Vec<String>, cx: &ArgsCx) -> Vec<String> {
     a.extend([
         "-p".into(),
-        cx.prompt.to_string(),
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),
@@ -173,14 +302,39 @@ fn question_args(mut a: Vec<String>, cx: &ArgsCx) -> Vec<String> {
     }
     a.extend(["--no-session-persistence".into(), "--strict-mcp-config".into(), "--disallowedTools".into()]);
     a.extend(CHANGING_TOOLS.iter().map(|t| t.to_string()));
-    if !cx.reads_checked {
+    if cx.reads_checked {
+        a.extend(READING_TOOLS.iter().map(|t| t.to_string()));
+    } else {
         a.extend(["--allowedTools", "Read", "Glob", "Grep"].map(String::from));
     }
     a
 }
 
+/// How Claude Code's result names a `--resume` session it doesn't have (2.1: `errors`, with no
+/// turn taken). Its sessions are kept per computer and per folder, so a project copied elsewhere
+/// has an id it can't find.
+const NO_SUCH_SESSION: &str = "No conversation found with session ID";
+
+/// A failed result that only says the session to resume isn't there.
+fn no_such_session(v: &Value) -> bool {
+    let named = |e: &Value| e.as_str().is_some_and(|e| e.contains(NO_SUCH_SESSION));
+    let turns = v.get("num_turns").and_then(Value::as_u64).unwrap_or(0);
+    turns == 0 && (v.get("errors").and_then(Value::as_array).is_some_and(|a| a.iter().any(named)) || v.get("result").is_some_and(named))
+}
+
 /// Claude Code in headless mode (flags checked against `claude --help`).
-pub struct ClaudeCode;
+#[derive(Default)]
+pub struct ClaudeCode {
+    /// The folder chosen for it ([`BackendOptions::config_dir`]); `None`: its usual one.
+    folder: Option<std::path::PathBuf>,
+}
+
+impl ClaudeCode {
+    /// The folder it keeps its sign-in and sessions in: the chosen one, else its usual one.
+    fn config_dir(&self) -> Option<std::path::PathBuf> {
+        self.folder.clone().or_else(claude_config_dir)
+    }
+}
 
 impl AgentAdapter for ClaudeCode {
     fn ids(&self) -> &'static [&'static str] {
@@ -191,8 +345,20 @@ impl AgentAdapter for ClaudeCode {
         true
     }
 
+    fn prompt_on_stdin(&self) -> bool {
+        true
+    }
+
     fn check_tool_server(&self, stop: &CancelToken) -> Result<(), ToolError> {
         cli_can_start(craft_anything_platform::self_cli_path().as_deref(), stop)
+    }
+
+    fn model_in_use(&self, options: Option<&BackendOptions>) -> Option<String> {
+        Some(options.and_then(|options| options.cli_model.clone()).unwrap_or_else(|| crate::anthropic::DEFAULT_MODEL.into()))
+    }
+
+    fn model_choices(&self, _config: &BackendConfig, _options: &BackendOptions) -> Result<Vec<String>, ToolError> {
+        Ok(crate::anthropic::MODELS.iter().map(|model| model.to_string()).collect())
     }
 
     fn args(&self, cx: &ArgsCx) -> Vec<String> {
@@ -201,21 +367,15 @@ impl AgentAdapter for ClaudeCode {
             return question_args(a, cx);
         }
         let mcp_json = json!({"mcpServers": {MCP_NAME: {"command": cx.mcp.command, "args": cx.mcp.args}}}).to_string();
-        a.extend([
-            "-p".into(),
-            cx.prompt.to_string(),
-            "--output-format".into(),
-            "stream-json".into(),
-            "--verbose".into(),
-            "--append-system-prompt".into(),
-            cx.preamble.to_string(),
-        ]);
+        a.extend(["-p".into(), "--output-format".into(), "stream-json".into(), "--verbose".into(), "--append-system-prompt".into(), cx.preamble.to_string()]);
         // Opus 5.5 everywhere unless config.toml names another model on purpose; the effort
         // goes in through the environment (see `run_cli`).
         a.extend(["--model".into(), cx.options.cli_model.clone().unwrap_or_else(|| crate::anthropic::DEFAULT_MODEL.into())]);
         if let Some(r) = cx.resume {
             a.extend(["--resume".into(), r.to_string()]);
         }
+        let tools = if cx.builder { "Bash,PowerShell,Read,Write,Edit,MultiEdit,Glob,Grep,TodoWrite,NotebookEdit" } else { "" };
+        a.extend(["--tools".into(), tools.into()]);
         if cx.builder {
             // Questions go through our core_person_ask tool, which the app shows as buttons.
             a.extend(["--permission-prompt-tool".into(), format!("mcp__{MCP_NAME}__{APPROVAL_TOOL}"), "--disallowedTools".into(), "AskUserQuestion".into()]);
@@ -229,10 +389,18 @@ impl AgentAdapter for ClaudeCode {
             a.push("TodoWrite".into());
         } else if cx.builder {
             a.extend(["Read", "Glob", "Grep", "TodoWrite"].map(String::from));
+        } else if cx.reads_checked {
+            // A Clean room chat works only through our tools, which keep the original out of reach.
+            // Refused outright: neither its defaults nor an allow rule added later can open them (#564).
+            a.push("--disallowedTools".into());
+            a.extend(READING_TOOLS.iter().chain(CHANGING_TOOLS).map(|t| t.to_string()));
         }
         a
     }
 
+    /// Claude Code's stream-json: text and tool calls as they come, the session id from any line,
+    /// and from the final `result` its usage and cost, a failure in plain words, or a session to
+    /// resume that isn't on this computer (`session_missing`, with its own message).
     fn parse(&self, p: &mut StreamParser, v: &Value) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
@@ -240,7 +408,39 @@ impl AgentAdapter for ClaudeCode {
             p.session_id = Some(id.to_string());
         }
         match s("type").as_str() {
+            "system" if s("subtype") == "init" => {
+                let failed = v.get("mcp_servers").and_then(Value::as_array).and_then(|servers| {
+                    servers.iter().find(|server| {
+                        server.get("name").and_then(Value::as_str) == Some(MCP_NAME)
+                            && matches!(server.get("status").and_then(Value::as_str), Some("failed" | "needs-auth"))
+                    })
+                });
+                if let Some(server) = failed {
+                    p.failure = Some(TurnFailure::new(FailureKind::ToolsUnavailable));
+                    let status = server.get("status").and_then(Value::as_str).unwrap_or_default();
+                    out.push(AgentEvent::Error {
+                        message: format!("Craft Anything's tools did not start in Claude Code (server status: {status})."),
+                        remediation: Some(
+                            "Check the Craft Anything CLI and the agent failure log, then start a new build attempt after fixing the tool connection.".into(),
+                        ),
+                        log: None,
+                    });
+                }
+            }
             "assistant" => {
+                if let Some(code) = v.get("error").and_then(Value::as_str) {
+                    let failure = TurnFailure::claude(code);
+                    p.failure = Some(failure);
+                    let why = v.pointer("/message/content").map(content_text).unwrap_or_else(|| code.to_string());
+                    let (message, hint) = claude_code_failure_in(&why, self.folder.as_deref());
+                    let remediation = hint.or_else(|| match failure.kind {
+                        FailureKind::Authentication => self.sign_in_fix(),
+                        FailureKind::Billing => Some("Check the account's credits, plan and spending limit before trying again.".into()),
+                        FailureKind::Configuration => Some("Check the chosen model and Claude Code settings before trying again.".into()),
+                        _ => None,
+                    });
+                    return vec![AgentEvent::Error { message, remediation, log: None }];
+                }
                 for b in v.pointer("/message/content").and_then(Value::as_array).cloned().unwrap_or_default() {
                     match b.get("type").and_then(Value::as_str).unwrap_or_default() {
                         "text" => out.push(AgentEvent::TextDelta { text: b.get("text").and_then(Value::as_str).unwrap_or_default().to_string() }),
@@ -274,9 +474,20 @@ impl AgentAdapter for ClaudeCode {
                         .saturating_add(u.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0));
                     p.output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
                 }
-                if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) && no_such_session(v) {
+                    p.session_missing = true;
+                    out.push(AgentEvent::Error {
+                        message: "Claude Code's earlier conversation about this project isn't on this computer.".into(),
+                        remediation: Some(
+                            "It was started on another computer or in another folder. Ask again: a new conversation starts from what the project already has."
+                                .into(),
+                        ),
+                        log: None,
+                    });
+                } else if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                    p.failure.get_or_insert(TurnFailure::new(FailureKind::Unknown));
                     let why = if s("result").is_empty() { s("subtype") } else { s("result") };
-                    let (message, remediation) = claude_code_failure(&why);
+                    let (message, remediation) = claude_code_failure_in(&why, self.folder.as_deref());
                     out.push(AgentEvent::Error { message, remediation, log: None });
                 }
             }
@@ -289,20 +500,205 @@ impl AgentAdapter for ClaudeCode {
         true
     }
 
-    /// The person's own standalone Claude Code (see [`host_session_vars`]).
+    /// The person's own standalone Claude Code (see [`host_session_vars`]), in its chosen folder.
+    /// Under a Flatpak without one, it gets a folder it can write its conversations to (#506).
     fn process(&self, program: &str) -> Process {
-        standalone(program)
+        let proc = standalone(program);
+        if let Some(dir) = &self.folder {
+            return proc.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        match flatpak_claude_dir() {
+            Some(dir) => {
+                let _ = std::fs::create_dir_all(&dir);
+                proc.env("CLAUDE_CONFIG_DIR", dir)
+            }
+            None => proc,
+        }
     }
 
     fn signed_in(&self, program: &str) -> Option<bool> {
-        let out = standalone(program).args(["auth", "status", "--json"]).timeout(Duration::from_secs(15)).stdout_cap(64 * 1024).run().ok()?;
+        let out = self.process(program).args(["auth", "status", "--json"]).timeout(Duration::from_secs(15)).stdout_cap(64 * 1024).run().ok()?;
         let v: Value = serde_json::from_str(out.stdout_text().trim()).ok()?;
         v.get("loggedIn").and_then(Value::as_bool)
     }
 
-    fn sign_in_fix(&self) -> Option<String> {
-        sign_in_hint("login")
+    /// The account its `.claude.json` names (`oauthAccount`), kept there while the sign-in itself
+    /// is in the system's keychain. In a chosen folder the file is inside it; with its usual
+    /// `~/.claude`, it's beside it in the home folder.
+    fn signed_in_before(&self) -> bool {
+        let set = self.folder.clone().or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()).map(std::path::PathBuf::from));
+        let file = match set.or_else(flatpak_claude_dir) {
+            Some(dir) => dir.join(".claude.json"),
+            None => match dirs::home_dir() {
+                Some(home) => home.join(".claude.json"),
+                None => return false,
+            },
+        };
+        claude_names_account(&file)
     }
+
+    fn sign_in_fix(&self) -> Option<String> {
+        sign_in_hint_in("login", in_flatpak(), self.folder.as_deref())
+    }
+
+    /// The session under Claude Code's own folder (see [`claude_session_file`]).
+    fn session_file(&self, id: &str) -> Option<std::path::PathBuf> {
+        claude_session_file(&self.config_dir()?, id)
+    }
+
+    /// The kept session's requests and replies (see [`claude_handoff`]).
+    fn handoff(&self, saved: &str, max: usize) -> Option<String> {
+        claude_handoff(saved, max)
+    }
+
+    /// Back under Claude Code's own folder (see [`claude_restore`]); without one there's nowhere
+    /// to put it, which is said.
+    fn restore_session(&self, id: &str, saved: &[u8], cwd: &std::path::Path) -> Result<bool, ToolError> {
+        let config = self.config_dir().ok_or_else(|| ToolError::new(ErrorCode::BadSettings, "Couldn't find Claude Code's folder on this computer."))?;
+        claude_restore(&config, id, saved, cwd)
+    }
+
+    fn folder_var(&self) -> Option<&'static str> {
+        Some("CLAUDE_CONFIG_DIR")
+    }
+
+    fn in_folder(&self, folder: std::path::PathBuf) -> Option<Arc<dyn AgentAdapter>> {
+        Some(Arc::new(ClaudeCode { folder: Some(folder) }))
+    }
+}
+
+/// Claude Code's own folder: `CLAUDE_CONFIG_DIR` when it's set (the person's choice, which the
+/// agent we start keeps too), else our own under a Flatpak (see [`flatpak_claude_dir`]), else
+/// `~/.claude`.
+fn claude_config_dir() -> Option<std::path::PathBuf> {
+    let set = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    set.or_else(flatpak_claude_dir).or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
+}
+
+/// Whether this app runs in a Flatpak sandbox (it sets `FLATPAK_ID` and makes `/.flatpak-info`).
+pub fn in_flatpak() -> bool {
+    static IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IN.get_or_init(|| std::env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").exists())
+}
+
+/// Where Claude Code keeps its conversations when we start it under a Flatpak and the person
+/// hasn't chosen a folder: its own is `~/.claude`, which the sandbox only lets us read, so a
+/// conversation was never saved and `--resume` found nothing (#506). A folder of ours in the
+/// app's data folder is writable, and kept with the app. `None` outside a Flatpak, or when
+/// `CLAUDE_CONFIG_DIR` is set.
+pub fn flatpak_claude_dir() -> Option<std::path::PathBuf> {
+    let chosen = std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|v| !v.is_empty());
+    flatpak_claude_dir_in(in_flatpak(), chosen, dirs::data_dir())
+}
+
+pub fn flatpak_claude_dir_in(flatpak: bool, chosen: bool, data: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    (flatpak && !chosen).then_some(data?.join("craft-anything").join("claude"))
+}
+
+/// Claude Code's name for the folder a session ran in: the path with everything but letters and
+/// digits made `-`. It finds a session by its id in any of these folders (2.1), so a long path
+/// cut short still works.
+fn claude_project_folder(cwd: &std::path::Path) -> String {
+    cwd.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).take(200).collect()
+}
+
+/// Put a kept Claude Code session back under `config` (see [`AgentAdapter::restore_session`]).
+/// Only a copy of that same session is put back, and never over one that's there.
+pub fn claude_restore(config: &std::path::Path, id: &str, saved: &[u8], cwd: &std::path::Path) -> Result<bool, ToolError> {
+    let valid = !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !valid {
+        return Err(ToolError::invalid("The project names its builder's session with an id Claude Code doesn't use."));
+    }
+    if claude_session_file(config, id).is_some() {
+        return Ok(false);
+    }
+    let named = format!("\"sessionId\":\"{id}\"");
+    if !saved.windows(named.len()).any(|w| w == named.as_bytes()) {
+        return Err(ToolError::invalid("The conversation kept in the project is of another session."));
+    }
+    let path = config.join("projects").join(claude_project_folder(cwd)).join(format!("{id}.jsonl"));
+    craft_anything_platform::fs::write_atomic_private(&path, saved)?;
+    Ok(true)
+}
+
+/// Folders under Claude Code's `projects/` looked through for a session.
+const SESSION_FOLDERS: usize = 10_000;
+
+/// Claude Code keeps each session as `projects/<the folder it ran in>/<id>.jsonl` under its
+/// config folder. An id is a UUID: anything else (a hand-edited manifest) names no file.
+pub fn claude_session_file(config: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
+    if id.is_empty() || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let name = format!("{id}.jsonl");
+    std::fs::read_dir(config.join("projects")).ok()?.flatten().take(SESSION_FOLDERS).map(|e| e.path().join(&name)).find(|p| p.is_file())
+}
+
+/// Whether Claude Code's `.claude.json` names the account it was signed in to (`oauthAccount`).
+/// It also keeps every project's history, so up to 32 MB is read; a bigger or unreadable file
+/// names none.
+pub fn claude_names_account(file: &std::path::Path) -> bool {
+    use std::io::Read;
+    const CAP: u64 = 32 << 20;
+    let mut text = Vec::new();
+    let read = std::fs::File::open(file).and_then(|f| f.take(CAP + 1).read_to_end(&mut text));
+    if read.is_err() || text.len() as u64 > CAP {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&text).ok().is_some_and(|v| v.get("oauthAccount").is_some_and(Value::is_object))
+}
+
+/// Longest single request or reply in a handoff; a first brief runs to many thousands.
+const HANDOFF_ENTRY: usize = 1500;
+
+/// A Claude Code session read back as a handoff: the messages Craft Anything sent and the text
+/// the builder answered with, oldest first, leaving out tool calls, their results, thinking and
+/// side tasks. The newest are kept when it's longer than `max` characters.
+pub fn claude_handoff(saved: &str, max: usize) -> Option<String> {
+    let clip = |t: &str| {
+        let t = t.trim();
+        if t.chars().count() > HANDOFF_ENTRY { format!("{}…", t.chars().take(HANDOFF_ENTRY).collect::<String>()) } else { t.to_string() }
+    };
+    let mut entries = Vec::new();
+    for v in saved.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let content = v.pointer("/message/content");
+        match v.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                if let Some(t) = content.and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
+                    entries.push(format!("Craft Anything asked you: {}", clip(t)));
+                }
+            }
+            Some("assistant") => {
+                let text: String = content
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.trim().is_empty() && text.trim() != "No response requested." {
+                    entries.push(format!("You answered: {}", clip(&text)));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for e in entries.iter().rev() {
+        let n = e.chars().count().saturating_add(2);
+        if used.saturating_add(n) > max {
+            break;
+        }
+        used = used.saturating_add(n);
+        kept.push(e.as_str());
+    }
+    kept.reverse();
+    (!kept.is_empty()).then(|| kept.join("\n\n"))
 }
 
 /// Codex (`codex exec --json`). Flags are checked against `codex exec --help` before use.
@@ -311,6 +707,16 @@ pub struct Codex;
 impl AgentAdapter for Codex {
     fn ids(&self) -> &'static [&'static str] {
         &["codex"]
+    }
+
+    /// `codex exec -` reads the message from stdin, so a long one can't pass Windows'
+    /// command-line limit (os error 206, #528).
+    fn prompt_on_stdin(&self) -> bool {
+        true
+    }
+
+    fn stdin_text(&self, preamble: &str, prompt: &str) -> String {
+        format!("{preamble}{prompt}")
     }
 
     fn check_tool_server(&self, stop: &CancelToken) -> Result<(), ToolError> {
@@ -329,13 +735,26 @@ impl AgentAdapter for Codex {
             v.extend(["--sandbox".into(), "workspace-write".into()]);
         }
         v.extend(["-c".into(), format!("mcp_servers.{MCP_NAME}.command={}", toml_string(&cx.mcp.command))]);
-        let args_toml = format!("[{}]", cx.mcp.args.iter().map(|s| toml_string(s)).collect::<Vec<_>>().join(", "));
+        // Codex doesn't refresh its callable tools after enable_toolset (#538), so list every
+        // permitted tool from startup. The server still applies Clean room's restrictions.
+        let mut mcp_args = cx.mcp.args.clone();
+        if !mcp_args.iter().any(|a| a == "--all-tools") {
+            mcp_args.push("--all-tools".into());
+        }
+        let args_toml = format!("[{}]", mcp_args.iter().map(|s| toml_string(s)).collect::<Vec<_>>().join(", "));
         v.extend(["-c".into(), format!("mcp_servers.{MCP_NAME}.args={args_toml}")]);
+        // `codex exec` can't ask, so without this it refuses a tool not marked read-only, such as
+        // rebuild_start, before our server sees the call (#540). Only tools that ask the person
+        // themselves are approved; every other tool keeps the person's own Codex policy.
+        for tool in craft_anything_engine::AGENT_APP_PREAPPROVED_TOOLS {
+            v.extend(["-c".into(), format!("mcp_servers.{MCP_NAME}.tools.{tool}.approval_mode=\"approve\"")]);
+        }
         if let Some(m) = &cx.options.cli_model {
             v.extend(["-m".into(), m.clone()]);
         }
         v.extend(cx.options.args.iter().cloned());
-        v.push(format!("{}{}", cx.preamble, cx.prompt));
+        // The message itself goes in on stdin (see `stdin_text`).
+        v.push("-".into());
         v
     }
 
@@ -372,7 +791,9 @@ impl AgentAdapter for Codex {
                     out.push(p.started(&id, &name, item.get("arguments").cloned().unwrap_or(Value::Null)));
                 }
                 let failed = item.get("status").and_then(Value::as_str) == Some("failed") || item.get("error").is_some_and(|e| !e.is_null());
-                let text = item.get("result").or_else(|| item.get("error")).map(|r| r.to_string()).unwrap_or_default();
+                let tool = item.get("tool").and_then(Value::as_str).unwrap_or_default();
+                let ours = item.get("server").and_then(Value::as_str) == Some(MCP_NAME);
+                let text = codex_tool_text(&item, tool, ours);
                 out.push(p.finished(&id, !failed, &text));
             }
             ("item.started", "command_execution") => {
@@ -395,6 +816,30 @@ impl AgentAdapter for Codex {
     }
 }
 
+/// What a finished Codex tool call says. A failed call carries `"result": null` beside its
+/// `error`, which showed as "null" (#540), so null fields are skipped and an error's message is
+/// used as written. Codex's refusal to run one of our tools it can't ask about gets the way out.
+fn codex_tool_text(item: &Value, tool: &str, ours: bool) -> String {
+    let field = |k: &str| item.get(k).filter(|v| !v.is_null());
+    let error = field("error").map(|e| e.get("message").and_then(Value::as_str).map_or_else(|| e.to_string(), str::to_string));
+    let text = match (field("result"), error) {
+        (_, Some(e)) => e,
+        (Some(r), None) => r.to_string(),
+        (None, None) => String::new(),
+    };
+    // Another MCP server's refusal isn't fixed by our setup: it keeps Codex's own words.
+    if ours && text.contains(CODEX_NEEDS_APPROVAL) {
+        // The feed keeps 200 characters of a result, so the fix comes first and fits.
+        return format!(
+            "Codex blocked {tool}: it can't ask for approval here. Fix: run `craft-anything-cli setup --client codex --yes`, then retry. See docs/codex.md."
+        );
+    }
+    text
+}
+
+/// Codex's wording when a tool needs approval and its policy is `never` (#540).
+const CODEX_NEEDS_APPROVAL: &str = "requires approval, but approval policy is never";
+
 /// Gemini CLI (`--output-format stream-json`). Flags are checked against `gemini --help`.
 pub struct GeminiCli;
 
@@ -403,12 +848,23 @@ impl AgentAdapter for GeminiCli {
         &["gemini-cli", "gemini"]
     }
 
+    /// Gemini CLI reads its message from stdin and appends `-p` to it, so a long one can't pass
+    /// Windows' command-line limit, which is 8,191 characters through npm's `gemini.cmd`.
+    fn prompt_on_stdin(&self) -> bool {
+        true
+    }
+
+    fn stdin_text(&self, preamble: &str, prompt: &str) -> String {
+        format!("{preamble}{prompt}")
+    }
+
     fn args(&self, cx: &ArgsCx) -> Vec<String> {
         let mut a = cx.options.args.clone();
         if let Some(m) = &cx.options.cli_model {
             a.extend(["-m".into(), m.clone()]);
         }
-        a.extend(["--output-format".into(), "stream-json".into(), "-p".into(), format!("{}{}", cx.preamble, cx.prompt)]);
+        // An empty `-p` keeps it headless and adds nothing to the message on stdin (see `stdin_text`).
+        a.extend(["--output-format".into(), "stream-json".into(), "-p".into(), String::new()]);
         a
     }
 

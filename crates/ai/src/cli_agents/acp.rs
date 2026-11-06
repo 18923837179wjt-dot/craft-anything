@@ -8,9 +8,10 @@
 //! process; [`AcpConversation`] runs it against the agent through `craft_anything_platform`.
 
 use super::{McpCommand, display_for};
-use crate::{AgentEvent, Conversation};
+use crate::model::Stop;
+use crate::{AgentEvent, Conversation, FailureKind, TurnFailure};
 use craft_anything_platform::sync::Mutex;
-use craft_anything_platform::{Process, RunningProcess, StdinMode};
+use craft_anything_platform::{RunningProcess, StdinMode};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -19,11 +20,32 @@ use std::process::ChildStdin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Agents known to speak ACP, and the arguments that start them in that mode.
-pub const ACP_AGENTS: &[(&str, &[&str])] =
-    &[("gemini-cli", &["--experimental-acp"]), ("qwen-code", &["--experimental-acp"]), ("opencode", &["acp"]), ("goose", &["acp"]), ("hermes", &["acp"])];
+pub const ACP_AGENTS: &[(&str, &[&str])] = &[
+    ("gemini-cli", &["--experimental-acp"]),
+    ("qwen-code", &["--experimental-acp"]),
+    ("opencode", &["acp"]),
+    ("goose", &["acp"]),
+    ("hermes", &["acp"]),
+    ("maki", &["acp"]),
+    ("copilot", &["--acp", "--stdio"]),
+];
+
+/// Agents whose ACP mode takes the backend's model (`cli_model`), and the flag after the ACP
+/// arguments that picks it. Others keep the model they're set to.
+pub const ACP_MODEL_FLAGS: &[(&str, &str)] = &[("maki", "-m")];
+
+/// The arguments after `agent`'s ACP ones that pick `model`; none when its ACP mode isn't known
+/// to take one.
+pub fn model_args(agent: &str, model: Option<&str>) -> Vec<String> {
+    let flag = ACP_MODEL_FLAGS.iter().find(|(id, _)| *id == agent).map(|(_, f)| *f);
+    match (flag, model.map(str::trim).filter(|m| !m.is_empty())) {
+        (Some(flag), Some(model)) => vec![flag.to_string(), model.to_string()],
+        _ => Vec::new(),
+    }
+}
 
 /// The ACP version we speak.
 const PROTOCOL_VERSION: u64 = 1;
@@ -54,6 +76,21 @@ pub enum Out {
 /// while the person is asked. True allows it.
 pub type Approver = Arc<dyn Fn(&str, &Value) -> bool + Send + Sync>;
 
+/// The approver for a chat in Clean room (#564): the agent's own reading, writing, commands and
+/// fetching are refused (they'd reach the original), and what's left (planning, our tools, which
+/// our tool server limits itself) is allowed. There is no project to check paths against in a chat,
+/// so nothing of the agent's own is let through.
+pub fn clean_room_chat_approver() -> Approver {
+    Arc::new(|tool, _input| !matches!(tool, "Read" | "Write" | "Bash" | "WebFetch"))
+}
+
+/// Session metadata only: no prompt is sent to discover a model's selectable settings.
+pub struct ModelMetadata {
+    pub models: Vec<String>,
+    pub current_model: String,
+    pub config_options: Vec<Value>,
+}
+
 /// An ACP tool call in the approval policy's shape.
 fn policy_action(call: &Value) -> (String, Value) {
     let s = |p: &str| call.pointer(p).and_then(Value::as_str).map(str::to_string);
@@ -82,6 +119,11 @@ enum Pending {
     Prompt,
 }
 
+struct QueuedPrompt {
+    text: String,
+    continuation: Option<String>,
+}
+
 /// The ACP protocol for one conversation.
 pub struct AcpCore {
     backend: String,
@@ -93,13 +135,24 @@ pub struct AcpCore {
     pending: HashMap<u64, Pending>,
     session: Option<String>,
     ready: bool,
-    queued: VecDeque<String>,
+    queued: VecDeque<QueuedPrompt>,
+    /// Only a loaded session or one already sent a prompt can continue an interrupted turn.
+    session_has_history: bool,
     /// Permission requests waiting for an answer: our call id → (JSON-RPC id, options).
     asks: HashMap<String, (Value, Vec<Value>)>,
     /// Tool call titles by id, for the finished event.
     tools: HashMap<String, String>,
     /// Permission requests go to an approver ([`Out::Decide`]) instead of the person's chat.
     decides: bool,
+    failure: Option<TurnFailure>,
+    /// A read-only question: no MCP server and no permission escalation into a build.
+    question: bool,
+    /// The adapter's startup remediation. Sign-in itself stays outside the ACP connection.
+    sign_in_fix: Option<String>,
+    /// Model ids advertised by the opened or loaded session, not a local guess at its catalogue.
+    models: Vec<String>,
+    current_model: String,
+    config_options: Vec<Value>,
 }
 
 impl AcpCore {
@@ -115,9 +168,16 @@ impl AcpCore {
             session: None,
             ready: false,
             queued: VecDeque::new(),
+            session_has_history: false,
             asks: HashMap::new(),
             tools: HashMap::new(),
             decides: false,
+            failure: None,
+            question: false,
+            sign_in_fix: None,
+            models: Vec::new(),
+            current_model: String::new(),
+            config_options: Vec::new(),
         }
     }
 
@@ -151,7 +211,12 @@ impl AcpCore {
 
     /// A message from the person: sent now, or once the session is ready.
     pub fn prompt(&mut self, text: &str) -> Vec<Out> {
-        self.queued.push_back(text.to_string());
+        self.queue_prompt(text, None)
+    }
+
+    fn queue_prompt(&mut self, text: &str, continuation: Option<String>) -> Vec<Out> {
+        self.failure = None;
+        self.queued.push_back(QueuedPrompt { text: text.to_string(), continuation });
         // A start that failed earlier (an `initialize` error) left nothing under way: start again,
         // or the message would wait for a session that never comes (#271).
         if !self.ready && self.pending.is_empty() {
@@ -163,13 +228,15 @@ impl AcpCore {
     fn flush(&mut self) -> Vec<Out> {
         let busy = self.pending.values().any(|p| *p == Pending::Prompt);
         let Some(sid) = self.session.clone().filter(|_| self.ready && !busy) else { return Vec::new() };
-        let Some(text) = self.queued.pop_front() else { return Vec::new() };
+        let Some(prompt) = self.queued.pop_front() else { return Vec::new() };
+        let text = if self.session_has_history { prompt.continuation.unwrap_or(prompt.text) } else { prompt.text };
+        self.session_has_history = true;
         let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": text}]});
         vec![self.request("session/prompt", params, Pending::Prompt)]
     }
 
     fn mcp_servers(&self) -> Value {
-        json!([{"name": super::MCP_NAME, "command": self.mcp.command, "args": self.mcp.args, "env": []}])
+        if self.question { json!([]) } else { json!([{"name": super::MCP_NAME, "command": self.mcp.command, "args": self.mcp.args, "env": []}]) }
     }
 
     /// One line from the agent.
@@ -178,6 +245,8 @@ impl AcpCore {
         let method = msg.get("method").and_then(Value::as_str);
         match (method, msg.get("id")) {
             (Some(m), Some(id)) => self.agent_request(m, id.clone(), msg.get("params").unwrap_or(&Value::Null)),
+            // session/load replays history before its response, not activity in the new turn.
+            (Some("session/update"), None) if self.pending.values().any(|p| *p == Pending::LoadSession) => Vec::new(),
             (Some("session/update"), None) => self.update(msg.get("params").and_then(|p| p.get("update")).unwrap_or(&Value::Null)),
             (Some(_), None) => Vec::new(),
             (None, Some(id)) => self.response(id.as_u64().unwrap_or(0), &msg),
@@ -191,6 +260,8 @@ impl AcpCore {
     }
 
     fn turn_done(&self) -> Out {
+        // This client has no attributable ACP usage totals. Leave the cost unknown instead of
+        // treating another provider's prices, or a session-wide total, as this turn's bill.
         Out::Event(AgentEvent::TurnDone { backend: self.backend.clone(), input_tokens: 0, output_tokens: 0, cost_usd: None, cost_is_estimate: false })
     }
 
@@ -201,11 +272,18 @@ impl AcpCore {
             // A session that can't be continued starts afresh rather than failing the message.
             if kind == Pending::LoadSession {
                 self.resume = None;
+                self.session = None;
                 let params = json!({"cwd": self.cwd, "mcpServers": self.mcp_servers()});
                 return vec![self.request("session/new", params, Pending::NewSession)];
             }
-            let fix = matches!(kind, Pending::Initialize | Pending::NewSession)
-                .then(|| format!("Check that {} is installed and signed in: run it once in a terminal.", self.agent_name));
+            self.failure = Some(TurnFailure::new(match err.get("code").and_then(Value::as_i64) {
+                Some(-32000) => FailureKind::Authentication,
+                Some(-32602..=-32600) => FailureKind::Configuration,
+                _ => FailureKind::Unknown,
+            }));
+            let fix = matches!(kind, Pending::Initialize | Pending::NewSession).then(|| {
+                self.sign_in_fix.clone().unwrap_or_else(|| format!("Check that {} is installed and signed in: run it once in a terminal.", self.agent_name))
+            });
             return self.fail(format!("{}: {text}", self.agent_name), fix);
         }
         let result = msg.get("result").unwrap_or(&Value::Null);
@@ -225,6 +303,18 @@ impl AcpCore {
                 }
             }
             Pending::NewSession | Pending::LoadSession => {
+                self.current_model = result.pointer("/models/currentModelId").and_then(Value::as_str).unwrap_or_default().to_string();
+                self.config_options = result.get("configOptions").and_then(Value::as_array).cloned().unwrap_or_default();
+                // The running agent decides what's available to this account. Entries without
+                // an id can't be selected, so skip them rather than inventing one from a label.
+                self.models = result
+                    .pointer("/models/availableModels")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|model| model.get("modelId").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect();
                 if let Some(sid) = result.get("sessionId").and_then(Value::as_str) {
                     self.session = Some(sid.to_string());
                 }
@@ -232,6 +322,7 @@ impl AcpCore {
                     return self.fail(format!("{} started no session", self.agent_name), None);
                 }
                 self.ready = true;
+                self.session_has_history = kind == Pending::LoadSession;
                 self.flush()
             }
             Pending::Prompt => {
@@ -256,6 +347,11 @@ impl AcpCore {
             // We offer no file system or terminal to the agent; it does its own.
             let err = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("{method} isn't offered by this client")}});
             return vec![Out::Send(err.to_string())];
+        }
+        if self.question {
+            // Startup already limits the tools; a question cannot ask for broader access or
+            // turn an unexpected permission request into an approval card for the person.
+            return vec![Out::Send(json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": {"outcome": "cancelled"}}}).to_string())];
         }
         let call = params.get("toolCall").unwrap_or(&Value::Null);
         let s = |k: &str| call.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
@@ -412,6 +508,8 @@ impl Shared {
 pub struct AcpConversation {
     program: String,
     args: Vec<String>,
+    /// Process setup and startup guidance from the same registered adapter that chose the flags.
+    adapter: Arc<dyn super::AgentAdapter>,
     agent: String,
     backend: String,
     cwd: PathBuf,
@@ -425,9 +523,85 @@ pub struct AcpConversation {
     approver: Option<Approver>,
     preamble: String,
     logs: Option<PathBuf>,
+    failure: Option<TurnFailure>,
+    /// Suppress MCP attachment and refuse permission requests; startup flags restrict native tools.
+    question: bool,
+    /// Report invalid backend settings through the conversation before starting a child process.
+    validation_error: Option<craft_anything_evidence::ToolError>,
 }
 
 impl AcpConversation {
+    /// Open a session and read its model catalogue without sending a prompt. Waits for metadata
+    /// until `timeout`, carrying startup errors back to the caller; dropping this temporary
+    /// conversation stops its process. Blocking: call off the UI thread.
+    pub fn model_choices(self, timeout: Duration) -> Result<Vec<String>, craft_anything_evidence::ToolError> {
+        self.model_metadata(timeout).map(|metadata| metadata.models)
+    }
+
+    /// Read a fresh session's selected model and configuration choices without a model turn.
+    /// Blocking and bounded, with the same process cleanup as model catalogue discovery.
+    pub fn model_metadata(self, timeout: Duration) -> Result<ModelMetadata, craft_anything_evidence::ToolError> {
+        self.model_metadata_with_stop(timeout, &Stop::default())
+    }
+
+    pub(crate) fn model_metadata_with_stop(mut self, timeout: Duration, stop: &Stop) -> Result<ModelMetadata, craft_anything_evidence::ToolError> {
+        stop.check()?;
+        self.spawn()?;
+        self.busy.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        loop {
+            stop.check()?;
+            let ready = self.lock().as_ref().filter(|shared| shared.core.ready).map(|shared| ModelMetadata {
+                models: shared.core.models.clone(),
+                current_model: shared.core.current_model.clone(),
+                config_options: shared.core.config_options.clone(),
+            });
+            if let Some(metadata) = ready {
+                return Ok(metadata);
+            }
+            for event in self.poll() {
+                if let AgentEvent::Error { message, remediation, .. } = event {
+                    let error = craft_anything_evidence::ToolError::unavailable(message);
+                    return Err(match remediation {
+                        Some(fix) => error.with_remediation(fix),
+                        None => error,
+                    });
+                }
+            }
+            if started.elapsed() >= timeout {
+                return Err(self.model_metadata_timeout());
+            }
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+    }
+
+    fn model_metadata_timeout(&self) -> craft_anything_evidence::ToolError {
+        craft_anything_evidence::ToolError::unavailable(format!("{} did not list its models before the deadline.", display_for(&self.agent)))
+            .with_remediation(self.adapter.sign_in_fix().unwrap_or_else(|| "Check the agent in a terminal, then try again.".into()))
+    }
+
+    /// Keep an adapter's settings check until the conversation starts. A failure is reported
+    /// through the usual events without launching a process or changing the person's settings.
+    pub fn with_validation(mut self, result: Result<(), craft_anything_evidence::ToolError>) -> Self {
+        self.validation_error = result.err();
+        self
+    }
+
+    /// A read-only question: attach no MCP server and refuse permission requests. The caller
+    /// must also choose a fresh session and restrictive agent flags; this switch alone doesn't
+    /// prevent native tools from running without a permission request.
+    pub fn with_question(mut self, question: bool) -> Self {
+        self.question = question;
+        self
+    }
+
+    /// Use the selected registry adapter for process setup and startup remediation. This keeps
+    /// custom adapters and test stand-ins on the same path as the built-in agents.
+    pub fn with_adapter(mut self, adapter: Arc<dyn super::AgentAdapter>) -> Self {
+        self.adapter = adapter;
+        self
+    }
+
     /// Where to write a log if the agent stops unexpectedly ([`crate::failure_log`]).
     pub fn with_logs(mut self, logs: Option<PathBuf>) -> Self {
         self.logs = logs;
@@ -453,6 +627,7 @@ impl AcpConversation {
         AcpConversation {
             program,
             args,
+            adapter: super::adapter_for(agent),
             agent: agent.into(),
             backend: backend.into(),
             cwd,
@@ -466,6 +641,9 @@ impl AcpConversation {
             approver: None,
             preamble: String::new(),
             logs: None,
+            failure: None,
+            question: false,
+            validation_error: None,
         }
     }
 
@@ -475,9 +653,14 @@ impl AcpConversation {
 
     /// Start the agent and send `initialize`.
     fn spawn(&mut self) -> Result<(), craft_anything_evidence::ToolError> {
+        if let Some(error) = &self.validation_error {
+            return Err(error.clone());
+        }
         let name = display_for(&self.agent);
         let resume = self.lock().as_ref().and_then(|s| s.core.session_id()).or_else(|| self.resume.clone());
         let mut core = AcpCore::new(&self.backend, &name, self.cwd.clone(), self.mcp.clone(), resume);
+        core.question = self.question;
+        core.sign_in_fix = self.adapter.sign_in_fix();
         if self.approver.is_some() {
             core = core.deciding();
         }
@@ -485,7 +668,9 @@ impl AcpConversation {
         let (shared, tx, busy) = (self.shared.clone(), self.tx.clone(), self.busy.clone());
         let shared_err = self.shared.clone();
         let tx_err = tx.clone();
-        let mut proc = Process::new(&self.program)
+        let mut proc = self
+            .adapter
+            .process(&self.program)
             .args(&self.args)
             .cwd(&self.cwd)
             .stdin(StdinMode::Piped)
@@ -523,6 +708,7 @@ impl AcpConversation {
             let outs = s.core.start();
             s.apply(outs, &self.shared, &self.tx, &self.busy);
         }
+        let _ = self.tx.send(AgentEvent::Status { text: "Usage totals are unavailable over ACP. Check usage and billing in the agent CLI.".into() });
         Ok(())
     }
 
@@ -533,10 +719,7 @@ impl AcpConversation {
             s.apply(outs, &self.shared, &self.tx, &self.busy);
         }
     }
-}
-
-impl Conversation for AcpConversation {
-    fn send(&mut self, text: &str) {
+    fn send_prompt(&mut self, text: &str, retry: bool) {
         if self.busy.swap(true, Ordering::SeqCst) {
             let _ = self.tx.send(AgentEvent::Error {
                 message: "Still working on the last message.".into(),
@@ -545,11 +728,13 @@ impl Conversation for AcpConversation {
             });
             return;
         }
+        self.failure = None;
         let running = self.proc.as_mut().is_some_and(|p| !p.is_finished());
         if !running {
             let _ = self.tx.send(AgentEvent::Status { text: format!("Starting {}…", display_for(&self.agent)) });
             if let Err(e) = self.spawn() {
                 self.busy.store(false, Ordering::SeqCst);
+                self.failure = Some(TurnFailure::from_process(&e));
                 let _ = self.tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
                 let _ = self.tx.send(AgentEvent::TurnDone {
                     backend: self.backend.clone(),
@@ -562,7 +747,22 @@ impl Conversation for AcpConversation {
             }
         }
         let text = format!("{}{text}", self.preamble);
-        self.with_core(|c| c.prompt(&text));
+        let continuation = retry.then(|| format!("{}{}", self.preamble, crate::failure::CONTINUE_TURN));
+        self.with_core(|c| c.queue_prompt(&text, continuation));
+    }
+}
+
+impl Conversation for AcpConversation {
+    fn last_failure(&self) -> Option<TurnFailure> {
+        self.failure.or_else(|| self.lock().as_ref().and_then(|s| s.core.failure))
+    }
+
+    fn send(&mut self, text: &str) {
+        self.send_prompt(text, false);
+    }
+
+    fn retry(&mut self, text: &str) {
+        self.send_prompt(text, true);
     }
 
     fn session_id(&self) -> Option<String> {
@@ -574,6 +774,8 @@ impl Conversation for AcpConversation {
         // An agent that exits mid-message would otherwise leave the conversation busy forever.
         if self.busy.load(Ordering::SeqCst) && self.proc.as_mut().is_some_and(RunningProcess::is_finished) {
             self.busy.store(false, Ordering::SeqCst);
+            let ready = self.lock().as_ref().is_some_and(|s| s.core.ready);
+            self.failure = Some(TurnFailure::new(if ready { FailureKind::Transient } else { FailureKind::Unknown }));
             let tail = self.lock().as_ref().map(|s| s.stderr.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default();
             events.extend(self.rx.try_iter());
             let command = craft_anything_platform::process::printable_command(std::ffi::OsStr::new(&self.program), &self.args);
@@ -627,6 +829,56 @@ impl Drop for AcpConversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_uses_stdio_acp() {
+        assert_eq!(acp_args("copilot"), Some(["--acp", "--stdio"].as_slice()));
+        assert!(acp_args("unknown-agent").is_none());
+    }
+
+    #[test]
+    fn copilot_authentication_stays_in_its_cli() {
+        let mut core = core(None);
+        core.sign_in_fix = super::super::adapter_for("copilot").sign_in_fix();
+        core.start();
+        let output = events(core.line(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Authentication required"}}"#));
+        assert!(
+            matches!(&output[0], AgentEvent::Error { remediation: Some(fix), .. } if fix.contains("copilot login") && fix.contains("restart Craft Anything"))
+        );
+    }
+
+    #[test]
+    fn copilot_model_choices_come_from_the_session_not_a_fixed_catalogue() {
+        let mut core = core(None);
+        core.start();
+        core.line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+        core.line(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"copilot-test","models":{"availableModels":[{"modelId":"model-one","name":"One"},{"modelId":"model-two","name":"Two"},{"name":"missing-id"}]}}}"#);
+        assert_eq!(core.models, ["model-one", "model-two"]);
+        assert!(core.ready);
+    }
+
+    #[test]
+    fn model_metadata_deadlines_name_the_current_agent() {
+        for (agent, name) in [("gemini-cli", "Gemini CLI"), ("copilot", "GitHub Copilot")] {
+            let mcp = McpCommand { command: "not-started".into(), args: Vec::new(), notes: None };
+            let conversation = AcpConversation::new("Test", agent, "not-started".into(), Vec::new(), PathBuf::new(), mcp, None);
+            let error = conversation.model_metadata_timeout();
+            assert_eq!(error.message, format!("{name} did not list its models before the deadline."));
+            assert_eq!(error.remediation.unwrap().contains("copilot login"), agent == "copilot");
+        }
+    }
+
+    #[test]
+    fn a_read_only_question_opens_a_fresh_session_without_mcp_and_refuses_permissions() {
+        let mut core = core(None);
+        core.question = true;
+        core.start();
+        let new = sent(&core.line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#));
+        assert_eq!(new[0]["method"], "session/new");
+        assert_eq!(new[0]["params"]["mcpServers"], json!([]));
+        let reply = sent(&core.line(r#"{"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{"toolCall":{"kind":"edit"},"options":[{"optionId":"allow","kind":"allow_once"}]}}"#));
+        assert_eq!(reply[0]["result"]["outcome"]["outcome"], "cancelled");
+    }
 
     fn core(resume: Option<&str>) -> AcpCore {
         let mcp = McpCommand { command: "/opt/ca/craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
@@ -691,6 +943,163 @@ mod tests {
         assert_eq!(sent(&c.line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#))[0]["method"], "session/new");
     }
 
+    #[cfg(unix)]
+    fn prompt_after_interrupted_acp_turn(recovery: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("acp-agent");
+        let script = r#"#!/bin/sh
+d=$(dirname "$0")
+if [ ! -f "$d/started" ]; then
+    : > "$d/started"
+    IFS= read -r init
+    echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}'
+    IFS= read -r new
+    echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"saved"}}'
+    IFS= read -r prompt
+    printf '%s\n' "$prompt" > "$d/first-prompt"
+    exit 7
+fi
+IFS= read -r init
+if [ "$1" = unsupported ]; then
+    echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+    IFS= read -r new
+    echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fresh"}}'
+    prompt_id=3
+else
+    echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}'
+    IFS= read -r load
+    printf '%s\n' "$load" > "$d/load"
+    if [ "$1" = loaded ]; then
+        echo '{"jsonrpc":"2.0","id":2,"result":{}}'
+        prompt_id=3
+    else
+        echo '{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"session unavailable"}}'
+        IFS= read -r new
+        echo '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"fresh"}}'
+        prompt_id=4
+    fi
+fi
+IFS= read -r prompt
+printf '%s\n' "$prompt" > "$d/retry-prompt"
+printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt_id"
+"#;
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
+        let mut c = AcpConversation::new("Scripted ACP", "gemini-cli", program.display().to_string(), vec![recovery.into()], dir.path().into(), mcp, None)
+            .with_preamble("P:".into());
+        let finish = |c: &mut AcpConversation| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut all = Vec::new();
+            while !all.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+                assert!(std::time::Instant::now() < deadline, "no TurnDone: {all:?}");
+                all.extend(c.poll());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            all
+        };
+        let original = "Build the requested blue header.";
+        c.send(original);
+        assert!(finish(&mut c).iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+        assert_eq!(c.last_failure(), Some(TurnFailure::new(FailureKind::Transient)));
+        assert_eq!(c.session_id().as_deref(), Some("saved"));
+        c.retry(original);
+        let events = finish(&mut c);
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "{events:?}");
+        let read = |name: &str| -> Value { serde_json::from_str(&std::fs::read_to_string(dir.path().join(name)).unwrap()).unwrap() };
+        assert_eq!(read("first-prompt")["params"]["prompt"][0]["text"], format!("P:{original}"));
+        if recovery != "unsupported" {
+            assert_eq!(read("load")["params"]["sessionId"], "saved");
+        }
+        let retry = read("retry-prompt");
+        assert_eq!(retry["method"], "session/prompt");
+        assert_eq!(retry["params"]["sessionId"], if recovery == "loaded" { "saved" } else { "fresh" });
+        retry["params"]["prompt"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acp_retry_preserves_the_request_when_recovery_starts_a_new_session() {
+        for recovery in ["missing", "unsupported"] {
+            assert_eq!(prompt_after_interrupted_acp_turn(recovery), "P:Build the requested blue header.", "{recovery}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acp_retry_continues_a_successfully_loaded_session() {
+        assert_eq!(prompt_after_interrupted_acp_turn("loaded"), format!("P:{}", crate::failure::CONTINUE_TURN));
+    }
+
+    fn update(c: &mut AcpCore, value: Value) -> Vec<Out> {
+        c.line(&json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "old", "update": value}}).to_string())
+    }
+
+    #[test]
+    fn loading_a_session_keeps_replayed_messages_and_tools_out_of_the_new_turn() {
+        let mut c = core(Some("old"));
+        c.start();
+        c.prompt("Continue here.");
+        c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}"#);
+        let history = [
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Earlier answer"}}),
+            json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "Earlier thought"}}),
+            json!({"sessionUpdate": "plan", "entries": [{"content": "Earlier plan"}]}),
+            json!({"sessionUpdate": "tool_call", "toolCallId": "old-tool", "title": "Earlier tool", "status": "completed"}),
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "old-tool", "status": "completed"}),
+        ];
+        for notification in &history {
+            assert!(update(&mut c, notification.clone()).is_empty(), "history must not appear as current activity: {notification}");
+        }
+        assert!(c.tools.is_empty(), "replay must not populate the live tool-title map");
+        assert!(c.line(r#"{"jsonrpc":"2.0","id":99,"result":{}}"#).is_empty());
+        assert!(update(&mut c, history[0].clone()).is_empty(), "an unrelated response does not finish loading");
+
+        let prompt = sent(&c.line(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#));
+        assert_eq!(prompt[0]["method"], "session/prompt");
+        assert_eq!(prompt[0]["params"]["sessionId"], "old");
+        assert_eq!(prompt[0]["params"]["prompt"][0]["text"], "Continue here.");
+        assert_eq!(
+            events(update(&mut c, history[0].clone())),
+            [AgentEvent::TextDelta { text: "Earlier answer".into() }],
+            "the same text after loading is live"
+        );
+        let live = events(update(&mut c, json!({"sessionUpdate": "tool_call", "toolCallId": "live-tool", "title": "Current tool", "status": "pending"})));
+        assert!(matches!(&live[..], [AgentEvent::ToolStarted { tool, .. }] if tool == "Current tool"));
+        let done = events(update(&mut c, json!({"sessionUpdate": "tool_call_update", "toolCallId": "live-tool", "status": "completed"})));
+        assert!(matches!(&done[..], [AgentEvent::ToolFinished { tool, ok: true, .. }] if tool == "Current tool"));
+        assert_eq!(c.tools.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_load_does_not_suppress_the_replacement_sessions_updates() {
+        let mut c = core(Some("old"));
+        c.start();
+        c.prompt("Try again.");
+        c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}"#);
+        let message = json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Answer"}});
+        assert!(update(&mut c, message.clone()).is_empty());
+        let new = sent(&c.line(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"load failed"}}"#));
+        assert_eq!(new[0]["method"], "session/new");
+        let prompt = sent(&c.line(r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"replacement"}}"#));
+        assert_eq!(prompt[0]["params"]["sessionId"], "replacement");
+        let live = c.line(&json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "replacement", "update": message}}).to_string());
+        assert_eq!(events(live), [AgentEvent::TextDelta { text: "Answer".into() }]);
+    }
+
+    #[test]
+    fn cancelling_a_loading_session_does_not_publish_replay_or_send_the_cancelled_prompt() {
+        let mut c = core(Some("old"));
+        c.start();
+        c.prompt("Stop this.");
+        c.line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}"#);
+        assert!(c.cancel().contains(&Out::TurnEnded));
+        assert!(update(&mut c, json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "History"}})).is_empty());
+        assert!(c.line(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#).is_empty(), "the cancelled prompt stays cancelled when loading finishes");
+        assert_eq!(sent(&c.prompt("A new request."))[0]["params"]["prompt"][0]["text"], "A new request.");
+    }
+
     #[test]
     fn permission_requests_become_consent_and_are_answered_once() {
         let mut c = core(None);
@@ -728,6 +1137,7 @@ mod tests {
         c.start();
         c.prompt("hi");
         let outs = c.line(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Authentication required"}}"#);
+        assert_eq!(c.failure, Some(TurnFailure::new(FailureKind::Authentication)));
         assert!(outs.contains(&Out::TurnEnded));
         assert!(matches!(&events(outs)[0], AgentEvent::Error { message, remediation: Some(_), .. } if message.contains("Authentication required")));
         let refused = sent(&c.line(r#"{"jsonrpc":"2.0","id":9,"method":"fs/read_text_file","params":{"path":"/etc/passwd"}}"#));
@@ -751,6 +1161,36 @@ mod tests {
         assert_eq!(run("read", json!({"path": "/a"})).0, "Read");
         assert_eq!(run("fetch", json!({"url": "https://x"})).0, "WebFetch");
         assert_eq!(run("other", json!({})).0, "t", "unknown kinds are asked about by title");
+    }
+
+    #[test]
+    fn maki_starts_in_acp_mode_with_the_backends_model() {
+        assert_eq!(acp_args("maki"), Some(&["acp"][..]));
+        assert_eq!(model_args("maki", Some(" anthropic/claude-sonnet-4-6 ")), ["-m", "anthropic/claude-sonnet-4-6"]);
+        assert!(model_args("maki", None).is_empty() && model_args("maki", Some(" ")).is_empty());
+        // An agent whose ACP mode isn't known to take a model keeps its own, as before.
+        assert!(model_args("opencode", Some("x/y")).is_empty());
+    }
+
+    /// `maki -m <model> acp` starts with Maki's default model: the flag only counts after `acp`.
+    #[test]
+    fn a_maki_backend_runs_acp_then_its_model_after_its_own_args() {
+        let config = crate::BackendConfig {
+            name: "Maki".into(),
+            kind: crate::BackendKind::AgentCli,
+            model: "maki".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: true,
+        };
+        let options = crate::BackendOptions {
+            acp: Some(true),
+            cli_model: Some("anthropic/claude-sonnet-4-6".into()),
+            args: vec!["--no-plugins".into()],
+            ..Default::default()
+        };
+        let Some(c) = super::super::acp_for(&super::super::CliSpec::new(config, options, false, None)) else { panic!("Maki speaks ACP") };
+        assert_eq!((c.program.as_str(), c.args.as_slice()), ("maki", &["--no-plugins", "acp", "-m", "anthropic/claude-sonnet-4-6"].map(String::from)[..]));
     }
 
     #[test]

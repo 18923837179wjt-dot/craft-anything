@@ -76,6 +76,11 @@ pub struct EngineSettings {
     pub store_dir: Option<PathBuf>,
     /// URL of a user-run JEB MCP server, e.g. `http://127.0.0.1:8425/mcp` (loopback, plain HTTP only).
     pub jeb_url: Option<String>,
+    /// Find engines only where these settings and the managed store say, never on PATH or in the
+    /// usual install folders. Never saved: test sessions set it so they don't find what this
+    /// computer has installed ([`crate::testing::session`]).
+    #[serde(skip)]
+    pub only_configured: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -351,8 +356,56 @@ impl Settings {
         }
     }
 
+    /// Load startup settings, first recovering app edits deferred by a busy shutdown.
     pub fn load() -> Settings {
-        Settings::load_from(&Settings::path())
+        let path = Settings::path();
+        if let Err(e) = Self::recover_pending(&path) {
+            log::warn!("Couldn't recover pending settings: {}", e.message);
+        }
+        Settings::load_from(&path)
+    }
+
+    /// Keep pending non-AI edits without touching config.toml or waiting for the engine session.
+    /// The sidecar uses the settings schema/version and migrations; startup merges it with the
+    /// latest committed AI table, so a writer still finishing at shutdown cannot be overwritten.
+    pub fn defer_save_to(&self, path: &Path) -> Result<(), ToolError> {
+        let mut pending = self.clone();
+        pending.ai.clear();
+        pending.save_to(&path.with_extension("pending.toml"))
+    }
+
+    /// Remove deferred edits superseded by a successful full save. A missing sidecar is fine.
+    pub fn discard_pending(path: &Path) -> Result<(), ToolError> {
+        let pending_path = path.with_extension("pending.toml");
+        match std::fs::remove_file(&pending_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ToolError::io(pending_path.display(), e)),
+        }
+    }
+
+    /// Recover a deferred snapshot only when both files are readable and supported. Leave the
+    /// sidecar intact on failure, and remove it only after the merged settings are saved.
+    fn recover_pending(path: &Path) -> Result<(), ToolError> {
+        let pending_path = path.with_extension("pending.toml");
+        let text = match std::fs::read_to_string(&pending_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(ToolError::io(pending_path.display(), e)),
+        };
+        let bad_settings = |e: String| ToolError::new(ErrorCode::BadSettings, e);
+        let mut pending = read_settings(&text).map_err(bad_settings)?;
+        let current = match std::fs::read_to_string(path) {
+            Ok(text) => read_settings(&text).map_err(bad_settings)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+            Err(e) => return Err(ToolError::io(path.display(), e)),
+        };
+        if current.version > SETTINGS_VERSION || pending.version > SETTINGS_VERSION {
+            return Err(ToolError::new(ErrorCode::BadSettings, "Update Craft Anything to recover settings saved by a newer version."));
+        }
+        pending.ai = current.ai;
+        pending.save_to(path)?;
+        Self::discard_pending(path)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), ToolError> {
@@ -377,7 +430,12 @@ impl Settings {
 
     /// Ghidra's headless launcher, when Deep mode can really use Ghidra (`None`: not installed).
     pub fn ghidra_launcher(&self) -> Option<PathBuf> {
-        craft_anything_engines::ghidra::get::headless(self.engines.ghidra.install_dir.as_deref(), &self.engine_store_dir())
+        let (dir, store) = (self.engines.ghidra.install_dir.as_deref(), self.engine_store_dir());
+        if self.engines.only_configured {
+            craft_anything_engines::ghidra::get::headless_configured(dir, &store)
+        } else {
+            craft_anything_engines::ghidra::get::headless(dir, &store)
+        }
     }
 
     /// The Java runtime Ghidra runs on (`None`: let Ghidra find its own).
@@ -394,7 +452,11 @@ impl Settings {
         if id == craft_anything_engines::ghidra::get::ID {
             return self.ghidra_launcher();
         }
-        craft_anything_engines::locate(id, &self.engines.tools, &self.engine_store_dir())
+        if self.engines.only_configured {
+            craft_anything_engines::locate_configured(id, &self.engines.tools, &self.engine_store_dir())
+        } else {
+            craft_anything_engines::locate(id, &self.engines.tools, &self.engine_store_dir())
+        }
     }
 }
 
@@ -416,6 +478,39 @@ auto_mode = true
     }
 
     use super::*;
+
+    #[test]
+    fn only_configured_finds_no_engine_from_this_computer_but_keeps_the_ones_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.engines.store_dir = Some(dir.path().join("engines"));
+        s.engines.only_configured = true;
+        assert_eq!(s.ghidra_launcher(), None, "PATH and the usual install folders aren't searched");
+        assert_eq!(s.engine_path("java"), None);
+        // The folder the person picked still counts, and so does the managed store.
+        let launcher_name = if cfg!(windows) { "analyzeHeadless.bat" } else { "analyzeHeadless" };
+        let picked = dir.path().join("picked").join("ghidra_12_PUBLIC");
+        std::fs::create_dir_all(picked.join("support")).unwrap();
+        std::fs::write(picked.join("support").join(launcher_name), "").unwrap();
+        s.engines.ghidra.install_dir = Some(dir.path().join("picked"));
+        assert_eq!(s.ghidra_launcher(), Some(picked.join("support").join(launcher_name)));
+        assert_eq!(s.engine_path("ghidra"), s.ghidra_launcher());
+        s.engines.ghidra.install_dir = None;
+        let managed = dir.path().join("engines").join("ghidra").join("ghidra_12_PUBLIC").join("support");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join(launcher_name), "").unwrap();
+        assert_eq!(s.ghidra_launcher(), Some(managed.join(launcher_name)));
+        // It is never written to config.toml, and a loaded config looks around the computer.
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert!(!text.contains("only_configured"), "{text}");
+        let loaded: Settings = toml::from_str(&text).unwrap();
+        assert!(!loaded.engines.only_configured);
+    }
+
+    #[test]
+    fn the_test_session_looks_only_where_its_settings_say() {
+        assert!(crate::testing::session().settings.engines.only_configured);
+    }
 
     #[test]
     fn path_overrides_match_the_engine_table_exactly() {
@@ -513,6 +608,51 @@ default = "Claude Code"
         std::fs::write(&path, "mode = [[[").unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());
         assert!(path.with_extension("toml.broken").exists());
+    }
+
+    /// Deferred saves cannot replace damaged/newer data, and failed recovery keeps both originals.
+    #[test]
+    fn deferred_settings_keep_ai_and_refuse_unsupported_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let pending_path = path.with_extension("pending.toml");
+        let mut pending = Settings { language: "de".into(), ..Settings::default() };
+        pending.ai.insert("model".into(), "stale".into());
+        pending.defer_save_to(&path).unwrap();
+        let pending_text = std::fs::read_to_string(&pending_path).unwrap();
+        assert!(read_settings(&pending_text).unwrap().ai.is_empty());
+        assert!(!path.exists(), "deferring never writes the shared config");
+        for invalid in ["mode = [[[", "version = 999\n", "version = 999\nmode = []"] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(Settings::recover_pending(&path).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+            assert_eq!(std::fs::read_to_string(&pending_path).unwrap(), pending_text);
+        }
+        let mut current = Settings::default();
+        current.ai.insert("model".into(), "latest".into());
+        current.save_to(&path).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        for invalid in ["mode = [[[", "version = 999\n"] {
+            std::fs::write(&pending_path, invalid).unwrap();
+            assert!(Settings::recover_pending(&path).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(std::fs::read_to_string(&pending_path).unwrap(), invalid);
+        }
+        std::fs::write(&pending_path, &pending_text).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(Settings::recover_pending(&path).is_err(), "I/O failure must not consume pending edits");
+        assert_eq!(std::fs::read_to_string(&pending_path).unwrap(), pending_text);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, original).unwrap();
+        // An old sidecar migrates through the existing settings schema before recovery.
+        std::fs::write(&pending_path, "language = \"de\"\n[ai]\nmodel = \"stale\"\n").unwrap();
+        Settings::recover_pending(&path).unwrap();
+        let recovered = Settings::load_from(&path);
+        assert_eq!(recovered.version, SETTINGS_VERSION);
+        assert_eq!(recovered.language, "de");
+        assert_eq!(recovered.ai, current.ai);
+        assert!(!pending_path.exists());
     }
 
     #[test]

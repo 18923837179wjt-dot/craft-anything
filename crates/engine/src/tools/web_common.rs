@@ -49,12 +49,33 @@ pub struct Browser {
     /// The `User-Agent` from `/json/version` (empty when unknown); names the runtime.
     pub user_agent: String,
     pub launched: bool,
-    // Held only so the owned browser process (and its temp profile) are killed/kept alive for the
-    // lifetime of this handle and cleaned up on drop; never read directly.
+    // The process is dropped before the profile so its supervisor is asked to stop it first.
     #[allow(dead_code)]
     _proc: Option<RunningProcess>,
     #[allow(dead_code)]
-    _profile: Option<std::path::PathBuf>,
+    _profile: Option<BrowserProfile>,
+}
+
+struct BrowserProfile(std::path::PathBuf);
+
+fn remove_profile_with(mut remove: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        match remove() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if started.elapsed() >= Duration::from_secs(5) => return Err(e),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+impl Drop for BrowserProfile {
+    fn drop(&mut self) {
+        if let Err(e) = remove_profile_with(|| std::fs::remove_dir_all(&self.0)) {
+            log::warn!("couldn't remove the private browser profile {}: {e}", self.0.display());
+        }
+    }
 }
 
 /// What is answering on a CDP endpoint: `electron`, `edge`, `chrome`, or `unknown`, from the
@@ -77,6 +98,19 @@ pub fn engine_missing(detail: impl std::fmt::Display) -> ToolError {
     ToolError::new(ErrorCode::EngineMissing, format!("no browser is available: {detail}")).with_remediation(
         "Give a loopback CDP endpoint (start a browser with --remote-debugging-port), or install a browser from Settings → Engines so one can be launched.",
     )
+}
+
+/// Where a launched browser's private profile goes. A Flatpak or Snap browser has a /tmp of its
+/// own, so it couldn't use a profile there and we couldn't read its port from it: its profile goes
+/// in the home folder its sandbox always shares (#747). Anything else uses the temp folder.
+fn profile_base(exe: &std::path::Path, home: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    let parent = exe.parent().unwrap_or(std::path::Path::new(""));
+    let name = exe.file_name().filter(|n| !n.is_empty());
+    match (name, home) {
+        (Some(app), Some(home)) if parent.ends_with("flatpak/exports/bin") => home.join(".var/app").join(app).join("cache"),
+        (Some(app), Some(home)) if parent == std::path::Path::new("/snap/bin") => home.join("snap").join(app).join("common"),
+        _ => std::env::temp_dir(),
+    }
 }
 
 impl Browser {
@@ -123,9 +157,9 @@ impl Browser {
     pub(crate) fn launch(ctx: &Ctx<'_>, opts: &LaunchOptions, dl: &Deadline) -> Result<Browser, ToolError> {
         let exe = craft_anything_engines::locate("chromium", &ctx.session.settings.engines.tools, &ctx.session.settings.engine_store_dir())
             .ok_or_else(|| engine_missing("no Chromium-based browser was found"))?;
-        let profile = super::artifact_tools::fresh_temp_dir("craft-browser")?;
+        let profile = BrowserProfile(super::artifact_tools::fresh_dir_in(&profile_base(&exe, dirs::home_dir()), "craft-browser")?);
         let mut args: Vec<String> = vec![
-            format!("--user-data-dir={}", profile.display()),
+            format!("--user-data-dir={}", profile.0.display()),
             "--remote-debugging-port=0".into(),
             "--remote-allow-origins=*".into(),
             "--no-first-run".into(),
@@ -157,7 +191,7 @@ impl Browser {
             .hands_off()
             .spawn()?;
         let name = exe.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "the browser".into());
-        let endpoint = Self::await_devtools(&profile, dl, &mut proc, &tail, &name)?;
+        let endpoint = Self::await_devtools(&profile.0, dl, &mut proc, &tail, &name)?;
         let version = cdp::json_version(&endpoint, dl)?;
         Ok(Browser {
             product: version.get("Browser").and_then(Value::as_str).unwrap_or("unknown").to_string(),
@@ -178,9 +212,9 @@ impl Browser {
             return Err(ToolError::new(ErrorCode::NotFound, format!("{} is not a file", exe.display()))
                 .with_remediation("Give the absolute path of the app's executable."));
         }
-        let profile = super::artifact_tools::fresh_temp_dir("craft-electron")?;
+        let profile = BrowserProfile(super::artifact_tools::fresh_temp_dir("craft-electron")?);
         let mut args: Vec<String> = vec![
-            format!("--user-data-dir={}", profile.display()),
+            format!("--user-data-dir={}", profile.0.display()),
             "--remote-debugging-port=0".into(),
             "--remote-allow-origins=*".into(),
             "--no-first-run".into(),
@@ -199,7 +233,7 @@ impl Browser {
             .hands_off()
             .spawn()?;
         let name = exe.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "the app".into());
-        let endpoint = Self::await_devtools(&profile, dl, &mut proc, &tail, &name)?;
+        let endpoint = Self::await_devtools(&profile.0, dl, &mut proc, &tail, &name)?;
         let version = cdp::json_version(&endpoint, dl)?;
         Ok(Browser {
             product: version.get("Browser").and_then(Value::as_str).unwrap_or("Electron app").to_string(),
@@ -376,7 +410,8 @@ pub fn sanitize_url(url: &str) -> String {
     // Strip scheme://userinfo@ → scheme://host…
     if let Some(scheme_end) = url.find("://") {
         let (scheme, rest) = url.split_at(scheme_end + 3);
-        if let Some(at) = rest.find('@') {
+        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if let Some(at) = rest.get(..auth_end).and_then(|a| a.rfind('@')) {
             let after = rest.get(at + 1..).unwrap_or("");
             return format!("{scheme}{after}");
         }
@@ -862,6 +897,47 @@ pub fn encode_png(img: &Image) -> Result<Vec<u8>, ToolError> {
     Ok(out)
 }
 
+/// `img` as an 8-bit RGBA PNG of at most `max` bytes, or `None` when it would be bigger. It's
+/// compressed a chunk at a time, so a picture that won't fit stops as soon as it passes `max`
+/// instead of being held whole first.
+pub fn encode_png_within(img: &Image, max: usize) -> Result<Option<Vec<u8>>, ToolError> {
+    /// Takes bytes until `max`, then refuses them and says so.
+    struct Capped {
+        out: Vec<u8>,
+        max: usize,
+        over: bool,
+    }
+    impl std::io::Write for Capped {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.out.len().saturating_add(buf.len()) > self.max {
+                self.over = true;
+                return Err(std::io::Error::other("the PNG passed its size limit"));
+            }
+            self.out.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut capped = Capped { out: Vec::new(), max, over: false };
+    let written = (|| {
+        let mut enc = png::Encoder::new(&mut capped, img.width, img.height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut w = enc.write_header().map_err(|e| format!("PNG header: {e}"))?;
+        let mut stream = w.stream_writer().map_err(|e| format!("PNG data: {e}"))?;
+        std::io::Write::write_all(&mut stream, &img.rgba).map_err(|e| format!("PNG data: {e}"))?;
+        stream.finish().map_err(|e| format!("PNG data: {e}"))?;
+        w.finish().map_err(|e| format!("PNG end: {e}"))
+    })();
+    match written {
+        _ if capped.over => Ok(None),
+        Ok(()) => Ok(Some(capped.out)),
+        Err(e) => Err(ToolError::internal(e)),
+    }
+}
+
 /// `img` scaled to `w`×`h` (box sampling: each output pixel is the mean of the input pixels it
 /// covers). Aspect ratio isn't kept: comparisons bring both pictures to one size.
 pub fn resize(img: &Image, w: u32, h: u32) -> Image {
@@ -996,6 +1072,79 @@ pub fn png_artifact(bytes: &[u8]) -> Result<Value, ToolError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_launched_browser_deletes_its_profile_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("private-profile");
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::write(profile.join("Preferences"), b"private browser state").unwrap();
+        let browser = super::Browser {
+            endpoint: super::cdp::parse_endpoint("http://127.0.0.1:9222").unwrap(),
+            product: "Test Browser".into(),
+            version: String::new(),
+            user_agent: String::new(),
+            launched: true,
+            _proc: None,
+            _profile: Some(super::BrowserProfile(profile.clone())),
+        };
+        drop(browser);
+        assert!(!profile.exists(), "the private browser profile survived its owner");
+    }
+
+    #[test]
+    fn profile_cleanup_retries_while_the_browser_releases_files() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("private-profile");
+        std::fs::create_dir(&profile).unwrap();
+        let mut attempts = 0;
+        super::remove_profile_with(|| {
+            attempts += 1;
+            if attempts < 3 { Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "still locked")) } else { std::fs::remove_dir_all(&profile) }
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert!(!profile.exists());
+    }
+
+    /// #747: a Flatpak or Snap browser keeps its profile where its sandbox can reach it and we can
+    /// read its port; any other browser uses the temp folder.
+    #[test]
+    fn a_sandboxed_browser_gets_a_profile_it_can_reach() {
+        use std::path::{Path, PathBuf};
+        let home = || Some(PathBuf::from("/home/me"));
+        let base = |exe: &str| super::profile_base(Path::new(exe), home());
+        assert_eq!(base("/var/lib/flatpak/exports/bin/com.google.Chrome"), Path::new("/home/me/.var/app/com.google.Chrome/cache"));
+        assert_eq!(base("/home/me/.local/share/flatpak/exports/bin/com.brave.Browser"), Path::new("/home/me/.var/app/com.brave.Browser/cache"));
+        assert_eq!(base("/snap/bin/chromium"), Path::new("/home/me/snap/chromium/common"));
+        assert_eq!(base("/usr/bin/google-chrome"), std::env::temp_dir());
+        assert_eq!(super::profile_base(Path::new("/var/lib/flatpak/exports/bin/com.google.Chrome"), None), std::env::temp_dir(), "no home folder");
+    }
+
+    /// The capped encoder gives a PNG of the same pixels when it fits, and stops without one when
+    /// it doesn't: noise hardly compresses, so 64×64 of it can't fit in 4 KB.
+    #[test]
+    fn a_png_over_its_limit_is_refused_while_encoding() {
+        let small = Image { width: 3, height: 2, rgba: (0..24).collect() };
+        let png = encode_png_within(&small, 1 << 20).unwrap().unwrap();
+        let back = decode_png(&png).unwrap();
+        assert_eq!((back.width, back.height, back.rgba), (3, 2, small.rgba.clone()));
+        assert_eq!(encode_png_within(&small, png.len()).unwrap().as_deref(), Some(png.as_slice()), "exactly the limit fits");
+        assert_eq!(encode_png_within(&small, png.len() - 1).unwrap(), None);
+        let mut seed = 0x2545_f491_u32;
+        let noise: Vec<u8> = (0..64 * 64 * 4)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let noisy = Image { width: 64, height: 64, rgba: noise };
+        assert_eq!(encode_png_within(&noisy, 4096).unwrap(), None);
+        let fits = encode_png_within(&noisy, 1 << 20).unwrap().unwrap();
+        assert_eq!(png_dimensions(&fits).unwrap(), (64, 64));
+    }
+
     use super::*;
 
     #[test]
@@ -1060,7 +1209,11 @@ mod tests {
     #[test]
     fn sanitize_url_strips_userinfo() {
         assert_eq!(sanitize_url("https://user:pw@host/path?q=1"), "https://host/path?q=1");
+        assert_eq!(sanitize_url("https://user:pw@host/@profile"), "https://host/@profile");
         assert_eq!(sanitize_url("https://host/x"), "https://host/x");
+        assert_eq!(sanitize_url("https://example.test/@profile"), "https://example.test/@profile");
+        assert_eq!(sanitize_url("https://cdn.example.test/icon@2x.png"), "https://cdn.example.test/icon@2x.png");
+        assert_eq!(sanitize_url("https://example.test/search?to=reader@example.test"), "https://example.test/search?to=reader@example.test");
     }
 
     #[test]

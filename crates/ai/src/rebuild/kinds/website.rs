@@ -144,8 +144,12 @@ impl TargetKind for WebsiteKind {
     fn detect(&self, cx: &DetectCx) -> Option<u32> {
         if matches!(cx.target, TargetRef::Website { .. }) {
             Some(100)
-        } else if cx.says(&[" website", " web page", " webpage", " landing page", " site ", "网站", "網站", "网页", "網頁"]) {
+        } else if cx.says(&[" website", " web page", " webpage", " landing page", " site ", " webseite", " internetseite", "网站", "網站", "网页", "網頁"])
+        {
             Some(50)
+        } else if matches!(cx.target, TargetRef::None) && stacks::get(cx.stack).is_some_and(|s| s.site) {
+            // Built as a site with nothing to recreate: "add a contact form" never says website.
+            Some(30)
         } else {
             None
         }
@@ -716,6 +720,17 @@ fn states_note(cx: &CheckCx, base: &str, out: &Path, dir: &str, unknowns: &mut V
 /// builder but don't change the score.
 pub struct WebVisualCheck;
 
+/// What the check says when there is no site to look at: the places `site_dir` accepts, in the
+/// place the app really is ("app/" or "the project folder", #494).
+/// When `app/` holds no files at all, the note says so first: the builder may claim it built the
+/// site while nothing was written (#736), and a site can't be found in a folder with no project.
+fn missing_site_note(place: &str, empty: bool) -> String {
+    let start = if empty { format!("{place} has no files yet, so the builder hasn't written the project. ") } else { String::new() };
+    format!(
+        "{start}No built site found in {place} yet. Expected an index.html in its dist/, build/ or out/ folder, or an index.html straight in {place} when there is no package.json."
+    )
+}
+
 impl Check for WebVisualCheck {
     fn id(&self) -> &'static str {
         CheckResult::WEB_VISUAL
@@ -725,7 +740,7 @@ impl Check for WebVisualCheck {
         let (ws, round) = (cx.ws, cx.round);
         let widths = cx.build_settings().widths();
         let Some(site) = site_dir(&ws.app_dir()) else {
-            return Ok(CheckResult::new(self.id(), round, false, "No built site found in app/dist, app/out or app/build yet."));
+            return Ok(CheckResult::new(self.id(), round, false, missing_site_note(ws.app_place(), app_is_empty(ws))));
         };
         let base = cx.serve_preview(&site)?;
         let out = ws.checks_dir().join(format!("round-{round}"));
@@ -815,5 +830,48 @@ impl Check for WebVisualCheck {
         // One page needs no list; with several, each one's likeness is kept for the project page.
         let pages = if likeness.len() > 1 { likeness } else { Vec::new() };
         Ok(CheckResult { similarity: Some(avg), artifacts, pages, unknowns, claims, ..CheckResult::new(self.id(), round, true, notes.join(" | ")) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #736: an empty app/ is said to be empty, so a builder that claims a build can't hide it; a
+    /// folder with files, or a project folder (which always holds the workspace's own), isn't.
+    #[test]
+    fn an_empty_app_folder_is_named_as_empty() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Site", "Clone it", TargetRef::None).unwrap();
+        std::fs::create_dir_all(ws.app_dir()).unwrap();
+        assert!(folder_is_empty(&ws.app_dir()), "a new app/ has nothing in it");
+        assert!(missing_site_note("app/", true).starts_with("app/ has no files yet"));
+        std::fs::write(ws.app_dir().join("package.json"), "{}").unwrap();
+        assert!(!folder_is_empty(&ws.app_dir()));
+        assert!(!missing_site_note("app/", false).contains("has no files"));
+        assert!(folder_is_empty(&d.path().join("never-made")), "a missing folder is empty");
+    }
+
+    /// #494: the note names every place `site_dir` accepts, and the place the app really is.
+    #[test]
+    fn the_missing_site_note_names_what_site_dir_accepts() {
+        let note = missing_site_note("app/", false);
+        for named in ["dist/", "build/", "out/", "index.html straight in app/", "no package.json"] {
+            assert!(note.contains(named), "{named} in {note}");
+        }
+        assert!(missing_site_note("the project folder", false).contains("index.html straight in the project folder"));
+        // What it names is what is accepted, and a manifest turns the plain page down.
+        for folder in ["dist", "build", "out"] {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(d.path().join(folder)).unwrap();
+            std::fs::write(d.path().join(folder).join("index.html"), "<html></html>").unwrap();
+            assert_eq!(site_dir(d.path()), Some(d.path().join(folder)), "{folder}");
+        }
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(site_dir(d.path()), None, "nothing built");
+        std::fs::write(d.path().join("index.html"), "<html></html>").unwrap();
+        assert_eq!(site_dir(d.path()), Some(d.path().to_path_buf()), "a plain page");
+        std::fs::write(d.path().join("package.json"), "{}").unwrap();
+        assert_eq!(site_dir(d.path()), None, "a page beside a manifest is not a built site");
     }
 }

@@ -131,6 +131,59 @@ fn esbuild_bundle_is_split() {
 }
 
 #[test]
+fn minified_esbuild_wrappers_keep_dependencies() {
+    let minified = fx::ESBUILD_BUNDLE.replace("require_util", "a").replace("require_main", "b");
+    let a = run("out.js", &minified);
+    assert_eq!(a.facts.parse_errors, 0);
+    assert_eq!(a.bundle.modules.len(), 2);
+    let main = a.bundle.modules.iter().find(|m| m.id == "src/main.js").unwrap();
+    assert_eq!(main.format, "esbuild-cjs");
+    assert_eq!(main.deps, ["src/util.js"]);
+
+    // Resolve after visiting the whole file: an initializer may be declared later.
+    let source = r#"
+var m = h({"src/main.js"(exports, module) { u(); i(); }});
+var u = h({"src/util.js"(exports, module) { module.exports = 7; }});
+var i = h({"src/setup.js"() { globalThis.ready = true; }});
+"#;
+    let a = run("out.js", source);
+    assert_eq!(a.facts.parse_errors, 0);
+    assert_eq!(a.bundle.modules.len(), 3);
+    assert_eq!(a.bundle.modules.iter().find(|m| m.id == "src/main.js").unwrap().deps, ["src/util.js", "src/setup.js"]);
+    assert_eq!(a.bundle.modules.iter().find(|m| m.id == "src/setup.js").unwrap().format, "esbuild-esm");
+}
+
+#[test]
+fn esbuild_wrapper_dependencies_follow_bindings() {
+    let source = r#"
+var a = h({"src/outer.js"(exports, module) { module.exports = 1; }});
+var b = h({"src/main.js"(exports, module) { a(); }});
+function anotherBundle() {
+    var a = h({"src/inner.js"(exports, module) { module.exports = 2; }});
+    var b = h({"src/other.js"(exports, module) { a(); }});
+}
+var s = h({"src/shadow.js"(exports, module) { function local(a) { a(); } }});
+"#;
+    let a = run("out.js", source);
+    assert_eq!(a.facts.parse_errors, 0);
+    let deps = |id| &a.bundle.modules.iter().find(|m| m.id == id).unwrap().deps;
+    assert_eq!(deps("src/main.js"), &["src/outer.js"]);
+    assert_eq!(deps("src/other.js"), &["src/inner.js"]);
+    assert!(deps("src/shadow.js").is_empty(), "a local parameter is not a wrapper call");
+}
+
+#[test]
+fn esbuild_dependencies_ignore_unrecognised_and_repeated_calls() {
+    let source = r#"
+var a = h({"src/util.js"(exports, module) { module.exports = 1; }});
+var b = h({"src/main.js"(exports, module) { a(); a(); unknown(); require_external(); a(1); }});
+"#;
+    let a = run("out.js", source);
+    assert_eq!(a.facts.parse_errors, 0);
+    assert_eq!(a.bundle.modules.iter().find(|m| m.id == "src/main.js").unwrap().deps, ["src/util.js"]);
+}
+
+#[test]
 fn fingerprints_ignore_names() {
     let a = run("a.js", "function f(a, b) { return a + b * 2; }").facts.fingerprint;
     let b = run("b.js", "function g(x, y) { return x + y * 2; }").facts.fingerprint;
@@ -320,6 +373,35 @@ fn graphql_documents_in_plain_strings_and_minified_shapes() {
     assert_eq!(compiled, [op("graphql", "mutation", "Pay")]);
     let anon = ops(r#"var d={kind:"OperationDefinition",operation:"query",name:void 0};"#);
     assert_eq!(anon, [("graphql".to_string(), "query".to_string(), None, true)], "known to be anonymous");
+}
+
+#[test]
+fn graphql_documents_that_begin_with_a_comment() {
+    // A comment is valid at the start of a GraphQL document, and common in generated clients.
+    let l = ops(r##"const q="# Client document\nquery Feed{items{id}}";"##);
+    assert!(has(&l, "graphql", "query", "Feed"), "{l:?}");
+    let l = ops("const q=`# Client document\nquery Feed{items{id}}`;");
+    assert!(has(&l, "graphql", "query", "Feed"), "{l:?}");
+    // A lone CR ends a comment in GraphQL, as a CRLF does. A string escape keeps the CR; a
+    // template literal would normalize it to LF.
+    let l = ops(r##"const q="# Client document\rquery Feed{items{id}}";"##);
+    assert!(has(&l, "graphql", "query", "Feed"), "{l:?}");
+    // A template with run-time text goes through the other call site.
+    let l = ops("const q=`# Client document\nquery Feed{items{id}} ${x}`;");
+    assert!(has(&l, "graphql", "query", "Feed"), "{l:?}");
+    // The same document in a request body.
+    let l = ops(r##"fetch("/graphql",{method:"POST",body:JSON.stringify({query:"# Client document\nquery Feed{items{id}}",variables:{}})})"##);
+    assert!(has(&l, "graphql", "query", "Feed"), "{l:?}");
+    // A comment doesn't make any other text a document.
+    let l = ops(r##"const s="# note\nconst a = {b:1}";"##);
+    assert!(!l.iter().any(|o| o.0 == "graphql"), "{l:?}");
+}
+
+#[test]
+fn graphql_comment_inside_a_selection_set() {
+    // A comment may sit between fields, and a lone CR ends it as a newline does.
+    let l = ops(r##"const q="query Feed{items # note\r id}";"##);
+    assert!(has(&l, "graphql", "query", "Feed"), "{l:?}");
 }
 
 #[test]

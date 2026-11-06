@@ -59,8 +59,10 @@ pub const DEFAULT_STDERR_CAP: usize = 1024 * 1024;
 /// How long to wait for the output threads after the child exits (an escaped grandchild may hold
 /// the pipe open; we stop waiting rather than hang).
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
-/// Longest partial line kept before it is delivered anyway.
-const MAX_LINE: usize = 1024 * 1024;
+/// Longest partial line kept before it is delivered anyway. MCP servers answer `tools/list` as
+/// one JSON-RPC line that can be megabytes (a plugin with many richly described tools), so this
+/// must cover such a whole line: a fragment is not JSON, and the answer would never parse.
+const MAX_LINE: usize = 16 * 1024 * 1024;
 
 /// A program to run, built fluently.
 #[derive(Clone)]
@@ -300,7 +302,7 @@ impl Process {
         // output is piped here, so it never needs one.
         #[cfg(windows)]
         wrap.wrap(process_wrap::std::JobObject).wrap(process_wrap::std::CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW));
-        let mut child = wrap.spawn().map_err(|e| spawn_error(&name, &self.program, e, self.remediation.as_deref()))?;
+        let mut child = spawn_retrying(|| wrap.spawn()).map_err(|e| spawn_error(&name, &self.program, self.cwd.as_deref(), e, self.remediation.as_deref()))?;
         let pid = child.id();
         let start = Instant::now();
         let activity = Arc::new(AtomicU64::new(0));
@@ -359,6 +361,21 @@ impl Process {
     }
 }
 
+/// Start a program, trying again for about a third of a second while its file is busy. A program
+/// just written (an agent's update, a test's stand-in) can still be open for writing in a child
+/// another thread is starting, and Linux then refuses to run it ("Text file busy").
+fn spawn_retrying<T>(mut spawn: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut wait = Duration::from_millis(5);
+    for _ in 0..6 {
+        match spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => std::thread::sleep(wait),
+            started => return started,
+        }
+        wait = wait.saturating_mul(2);
+    }
+    spawn()
+}
+
 /// The child gets [`search_path`](crate::which::search_path), which is also where a bare program
 /// name is looked up on Unix, so an app opened from the Dock starts what a shell would.
 fn use_search_path(cmd: &mut std::process::Command) {
@@ -367,8 +384,53 @@ fn use_search_path(cmd: &mut std::process::Command) {
     }
 }
 
-fn spawn_error(name: &str, program: &OsStr, e: std::io::Error, remediation: Option<&str>) -> ToolError {
-    match e.kind() {
+fn spawn_error(name: &str, program: &OsStr, cwd: Option<&std::path::Path>, e: std::io::Error, remediation: Option<&str>) -> ToolError {
+    // Unix starts a relative path from the folder the child runs in; Windows from ours.
+    let looked_up = if cfg!(unix) { started_from(program, cwd) } else { std::path::PathBuf::from(program) };
+    let found = crate::which::which_in(&looked_up.to_string_lossy(), crate::which::search_path()).into_iter().next();
+    spawn_error_for(name, program, e, remediation, found)
+}
+
+/// Where a program given by a relative path is when it starts in `cwd`. A bare name is left for
+/// the PATH lookup.
+fn started_from(program: &OsStr, cwd: Option<&std::path::Path>) -> std::path::PathBuf {
+    let path = std::path::Path::new(program);
+    match cwd {
+        Some(dir) if path.is_relative() && path.components().count() > 1 => dir.join(path),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// `found` is where the program was looked up. "Not found" from the system for a file that is
+/// there means something it needs is missing (the interpreter of an npm script, #152, #95): saying
+/// the program isn't installed sent people to reinstall what they had.
+fn spawn_error_for(name: &str, program: &OsStr, e: std::io::Error, remediation: Option<&str>, found: Option<std::path::PathBuf>) -> ToolError {
+    match (e.kind(), found) {
+        (std::io::ErrorKind::NotFound, Some(path)) => ToolError::new(
+            ErrorCode::ProgramFailed,
+            format!("{name} is at {} but could not be started: {e}.", path.display()),
+        )
+        .with_remediation(format!(
+            "The file is there, so something it needs to run is missing. Programs installed with npm need Node.js on the PATH: run `{}` in a terminal to see what it says.",
+            program.to_string_lossy()
+        ))
+        .with_details(serde_json::json!({"program": program.to_string_lossy(), "reason": "found_but_not_started", "path": path.to_string_lossy()})),
+        (kind, _) => spawn_error_kind(name, program, e, kind, remediation),
+    }
+}
+
+fn spawn_error_kind(name: &str, program: &OsStr, e: std::io::Error, kind: std::io::ErrorKind, remediation: Option<&str>) -> ToolError {
+    match kind {
+        // A program given by its path (a saved setting, say) that isn't there: PATH has nothing to
+        // do with it, and an update may have moved it (Codex desktop does on every update, #721).
+        std::io::ErrorKind::NotFound if std::path::Path::new(program).parent().is_some_and(|p| !p.as_os_str().is_empty()) => {
+            ToolError::new(ErrorCode::EngineMissing, format!("{name} should be at {}, but there's no file there.", program.to_string_lossy()))
+                .with_remediation(format!(
+                    "It may have moved, for example after an update. {}",
+                    remediation.map(str::to_string).unwrap_or_else(|| format!("Install {name}, or set its full path in Settings."))
+                ))
+                .with_details(serde_json::json!({"program": program.to_string_lossy(), "reason": "path_missing"}))
+        }
         std::io::ErrorKind::NotFound => ToolError::new(ErrorCode::EngineMissing, format!("{name} isn't installed or isn't on your PATH."))
             .with_remediation(remediation.map(str::to_string).unwrap_or_else(|| format!("Install {name}, or set its full path in Settings.")))
             .with_details(serde_json::json!({"program": program.to_string_lossy(), "reason": "not_found"})),
@@ -696,7 +758,7 @@ impl Supervisor {
             let _ = self.child.kill();
         } else {
             // The leader exited; take any leftover group members with it so they can't hold the pipes.
-            let _ = self.child.start_kill();
+            let _ = self.child.kill();
         }
         self.drain();
         let duration = self.start.elapsed();
@@ -887,7 +949,7 @@ impl Launch {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        let child = cmd.spawn().map_err(|e| spawn_error(&name, &self.program, e, self.remediation.as_deref()))?;
+        let child = spawn_retrying(|| cmd.spawn()).map_err(|e| spawn_error(&name, &self.program, self.cwd.as_deref(), e, self.remediation.as_deref()))?;
         let launched = Launched { pid: child.id(), started: Instant::now(), state: Arc::new(Mutex::new(LaunchState { child: Some(child), ended: None })) };
         // Reap it when it closes. If no thread can be made the child still runs (and `ended`
         // stays unknown); on Unix it stays a zombie until we exit, which is harmless.
@@ -1239,6 +1301,30 @@ mod launch_tests {
 mod error_tests {
     use super::*;
 
+    /// A busy program file is tried again; any other error, or a file that stays busy, is returned.
+    #[test]
+    fn a_busy_program_file_is_tried_again() {
+        let busy = || std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy);
+        let mut tries = 0;
+        let started = spawn_retrying(|| {
+            tries += 1;
+            if tries < 3 { Err(busy()) } else { Ok(tries) }
+        });
+        assert_eq!(started.ok(), Some(3));
+        let mut tries = 0;
+        let missing = spawn_retrying(|| -> std::io::Result<()> {
+            tries += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!((missing.map_err(|e| e.kind()), tries), (Err(std::io::ErrorKind::NotFound), 1));
+        let mut tries = 0;
+        let stays_busy = spawn_retrying(|| -> std::io::Result<()> {
+            tries += 1;
+            Err(busy())
+        });
+        assert_eq!((stays_busy.map_err(|e| e.kind()), tries), (Err(std::io::ErrorKind::ExecutableFileBusy), 7));
+    }
+
     #[test]
     fn a_crash_is_named_by_its_error_not_its_last_stack_frame() {
         let bun = "error: No provider is set up\n      at loadConfig (/$bunfs/root/chunk-qqmzrn42.js:12:40)\n      at <anonymous> (/$bunfs/root/chunk-qqmzrn42.js:96:6417)\n";
@@ -1265,12 +1351,86 @@ mod error_tests {
         };
         assert_eq!(nonzero_error("OpenCode", &out).message, "OpenCode stopped with exit code 1: error: No provider is set up");
     }
+
+    /// #721: a saved path to a program that an update moved said "isn't installed or isn't on your
+    /// PATH", which pointed away from the setting that was out of date. It names the path; a bare
+    /// name still talks about PATH.
+    #[test]
+    fn a_program_path_with_no_file_says_the_path_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("bin").join("0.165.0").join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        let err = Process::new(gone.as_os_str()).remediation("Install Codex, or choose its program in Settings → AI.").run().unwrap_err();
+        assert_eq!(err.code, ErrorCode::EngineMissing, "still a missing program, so a builder turn isn't retried");
+        assert!(err.message.contains(&*gone.to_string_lossy()) && err.message.contains("no file there"), "{}", err.message);
+        assert!(!err.message.contains("PATH"), "{}", err.message);
+        let remediation = err.remediation.unwrap_or_default();
+        assert!(remediation.contains("moved") && remediation.contains("Settings → AI"), "{remediation}");
+        assert_eq!(err.details.as_ref().and_then(|d| d["reason"].as_str()), Some("path_missing"));
+
+        let err = Process::new("craft-anything-no-such-program").run().unwrap_err();
+        assert!(err.message.contains("isn't on your PATH"), "{}", err.message);
+        assert_eq!(err.details.as_ref().and_then(|d| d["reason"].as_str()), Some("not_found"));
+    }
+
+    /// A relative path is looked up in the folder the program starts in, not in ours; a bare name
+    /// and an absolute path are left as they are.
+    #[test]
+    fn a_relative_program_is_looked_up_where_it_starts() {
+        use std::path::Path;
+        let dir = Path::new("project");
+        let rel = Path::new("bin").join("agent");
+        assert_eq!(started_from(rel.as_os_str(), Some(dir)), dir.join(&rel));
+        assert_eq!(started_from(rel.as_os_str(), None), rel);
+        assert_eq!(started_from(OsStr::new("agent"), Some(dir)), Path::new("agent"));
+        let abs = std::env::temp_dir().join("agent");
+        assert_eq!(started_from(abs.as_os_str(), Some(dir)), abs);
+    }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// #152, #95: a program that is there but can't start (an npm script whose `node` is missing)
+    /// said "isn't installed or isn't on your PATH". It names the file and what to look at; a
+    /// program that really isn't there still says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_is_there_but_cannot_start_is_not_called_missing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("opencode");
+        std::fs::write(&script, "#!/nonexistent/interpreter\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = Process::new(script.as_os_str()).arg("--version").run().unwrap_err();
+        assert_eq!(err.code, ErrorCode::ProgramFailed);
+        assert!(err.message.contains("is at") && err.message.contains("could not be started"), "{}", err.message);
+        assert!(!err.message.contains("isn't installed"), "{}", err.message);
+        assert!(err.remediation.unwrap_or_default().contains("Node.js"));
+        assert_eq!(err.details.as_ref().and_then(|d| d["reason"].as_str()), Some("found_but_not_started"));
+
+        let err = Process::new("craft-anything-no-such-program").run().unwrap_err();
+        assert_eq!(err.code, ErrorCode::EngineMissing);
+        assert!(err.message.contains("isn't installed or isn't on your PATH"), "{}", err.message);
+        assert_eq!(err.details.as_ref().and_then(|d| d["reason"].as_str()), Some("not_found"));
+    }
+
+    /// The same script by a relative path, started in its project: it is there (where it was
+    /// started), so it isn't reported as a path with no file.
+    #[test]
+    fn a_relative_program_that_cannot_start_is_found_in_its_own_folder() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        let script = dir.path().join("bin").join("agent");
+        std::fs::write(&script, "#!/nonexistent/interpreter\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = Process::new("./bin/agent").cwd(dir.path()).run().unwrap_err();
+        assert_eq!(err.details.as_ref().and_then(|d| d["reason"].as_str()), Some("found_but_not_started"), "{}", err.message);
+        let err = Launch::new("./bin/agent").cwd(dir.path()).start_watched().map(|_| ()).unwrap_err();
+        assert_eq!(err.details.as_ref().and_then(|d| d["reason"].as_str()), Some("found_but_not_started"), "{}", err.message);
+    }
 
     #[test]
     fn captures_output_and_exit_code() {
@@ -1285,6 +1445,27 @@ mod tests {
         assert!(!help.contains("by hand"), "{help}");
         assert_eq!(err.code, ErrorCode::ProgramFailed);
         assert!(err.message.contains("bad thing"), "{}", err.message);
+    }
+
+    /// An MCP plugin answers `tools/list` as one JSON-RPC line that can be megabytes (a server with
+    /// many richly described tools). A line past the old 1 MiB cap arrived in fragments, so the
+    /// answer never parsed and the plugin timed out: the whole line must arrive as one line.
+    #[cfg(unix)]
+    #[test]
+    fn a_multimegabyte_line_arrives_whole() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wanted = 3 * 1024 * 1024 + 7; // past the old cap, and not a round number
+        let out = Process::new("sh")
+            .args(["-c", &format!("head -c {wanted} /dev/zero | tr '\\0' a; echo")])
+            .on_stdout_line(move |l| {
+                let _ = tx.send(l.len());
+            })
+            .timeout(Duration::from_secs(30))
+            .run()
+            .unwrap();
+        assert!(out.success);
+        let lines: Vec<usize> = rx.into_iter().collect();
+        assert_eq!(lines, vec![wanted], "one line of {wanted} bytes, not {} fragments of {:?}", lines.len(), lines);
     }
 
     #[test]

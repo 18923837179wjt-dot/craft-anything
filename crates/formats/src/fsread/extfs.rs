@@ -67,7 +67,7 @@ fn inode_offset(data: &[u8], sb: &Sb, ino: u32) -> Option<u64> {
     table.checked_mul(sb.block_size)?.checked_add(index.checked_mul(sb.inode_size)?)
 }
 
-/// Read a block (physical number) into `out`, bounded; missing/zero blocks contribute zeros.
+/// Return a complete physical block; an out-of-image block is unavailable, not a sparse hole.
 fn block_bytes<'a>(data: &'a [u8], sb: &Sb, block: u64) -> Option<&'a [u8]> {
     let start = usize::try_from(block.checked_mul(sb.block_size)?).ok()?;
     let end = start.checked_add(usize::try_from(sb.block_size).ok()?)?;
@@ -75,11 +75,11 @@ fn block_bytes<'a>(data: &'a [u8], sb: &Sb, block: u64) -> Option<&'a [u8]> {
 }
 
 /// Collect the physical block numbers for logical blocks 0..n of an inode, via block pointers or
-/// an extent tree. Unmapped logical blocks are `None` (sparse → zeros).
-fn file_block_map(data: &[u8], sb: &Sb, inode_off: u64, flags: u32, nblocks: u64, img: &mut FsImage) -> Vec<Option<u64>> {
+/// an extent tree. Unmapped logical blocks are `None` (sparse → zeros); unreadable indirect
+/// metadata makes the whole map unavailable rather than turning unknown mappings into holes.
+fn file_block_map(data: &[u8], sb: &Sb, inode_off: u64, flags: u32, nblocks: u64, img: &mut FsImage) -> Option<Vec<Option<u64>>> {
     let r = Reader::new(data);
-    let ib = usize::try_from(inode_off).ok().and_then(|o| o.checked_add(40));
-    let Some(ib) = ib else { return Vec::new() };
+    let ib = usize::try_from(inode_off).ok().and_then(|o| o.checked_add(40))?;
     let n = usize::try_from(nblocks.min(1 << 20)).unwrap_or(0);
     let mut map = vec![None; n];
     if flags & 0x8_0000 != 0 {
@@ -103,31 +103,38 @@ fn file_block_map(data: &[u8], sb: &Sb, inode_off: u64, flags: u32, nblocks: u64
                 set(&mut logical, p, &mut map);
             }
         }
-        // Single indirect.
-        if let Some(ind) = r.u32_le(ib + 48).filter(|&p| p != 0) {
-            read_indirect(data, sb, u64::from(ind), 1, per, &mut logical, &mut map);
+        // Each root owns its full logical span, including when its pointer is zero.
+        for (level, slot, first) in [(1, 48, 12), (2, 52, 12 + per)] {
+            logical = first;
+            if let Some(root) = r.u32_le(ib + slot).filter(|&p| p != 0)
+                && let Err(block) = read_indirect(data, sb, u64::from(root), level, per, &mut logical, &mut map)
+            {
+                img.warn(format!("ext: indirect block {block} is unavailable; file data not recovered"));
+                img.complete = false;
+                return None;
+            }
         }
-        // Double indirect.
-        if let Some(dind) = r.u32_le(ib + 52).filter(|&p| p != 0) {
-            read_indirect(data, sb, u64::from(dind), 2, per, &mut logical, &mut map);
-        }
-        if r.u32_le(ib + 56).is_some_and(|p| p != 0) {
+        if nblocks > 12 + per + per * per && r.u32_le(ib + 56).is_some_and(|p| p != 0) {
             img.warn("ext: triple-indirect blocks are not followed");
             img.complete = false;
+            return None;
         }
     }
-    map
+    Some(map)
 }
 
-fn read_indirect(data: &[u8], sb: &Sb, block: u64, level: u8, per: u64, logical: &mut u64, map: &mut Vec<Option<u64>>) {
+fn read_indirect(data: &[u8], sb: &Sb, block: u64, level: u8, per: u64, logical: &mut u64, map: &mut Vec<Option<u64>>) -> Result<(), u64> {
     if *logical as usize >= map.len() {
-        return;
+        return Ok(());
     }
-    let Some(b) = block_bytes(data, sb, block) else { return };
+    let b = block_bytes(data, sb, block).ok_or(block)?;
     let r = Reader::new(b);
     for i in 0..per {
-        let Some(off) = usize::try_from(i.saturating_mul(4)).ok() else { break };
-        let Some(ptr) = r.u32_le(off) else { break };
+        if *logical as usize >= map.len() {
+            return Ok(());
+        }
+        let off = usize::try_from(i.saturating_mul(4)).map_err(|_| block)?;
+        let ptr = r.u32_le(off).ok_or(block)?;
         if ptr == 0 {
             *logical += if level == 1 { 1 } else { per };
             continue;
@@ -140,12 +147,10 @@ fn read_indirect(data: &[u8], sb: &Sb, block: u64, level: u8, per: u64, logical:
             }
             *logical += 1;
         } else {
-            read_indirect(data, sb, u64::from(ptr), level - 1, per, logical, map);
-        }
-        if *logical as usize >= map.len() {
-            return;
+            read_indirect(data, sb, u64::from(ptr), level - 1, per, logical, map)?;
         }
     }
+    Ok(())
 }
 
 fn extents(data: &[u8], sb: &Sb, node_off: usize, map: &mut Vec<Option<u64>>, depth_guard: u8, img: &mut FsImage) {
@@ -164,16 +169,17 @@ fn extents(data: &[u8], sb: &Sb, node_off: usize, map: &mut Vec<Option<u64>>, de
         let e = node_off + 12 + i * 12;
         if depth == 0 {
             let logical = r.u32_le(e).unwrap_or(0);
-            let len = r.u16_le(e + 4).unwrap_or(0);
+            let raw_len = r.u16_le(e + 4).unwrap_or(0);
             let start_hi = r.u16_le(e + 6).unwrap_or(0);
             let start_lo = r.u32_le(e + 8).unwrap_or(0);
             let phys = u64::from(start_lo) | (u64::from(start_hi) << 32);
-            let len = if len > 32768 { len - 32768 } else { len }; // uninitialised extents
+            let unwritten = raw_len > 32768; // uninitialised extents
+            let len = if unwritten { raw_len - 32768 } else { raw_len };
             for k in 0..u64::from(len) {
                 if let Ok(idx) = usize::try_from(u64::from(logical).saturating_add(k))
                     && idx < map.len()
                 {
-                    map[idx] = Some(phys.saturating_add(k));
+                    map[idx] = if unwritten { None } else { Some(phys.saturating_add(k)) };
                 }
             }
         } else {
@@ -197,13 +203,17 @@ fn file_data(data: &[u8], sb: &Sb, inode_off: u64, flags: u32, size: u64, limits
         return None;
     }
     let nblocks = size.div_ceil(sb.block_size);
-    let map = file_block_map(data, sb, inode_off, flags, nblocks, img);
+    let map = file_block_map(data, sb, inode_off, flags, nblocks, img)?;
     let mut out = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
     for phys in &map {
         match phys {
             Some(p) => match block_bytes(data, sb, *p) {
                 Some(b) => out.extend_from_slice(b),
-                None => out.resize(out.len() + usize::try_from(sb.block_size).unwrap_or(0), 0),
+                None => {
+                    img.warn(format!("ext: physical block {p} lies outside the image; file data not recovered"));
+                    img.complete = false;
+                    return None;
+                }
             },
             None => out.resize(out.len().saturating_add(usize::try_from(sb.block_size).unwrap_or(0)), 0),
         }
@@ -329,6 +339,19 @@ mod tests {
     #[test]
     fn reads_ext4_extents() {
         check(true);
+    }
+
+    #[test]
+    fn unwritten_ext4_extents_read_as_zeros() {
+        let mut base = craft_anything_testkit::firmware::ext_image(true);
+        // Inode 11 ("hello.txt", 22 bytes) starts at 5120 + (11 - 1) * 128 = 6400; its first extent's ee_len is at +56.
+        base[6456..6458].copy_from_slice(&32769u16.to_le_bytes());
+        let img = read(&base, &Limits::default());
+        assert!(img.complete, "{:?}", img.warnings);
+        let hello = img.entries.iter().find(|e| e.path == "hello.txt").expect("hello.txt entry");
+        assert_eq!(hello.size, 22);
+        assert_eq!(hello.data.as_deref(), Some([0u8; 22].as_slice()));
+        assert_eq!(img.entries.iter().find(|e| e.path == "sub/note").unwrap().data.as_deref(), Some(b"nested note".as_slice()));
     }
 
     /// Switch to 64-bit group descriptors and send `group`'s inode table to the last

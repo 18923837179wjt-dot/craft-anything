@@ -62,6 +62,7 @@ pub struct Inventory {
     pub containers: Vec<Value>,
     pub contradictions: Vec<Value>,
     pub truncated: bool,
+    pub unopened_nested: usize,
     pub hashed_bytes: u64,
 }
 
@@ -74,9 +75,11 @@ impl Inventory {
         m
     }
 
-    /// `inv_` + sha256 over (path, sha256) pairs: equal content trees share an id.
+    /// `inv_` + sha256 over (path, sha256) pairs, sorted: equal content trees share an id whatever
+    /// order their archive lists them in (#281).
     pub fn content_id(&self) -> String {
-        let pairs: Vec<(&str, Option<&str>)> = self.entries.iter().map(|e| (e.path.as_str(), e.sha256.as_deref())).collect();
+        let mut pairs: Vec<(&str, Option<&str>)> = self.entries.iter().map(|e| (e.path.as_str(), e.sha256.as_deref())).collect();
+        pairs.sort_unstable();
         format!("inv_{}", sha256_hex(craft_anything_evidence::canonical_json(&json!(pairs)).as_bytes()))
     }
 }
@@ -278,8 +281,10 @@ impl<'c> Inventorier<'c> {
         if archive {
             if depth >= self.limits.max_depth {
                 self.note_last("nested archive not opened: depth limit");
+                self.inv.unopened_nested = self.inv.unopened_nested.saturating_add(1);
             } else if bytes.len() as u64 > self.limits.max_nested_bytes {
                 self.note_last("nested archive not opened: too large");
+                self.inv.unopened_nested = self.inv.unopened_nested.saturating_add(1);
             } else {
                 self.add_archive(&format!("{path}!/"), bytes, kind, depth + 1)?;
             }
@@ -463,7 +468,24 @@ mod tests {
         // Depth limit stops expansion.
         let mut shallow = Inventorier::new("b", "zip", InvLimits { max_depth: 0, ..Default::default() }, &|| false);
         shallow.add_file("outer.zip", &z, 0).unwrap();
-        assert_eq!(shallow.finish().entries.len(), 1);
+        let shallow = shallow.finish();
+        assert_eq!(shallow.entries.len(), 1);
+        assert_eq!(serde_json::to_value(&shallow).unwrap()["unopened_nested"], 1);
+        assert!(!shallow.truncated);
+        assert_eq!(shallow.entries[0].note.as_deref(), Some("nested archive not opened: depth limit"));
+    }
+
+    #[test]
+    fn oversized_nested_archive_is_counted_without_truncating_the_listing() {
+        let z = fx::zip_stored(&[("leaf.txt", b"leaf")]);
+        let mut inv = Inventorier::new("bundle", "directory", InvLimits { max_nested_bytes: 0, ..Default::default() }, &|| false);
+        inv.add_file("inner.zip", &z, 0).unwrap();
+        inv.add_file("other.txt", b"other", 0).unwrap();
+        let inv = inv.finish();
+        assert_eq!(serde_json::to_value(&inv).unwrap()["unopened_nested"], 1);
+        assert!(!inv.truncated);
+        assert_eq!(inv.entries.len(), 2);
+        assert_eq!(inv.entries[0].note.as_deref(), Some("nested archive not opened: too large"));
     }
 
     #[test]
@@ -479,6 +501,21 @@ mod tests {
         b.add_file("new.js", b"4", 0).unwrap();
         let d = compare_inventories(&a.finish(), &b.finish(), 100);
         assert_eq!(d["counts"], json!({"added": 1, "removed": 0, "changed": 1, "moved": 1, "unchanged": 1}));
+    }
+
+    /// #281: the same files listed in another order are the same content tree.
+    #[test]
+    fn member_order_does_not_change_the_content_id() {
+        let zip = |files: &[(&str, &[u8])]| {
+            let mut i = Inventorier::new("a.zip", "zip", InvLimits::default(), &|| false);
+            i.add_archive("", &fx::zip_stored(files), "zip", 0).unwrap();
+            i.finish()
+        };
+        let (x, y): (&[u8], &[u8]) = (b"one", b"two");
+        let (ab, ba) = (zip(&[("a.txt", x), ("b.txt", y)]), zip(&[("b.txt", y), ("a.txt", x)]));
+        assert_eq!(ab.content_id(), ba.content_id());
+        assert_eq!(compare_inventories(&ab, &ba, 100)["identical"], true);
+        assert_ne!(ab.content_id(), zip(&[("a.txt", y), ("b.txt", x)]).content_id(), "swapped contents differ");
     }
 
     /// #283: two identical old files both "moved" to one new file, and nothing was removed.

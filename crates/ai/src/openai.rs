@@ -10,15 +10,40 @@ use std::collections::BTreeMap;
 
 pub const OPENAI_BASE: &str = "https://api.openai.com/v1";
 pub const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
+/// Gemini's OpenAI-compatible endpoint, for a Google AI Studio key.
+pub const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5";
 pub const OPENROUTER_DEFAULT_MODEL: &str = "anthropic/claude-opus-5-5";
-/// Kimi K3 (Moonshot AI) on OpenRouter: 1M-token context, tool calls.
-pub const KIMI_K3: &str = "moonshotai/kimi-k3";
+/// Kimi K3.1 Pro (Moonshot AI) on OpenRouter: 1M-token context, tool calls.
+pub const KIMI_K3_1: &str = "moonshotai/kimi-k3.1-pro";
 /// OpenRouter models offered when adding it.
-pub const OPENROUTER_MODELS: &[&str] = &[OPENROUTER_DEFAULT_MODEL, KIMI_K3];
+pub const OPENROUTER_MODELS: &[&str] = &[OPENROUTER_DEFAULT_MODEL, KIMI_K3_1];
+/// Gemini models offered when adding a Google AI Studio key; the live list comes from the key.
+pub const GEMINI_DEFAULT_MODEL: &str = "gemini-3.8-flash";
+pub const GEMINI_MODELS: &[&str] = &[GEMINI_DEFAULT_MODEL, "gemini-4-argon"];
 /// Generic app identification for OpenRouter (no personal data).
 pub const APP_REFERER: &str = "https://github.com/storytold/craft-anything";
 pub const APP_TITLE: &str = "Craft Anything";
+/// OpenCode Go (a subscription): an OpenAI-compatible base, the key from its console, and a session
+/// header the service asks every client to send so routing and prompt caching follow a conversation.
+pub const OPENCODE_GO_BASE: &str = "https://opencode.ai/inference/go/openai/v1";
+/// The header OpenCode Go asks every client to send.
+pub const OPENCODE_GO_SESSION_HEADER: &str = "x-opencode-session";
+/// The model a new OpenCode Go backend starts on, before its own list is fetched.
+pub const OPENCODE_GO_DEFAULT_MODEL: &str = "kimi-k3.1-pro";
+
+/// Whether this base URL is OpenCode Go's: https, host opencode.ai, path under /inference/go/.
+/// A substring test would also match a look-alike host or a proxy path.
+pub fn is_opencode_go(base: &str) -> bool {
+    let base = base.trim().trim_end_matches('/');
+    let Some((scheme, rest)) = base.split_once("://") else { return false };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.rsplit('@').next().unwrap_or(host).split(':').next().unwrap_or(host);
+    host.eq_ignore_ascii_case("opencode.ai") && (path == "inference/go" || path.starts_with("inference/go/"))
+}
 
 /// Well-known local servers: (name, base URL).
 pub const LOCAL_SERVERS: &[(&str, &str)] = &[
@@ -38,8 +63,10 @@ pub struct OpenAi {
     pub extra_headers: Vec<(&'static str, String)>,
     /// Use the ReAct text protocol instead of function tools.
     pub react: bool,
-    /// Switch to ReAct automatically when the server rejects tools.
+    /// Recover JSON text calls automatically, and switch to ReAct when the server rejects tools.
     pub auto_react: bool,
+    /// Talking to OpenRouter, which routes each request to one of several upstream providers.
+    pub openrouter: bool,
 }
 
 impl OpenAi {
@@ -50,7 +77,13 @@ impl OpenAi {
     pub fn openrouter(base: Option<&str>, key: String, model: &str) -> Self {
         let mut o = Self::compatible("OpenRouter", base.unwrap_or(OPENROUTER_BASE), Some(key), if model.is_empty() { OPENROUTER_DEFAULT_MODEL } else { model });
         o.extra_headers = vec![("HTTP-Referer", APP_REFERER.to_string()), ("X-Title", APP_TITLE.to_string())];
+        o.openrouter = true;
         o
+    }
+
+    /// A Google AI Studio (Gemini API) key, through Gemini's OpenAI-compatible endpoint.
+    pub fn gemini(base: Option<&str>, key: String, model: &str) -> Self {
+        Self::compatible("Gemini", base.unwrap_or(GEMINI_BASE), Some(key), if model.is_empty() { GEMINI_DEFAULT_MODEL } else { model })
     }
 
     pub fn compatible(label: &str, base: &str, key: Option<String>, model: &str) -> Self {
@@ -62,6 +95,7 @@ impl OpenAi {
             extra_headers: Vec::new(),
             react: false,
             auto_react: true,
+            openrouter: false,
         }
     }
 
@@ -103,6 +137,12 @@ impl OpenAi {
                 .collect();
             o.insert("tools".into(), Value::Array(tools));
             o.insert("tool_choice".into(), json!("auto"));
+            // OpenRouter picks an upstream provider per request, and one that can't do tool calls
+            // answers "400: Provider returned error" (#369). Only a provider that supports every
+            // parameter in the request is used.
+            if self.openrouter {
+                o.insert("provider".into(), json!({"require_parameters": true}));
+            }
         }
         body
     }
@@ -112,7 +152,20 @@ impl OpenAi {
         let agent = http::quick_agent(timeout);
         let v = http::get_json(&agent, &self.label, &self.url("models"), &self.headers())?;
         let arr = v.get("data").or_else(|| v.get("models")).and_then(Value::as_array).cloned().unwrap_or_default();
-        Ok(arr.iter().filter_map(|m| m.get("id").or_else(|| m.get("name")).and_then(Value::as_str).map(str::to_string)).collect())
+        // A catalogue may list a model only for another API (Responses, Messages): such an entry
+        // would fail on a chat-completions client, so skip it when the entry says which APIs it
+        // serves. Empty and repeated ids are dropped too.
+        let mut out: Vec<String> = Vec::new();
+        for m in arr {
+            if m.get("api").is_some_and(|a| a.get("chat-completions").is_none()) {
+                continue;
+            }
+            let Some(id) = m.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else { continue };
+            if !out.iter().any(|seen| seen == id) {
+                out.push(id.to_string());
+            }
+        }
+        Ok(out)
     }
 
     fn stream_once(&self, req: &TurnRequest<'_>, on_delta: &mut dyn FnMut(Delta), stop: &Stop) -> Result<TurnResult, ToolError> {
@@ -126,8 +179,8 @@ impl OpenAi {
         })?;
         stop.check()?;
         let mut r = st.finish(&self.model)?;
-        if self.react {
-            react_postprocess(&mut r);
+        if self.react || self.auto_react {
+            react_postprocess(&mut r, req.tools, self.react);
         }
         Ok(r)
     }
@@ -142,7 +195,7 @@ fn rejects_tools(e: &ToolError) -> bool {
 impl ChatModel for OpenAi {
     fn turn(&mut self, req: &TurnRequest<'_>, on_delta: &mut dyn FnMut(Delta), stop: &Stop) -> Result<TurnResult, ToolError> {
         match self.stream_once(req, on_delta, stop) {
-            Err(e) if !self.react && self.auto_react && !req.tools.is_empty() && rejects_tools(&e) => {
+            Err(e) if !self.react && self.auto_react && !req.tools.is_empty() && (rejects_tools(&e) || self.no_provider_for_tools(&e)) => {
                 log::info!("{} rejected tool calling; switching to the text protocol", self.label);
                 self.react = true;
                 self.stream_once(req, on_delta, stop)
@@ -153,6 +206,14 @@ impl ChatModel for OpenAi {
 
     fn model(&self) -> String {
         self.model.clone()
+    }
+}
+
+impl OpenAi {
+    /// OpenRouter answers 404 when no provider supports all the request's parameters (see
+    /// [`OpenAi::body`]): tool calling isn't available for this model, so the text protocol is.
+    fn no_provider_for_tools(&self, e: &ToolError) -> bool {
+        self.openrouter && e.details.as_ref().and_then(|d| d.get("status")).and_then(Value::as_u64) == Some(404)
     }
 }
 
@@ -192,7 +253,7 @@ pub fn messages_json(m: &Msg, react: bool) -> Vec<Value> {
                 .into_iter()
                 .map(|(id, name, input)| json!({"id": id, "type": "function", "function": {"name": name, "arguments": input.to_string()}}))
                 .collect();
-            let mut v = json!({"role": "assistant", "content": if text.is_empty() { Value::Null } else { Value::String(text) }});
+            let mut v = json!({"role": "assistant", "content": text});
             if !calls.is_empty()
                 && let Some(o) = v.as_object_mut()
             {
@@ -235,7 +296,11 @@ impl ChatStream {
             serde_json::from_str(data).map_err(|e| ToolError::new(ErrorCode::GarbledOutput, format!("The server sent a chunk we couldn't read: {e}")))?;
         if let Some(err) = v.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
-            return Err(ToolError::new(ErrorCode::EngineMissing, format!("Stream error: {msg}")));
+            let provider = err.get("code").and_then(Value::as_str).or_else(|| err.get("type").and_then(Value::as_str));
+            let status = err.get("code").and_then(Value::as_u64);
+            return Err(
+                ToolError::new(ErrorCode::ProgramFailed, format!("Stream error: {msg}")).with_details(json!({"provider_error": provider, "status": status}))
+            );
         }
         if let Some(m) = v.get("model").and_then(Value::as_str) {
             self.model = m.to_string();
@@ -303,8 +368,8 @@ impl ChatStream {
             None if self.done => StopReason::EndTurn,
             None => return Err(ToolError::new(ErrorCode::Truncated, "The answer stream ended early.")),
         };
-        // Some servers say "stop" even when they emitted tool calls.
-        let stop = if has_calls { StopReason::ToolUse } else { stop };
+        // Some servers say "stop" for tool calls. A limit or refusal must still prevent execution.
+        let stop = if has_calls && stop == StopReason::EndTurn { StopReason::ToolUse } else { stop };
         let model = if self.model.is_empty() { fallback_model.to_string() } else { self.model };
         Ok(TurnResult { message: Msg { role: Speaker::Assistant, blocks }, stop, usage: self.usage, model })
     }
@@ -333,8 +398,21 @@ pub enum ReactStep {
     Text(String),
 }
 
-/// Parse the model's text according to the ReAct protocol.
+/// Parse a ReAct step, accepting a complete JSON call as an alternative.
 pub fn parse_react(text: &str) -> ReactStep {
+    if let Some(step) = json_action(text) {
+        return step;
+    }
+    // Preserve a whole fenced ReAct step, but do not treat markers inside a JSON answer or
+    // ordinary code example as instructions.
+    let lead = text.trim();
+    let fenced_protocol = backtick_fence(lead).is_some_and(|(_, body)| {
+        let body = body.trim_start();
+        ["Action:", "Thought:", "Final Answer:"].into_iter().any(|marker| body.starts_with(marker))
+    });
+    if lead.starts_with(['{', '[']) || (lead.starts_with("```") && !fenced_protocol) {
+        return ReactStep::Text(text.trim().to_string());
+    }
     if let Some(pos) = text.find("Final Answer:") {
         return ReactStep::Final(text.get(pos + "Final Answer:".len()..).unwrap_or_default().trim().to_string());
     }
@@ -350,6 +428,118 @@ pub fn parse_react(text: &str) -> ReactStep {
         None => json!({}),
     };
     if tool.is_empty() { ReactStep::Text(text.trim().to_string()) } else { ReactStep::Action { tool, input } }
+}
+
+/// A complete backtick fence. Its standalone closing line can be longer than its opener,
+/// but an earlier closing line means the remaining text is outside that fence.
+fn backtick_fence(text: &str) -> Option<(&str, &str)> {
+    let (opening, rest) = text.trim().split_once('\n')?;
+    let length = opening.bytes().take_while(|byte| *byte == b'`').count();
+    if length < 3 {
+        return None;
+    }
+    let language = opening.get(length..)?.trim();
+    if language.contains('`') {
+        return None;
+    }
+    let (body, closing) = rest.rsplit_once('\n')?;
+    let closes = |line: &str| {
+        let line = line.trim();
+        line.len() >= length && line.bytes().all(|byte| byte == b'`')
+    };
+    if !closes(closing) || body.lines().any(closes) {
+        return None;
+    }
+    Some((language, body))
+}
+
+/// Accept a complete call, not a JSON object quoted somewhere in an explanation.
+fn json_action(text: &str) -> Option<ReactStep> {
+    let text = text.trim();
+    let raw = if text.starts_with("```") {
+        let (language, body) = backtick_fence(text)?;
+        if !matches!(language, "" | "json") {
+            return None;
+        }
+        body.trim()
+    } else {
+        text
+    };
+    let value: Value = serde_json::from_str(raw).ok()?;
+    let envelope = value.as_object()?;
+    if envelope.contains_key("function")
+        && (envelope.keys().any(|key| !matches!(key.as_str(), "function" | "type" | "id"))
+            || envelope.get("type").is_some_and(|kind| kind.as_str() != Some("function")))
+    {
+        return None;
+    }
+    let function = value.get("function").unwrap_or(&value);
+    let fields = function.as_object()?;
+    if fields.keys().any(|key| !matches!(key.as_str(), "name" | "arguments" | "parameters"))
+        || fields.contains_key("arguments") == fields.contains_key("parameters")
+    {
+        return None;
+    }
+    let tool = function.get("name")?.as_str()?.trim();
+    if tool.is_empty() {
+        return None;
+    }
+    let arguments = function.get("arguments").or_else(|| function.get("parameters"))?;
+    let input: Value = match arguments.as_str() {
+        Some(encoded) => serde_json::from_str(encoded).ok()?,
+        None => arguments.clone(),
+    };
+    input.is_object().then(|| ReactStep::Action { tool: tool.to_string(), input })
+}
+
+/// The calls in a reply that ends in fenced JSON calls after a sentence or between them
+/// ("Let's list the files." then a ```json fence), as small local models write them (#417).
+/// Every fence must be a complete `json` (or unlabelled) call, and nothing but blank lines may
+/// follow the last one; anything else (other code, a `~~~` fence, a fence inside a fence, an
+/// unclosed fence, words after the call, a JSON object quoted inline) means the reply is text,
+/// as before. So do the text protocol's own markers in the words (a final answer that ends in an
+/// example is still the answer); inside a call's arguments they're only content.
+fn fenced_calls(text: &str) -> Option<Vec<(String, Value)>> {
+    let mut calls = Vec::new();
+    let mut lines = text.lines();
+    let mut words_after = false;
+    while let Some(line) = lines.next() {
+        let opening = line.trim();
+        // Anything in a tilde fence is an example, whatever it holds.
+        if opening.starts_with("~~~") {
+            return None;
+        }
+        let length = opening.bytes().take_while(|byte| *byte == b'`').count();
+        if length < 3 {
+            if ["Final Answer:", "Action:"].into_iter().any(|marker| line.contains(marker)) {
+                return None;
+            }
+            words_after |= !opening.is_empty() && !calls.is_empty();
+            continue;
+        }
+        let closes = |line: &str| {
+            let line = line.trim();
+            line.len() >= length && line.bytes().all(|byte| byte == b'`')
+        };
+        let mut body = String::new();
+        loop {
+            let next = lines.next()?;
+            if closes(next) {
+                break;
+            }
+            body.push_str(next);
+            body.push('\n');
+        }
+        let language = opening.get(length..)?.trim();
+        // The body is the call itself: a fence inside it is a quoted example.
+        if !matches!(language, "" | "json") || body.trim_start().starts_with(['`', '~']) {
+            return None;
+        }
+        let Some(ReactStep::Action { tool, input }) = json_action(&body) else { return None };
+        calls.push((tool, input));
+        words_after = false;
+    }
+    (!calls.is_empty() && !words_after).then_some(calls)
 }
 
 /// The first balanced `{…}` in `s`, parsed.
@@ -385,14 +575,32 @@ fn extract_json_object(s: &str) -> Option<Value> {
 
 static REACT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Turn ReAct text into neutral tool-use blocks.
-fn react_postprocess(r: &mut TurnResult) {
+/// Recover complete text calls as neutral tool-use blocks.
+fn react_postprocess(r: &mut TurnResult, tools: &[ToolDef], react: bool) {
+    if !matches!(r.stop, StopReason::EndTurn | StopReason::ToolUse) || !r.message.tool_uses().is_empty() {
+        return;
+    }
     let text = r.message.text();
-    if let ReactStep::Action { tool, input } = parse_react(&text) {
+    let json_call = json_action(&text);
+    let from_json = json_call.is_some();
+    // Calls after a sentence run only when every one names a tool the model was offered.
+    let offered = |tool: &str| tools.iter().any(|definition| definition.name == tool);
+    if !from_json && let Some(calls) = fenced_calls(&text).filter(|calls| calls.iter().all(|(tool, _)| offered(tool))) {
+        for (tool, input) in calls {
+            let n = REACT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            r.message.blocks.push(Block::ToolUse { id: format!("react_{n}"), name: tool, input });
+        }
+        r.stop = StopReason::ToolUse;
+        return;
+    }
+    let step = json_call.or_else(|| react.then(|| parse_react(&text)));
+    if let Some(ReactStep::Action { tool, input }) = step
+        && (!from_json || tools.iter().any(|definition| definition.name == tool))
+    {
         let n = REACT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         r.message.blocks.push(Block::ToolUse { id: format!("react_{n}"), name: tool, input });
         r.stop = StopReason::ToolUse;
-    } else {
+    } else if react {
         r.stop = StopReason::EndTurn;
     }
 }
@@ -401,6 +609,149 @@ fn react_postprocess(r: &mut TurnResult) {
 mod tests {
     use super::*;
     use crate::model::Effort;
+
+    #[test]
+    fn calls_after_a_sentence_are_read_and_examples_are_not() {
+        let call = |tool: &str| format!("```json\n{{\"name\":\"{tool}\",\"arguments\":{{\"path\":\"app\"}}}}\n```");
+        let names = |text: &str| fenced_calls(text).map(|calls| calls.into_iter().map(|(tool, _)| tool).collect::<Vec<_>>());
+        // What qwen2.5-coder:14b wrote in a live build.
+        let after = format!("It looks like the file is missing. Let's list the files.\n\n{}", call("look"));
+        assert_eq!(names(&after), Some(vec!["look".to_string()]));
+        let several = format!("{}\n\nThen:\n{}\n\n", call("look"), call("write"));
+        assert_eq!(names(&several), Some(vec!["look".to_string(), "write".to_string()]));
+        assert_eq!(names("```\n{\"name\":\"look\",\"parameters\":{}}\n````"), Some(vec!["look".to_string()]), "unlabelled, longer close");
+        for text in [
+            format!("{}\nThis is an example.", call("look")),
+            format!("Here's Rust:\n```rust\nfn main() {{}}\n```\n{}", call("look")),
+            format!("{}\n```json\n{{\"name\":\"look\",\"arguments\":{{}}}}", call("look")),
+            "For example, use {\"name\":\"look\",\"arguments\":{}}.".to_string(),
+            "```json\n{\"name\":\"look\",\"arguments\":{},\"description\":\"x\"}\n```".to_string(),
+            "```json\n[{\"name\":\"look\",\"arguments\":{}}]\n```".to_string(),
+            "No calls here.".to_string(),
+            // An example in a tilde fence, then a real-looking call.
+            format!("~~~markdown\n{}\n~~~\n{}", call("write"), call("look")),
+            // A four-backtick fence quoting a three-backtick call.
+            format!("Like this:\n````\n{}\n````", call("write")),
+        ] {
+            assert_eq!(names(&text), None, "{text}");
+        }
+
+        // Only tools that were offered run, and then all of them.
+        let tool = |name: &str| ToolDef { name: name.into(), description: String::new(), schema: json!({"type": "object"}) };
+        let turn = |text: &str| TurnResult {
+            message: Msg { role: Speaker::Assistant, blocks: vec![Block::Text { text: text.into() }] },
+            stop: StopReason::EndTurn,
+            usage: Usage::default(),
+            model: String::new(),
+        };
+        let mut r = turn(&several);
+        react_postprocess(&mut r, &[tool("look"), tool("write")], false);
+        assert_eq!(r.stop, StopReason::ToolUse);
+        assert_eq!(r.message.tool_uses().into_iter().map(|(_, name, _)| name.to_string()).collect::<Vec<_>>(), ["look", "write"]);
+        let mut r = turn(&several);
+        react_postprocess(&mut r, &[tool("look")], false);
+        assert!(r.message.tool_uses().is_empty() && r.stop == StopReason::EndTurn, "one isn't offered: none run");
+        // The markers inside a call's arguments are only what it writes.
+        let notes = "Writing the notes.\n```json\n{\"name\":\"write\",\"arguments\":{\"content\":\"Action: save\\nFinal Answer: done\"}}\n```";
+        let mut r = turn(notes);
+        react_postprocess(&mut r, &[tool("write")], false);
+        assert_eq!(r.message.tool_uses().len(), 1, "{notes}");
+        // A final answer that ends in an example stays the answer.
+        let answer = format!("Final Answer: it's built. To list the files again:\n{}", call("look"));
+        for react in [false, true] {
+            let mut r = turn(&answer);
+            react_postprocess(&mut r, &[tool("look")], react);
+            assert!(r.message.tool_uses().is_empty() && r.stop == StopReason::EndTurn, "react={react}");
+        }
+    }
+
+    /// Only the real OpenCode Go base gets its session header: not a look-alike host, path or scheme.
+    #[test]
+    fn opencode_go_base_is_recognised_exactly() {
+        assert!(is_opencode_go(OPENCODE_GO_BASE));
+        assert!(is_opencode_go("https://opencode.ai/inference/go/openai/v1/models"));
+        assert!(is_opencode_go("https://OpenCode.AI/inference/go/openai/v1"));
+        assert!(!is_opencode_go("https://opencode.ai.evil.test/inference/go/v1"));
+        assert!(!is_opencode_go("http://127.0.0.1:4000/opencode.ai/inference/go/v1"));
+        assert!(!is_opencode_go("https://opencode.ai/inference/gopher/v1"));
+        assert!(!is_opencode_go("https://opencode.ai/inference/go-v2/v1"));
+        assert!(!is_opencode_go("http://opencode.ai/inference/go/v1"));
+        assert!(!is_opencode_go("https://openrouter.ai/api/v1"));
+    }
+
+    #[test]
+    fn json_text_calls_and_non_calls() {
+        for text in [
+            r#"{"name":"look","arguments":{"path":"app"}}"#,
+            r#"{"name":"look","parameters":{"path":"app"}}"#,
+            r#"{"name":"look","arguments":"{\"path\":\"app\"}"}"#,
+            r#"{"type":"function","function":{"name":"look","arguments":{"path":"app"}}}"#,
+            "```json\n{\"name\":\"look\",\"arguments\":{\"path\":\"app\"}}\n```",
+            "```\n{\"name\":\"look\",\"arguments\":{\"path\":\"app\"}}\n```",
+            "```json\n{\"name\":\"look\",\"arguments\":{\"path\":\"app\"}}\n````",
+            "````json\n{\"name\":\"look\",\"arguments\":{\"path\":\"app\"}}\n````",
+            "````\n{\"name\":\"look\",\"arguments\":{\"path\":\"app\"}}\n`````",
+        ] {
+            assert_eq!(parse_react(text), ReactStep::Action { tool: "look".into(), input: json!({"path": "app"}) }, "{text}");
+        }
+        for text in [
+            r#"{"name":"look","arguments":{"path":"app"}"#,
+            r#"{"name":"look","arguments":"not JSON"}"#,
+            r#"{"name":"look","arguments":["app"]}"#,
+            r#"{"name":"look"}"#,
+            r#"{"name":"look","arguments":{},"description":"This is an example"}"#,
+            r#"{"name":"look","arguments":{},"parameters":{"path":"different"}}"#,
+            r#"{"type":"example","function":{"name":"look","arguments":{}}}"#,
+            r#"{"name":"","arguments":{}}"#,
+            r#"{"answer":"Action: look\nAction Input: {}"}"#,
+            r#"[{"name":"look","arguments":{}}]"#,
+            r#"For example, use {"name":"look","arguments":{}}."#,
+            "```json\n{\"name\":\"look\",\"arguments\":{}}\n```\nThis is an example.",
+            "```json\n{\"name\":\"look\",\"arguments\":{}}```",
+            "```json`example\n{\"name\":\"look\",\"arguments\":{}}\n```",
+            "````json\n{\"name\":\"look\",\"arguments\":{}}\n```",
+            "```json\n{\"name\":\"look\",\"arguments\":{}}\n```\nThis is only an example.\n```",
+        ] {
+            assert!(matches!(parse_react(text), ReactStep::Text(_)), "{text}");
+        }
+        assert_eq!(
+            parse_react(r#"{"name":"look","arguments":{"text":"Final Answer: is a label"}}"#),
+            ReactStep::Action { tool: "look".into(), input: json!({"text":"Final Answer: is a label"}) }
+        );
+    }
+
+    #[test]
+    fn fenced_legacy_react_calls_still_parse() {
+        for text in [
+            "```\nAction: look\nAction Input: {\"path\":\"app\"}\n```",
+            "```text\nAction: look\nAction Input: {\"path\":\"app\"}\n```",
+            "```json\nThought: inspect the app\nAction: look\nAction Input: {\"path\":\"app\"}\n```",
+            " \n```\r\nAction: look\r\nAction Input: {\"path\":\"app\"}\r\n```\n ",
+            "```text\nAction: look\nAction Input: {\"path\":\"app\"}\n  ``` \t",
+            "```text\nAction: look\nAction Input: {\"path\":\"app\"}\n````",
+            "````text\nAction: look\nAction Input: {\"path\":\"app\"}\n````",
+            "````text\nAction: look\nAction Input: ```json\n{\"path\":\"app\"}\n```\n````",
+        ] {
+            assert_eq!(parse_react(text), ReactStep::Action { tool: "look".into(), input: json!({"path": "app"}) }, "{text}");
+        }
+        for text in [
+            "```json\n{\"answer\":\"Action: look\\nAction Input: {}\"}\n```",
+            "```\n[\"Action: look\\nAction Input: {}\"]\n```",
+            "```python\nprint(\"Action: look\\nAction Input: {}\")\n```",
+            "```\nThis is an example.\nAction: look\nAction Input: {}\n```",
+            "```\nAction: look\nAction Input: {}",
+            "```\nAction: look\nAction Input: {}\n```\nThis is only an example.",
+            "```text\nAction: look\nAction Input: {}\n```not a close```",
+            "```text\nAction: look\nAction Input: {}```",
+            "````text\nAction: look\nAction Input: {}\n```",
+            "```text\nAction: look\nAction Input: {}\n```\nThis is only an example.\n```",
+            "```text\nAction: look\nAction Input: {}\n````\nThis is only an example.\n```",
+            "````text\nAction: look\nAction Input: {}\n````\nThis is only an example.\n````",
+            "```json\n{\"name\":\"look\",\"arguments\":{}}```",
+        ] {
+            assert!(matches!(parse_react(text), ReactStep::Text(_)), "{text}");
+        }
+    }
 
     #[test]
     fn react_parsing() {
@@ -456,6 +807,63 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_calls_preserve_terminal_stop_reasons() {
+        for (finish, expected) in [
+            (Some("length"), StopReason::MaxTokens),
+            (Some("content_filter"), StopReason::Refusal),
+            (Some("pause_turn"), StopReason::PauseTurn),
+            (Some("provider_stop"), StopReason::Other("provider_stop".into())),
+            (Some("tool_calls"), StopReason::ToolUse),
+            (Some("stop"), StopReason::ToolUse),
+            (None, StopReason::ToolUse),
+        ] {
+            let mut stream = ChatStream::default();
+            let call = json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,"id":"call_a","function":{"name":"core_session_show","arguments":"{}"}
+            }]}}]});
+            stream.apply(&SseEvent { event: None, data: call.to_string() }, &mut |_| {}).unwrap();
+            if let Some(reason) = finish {
+                let end = json!({"choices":[{"delta":{},"finish_reason":reason}]});
+                stream.apply(&SseEvent { event: None, data: end.to_string() }, &mut |_| {}).unwrap();
+            }
+            stream.apply(&SseEvent { event: None, data: "[DONE]".into() }, &mut |_| {}).unwrap();
+            let result = stream.finish("m").unwrap();
+            assert_eq!(result.stop, expected, "finish_reason={finish:?}");
+            assert_eq!(result.message.tool_uses(), vec![("call_a".into(), "core_session_show".into(), json!({}))]);
+        }
+    }
+
+    /// #369: OpenRouter routes to an upstream provider per request, and one without tool calling
+    /// answered "400: Provider returned error". With tools in the request, only providers that
+    /// support every parameter are used; nothing else changes.
+    #[test]
+    fn gemini_uses_the_google_endpoint_with_a_bearer_key() {
+        let g = OpenAi::gemini(None, "k".into(), "");
+        assert_eq!(g.url("chat/completions"), format!("{GEMINI_BASE}/chat/completions"));
+        assert_eq!(g.model, GEMINI_DEFAULT_MODEL);
+        assert!(g.headers().contains(&("authorization", "Bearer k".to_string())));
+        assert!(!g.openrouter);
+    }
+
+    #[test]
+    fn openrouter_only_routes_a_tool_request_to_providers_that_support_tools() {
+        use crate::model::{Effort, ToolDef, TurnRequest};
+        let tools = [ToolDef { name: "look".into(), description: "d".into(), schema: json!({"type": "object"}) }];
+        let messages = [Msg::user_text("hi")];
+        let with_tools = TurnRequest { system: "S", messages: &messages, tools: &tools, effort: Effort::Low, max_tokens: 100 };
+        let without = TurnRequest { system: "S", messages: &messages, tools: &[], effort: Effort::Low, max_tokens: 100 };
+        let router = OpenAi::openrouter(None, "k".into(), "moonshotai/kimi-k3");
+        assert_eq!(router.body(&with_tools)["provider"], json!({"require_parameters": true}));
+        assert!(router.body(&without).get("provider").is_none(), "nothing to require without tools");
+        let mut text_protocol = router.clone();
+        text_protocol.react = true;
+        assert!(text_protocol.body(&with_tools).get("provider").is_none(), "the text protocol sends no tools");
+        let other = OpenAi::compatible("Ollama", "http://127.0.0.1:11434/v1", None, "llama3");
+        assert!(other.body(&with_tools).get("provider").is_none(), "only OpenRouter knows `provider`");
+        assert_eq!(router.body(&with_tools)["tool_choice"], "auto");
+    }
+
+    #[test]
     fn wire_messages() {
         let o = OpenAi::openrouter(None, "k".into(), "");
         assert!(o.headers().iter().any(|(k, _)| *k == "X-Title"));
@@ -477,6 +885,7 @@ mod tests {
         let m = b["messages"].as_array().unwrap();
         assert_eq!(m[0]["role"], "system");
         assert_eq!(m[2]["tool_calls"][0]["function"]["arguments"], "{\"a\":1}");
+        assert_eq!(m[2]["content"], "");
         assert_eq!(m[3]["role"], "tool");
         assert_eq!(m[4]["tool_call_id"], "c2");
         assert_eq!(b["tool_choice"], "auto");

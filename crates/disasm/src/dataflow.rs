@@ -67,9 +67,14 @@ pub fn def_use(img: &Image, prog: &Program, f: &Function, max_nodes: usize, max_
         Mode::X64 if img.bin.format == Format::Pe => &["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"],
         Mode::X64 => &["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"],
         Mode::A64 => &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17"],
+        Mode::A32 | Mode::T32 => &["r0", "r1", "r2", "r3", "r12"],
         _ => &["rax", "rcx", "rdx", "eax", "ecx", "edx"],
     };
-    let ret = if mode == Mode::A64 { "x0" } else { "rax" };
+    let ret = match mode {
+        Mode::A64 => "x0",
+        Mode::A32 | Mode::T32 => "r0",
+        _ => "rax",
+    };
     let mut out = DefUse::default();
     // Decode.
     let mut blocks: Vec<Vec<Insn>> = Vec::new();
@@ -150,15 +155,29 @@ pub fn def_use(img: &Image, prog: &Program, f: &Function, max_nodes: usize, max_
     for (r, id) in &param_node {
         entry_defs.insert(r.clone(), BTreeSet::from([*id]));
     }
+    let noreturn_calls: BTreeSet<u64> = f.calls.iter().filter(|call| prog.call_is_noreturn(call)).map(|call| call.site).collect();
+    let record_writes = |cur: &mut Defs, i: &Insn, id: usize| {
+        let conditional_call = i.cond.is_some() && matches!(i.flow, Flow::Call { .. } | Flow::IndirectCall { .. });
+        if conditional_call && noreturn_calls.contains(&i.addr) {
+            // Only the skipped path continues; a non-returning call supplies no later value.
+            return;
+        }
+        for w in &i.writes {
+            if !ignored(w) {
+                let definitions = cur.entry(w.clone()).or_default();
+                // A skipped call keeps the earlier value; an unconditional write replaces it.
+                if !conditional_call {
+                    definitions.clear();
+                }
+                definitions.insert(id);
+            }
+        }
+    };
     let transfer = |inp: &Defs, insns: &[Insn]| -> Defs {
         let mut cur = inp.clone();
         for i in insns {
             if let Some(&id) = node_of.get(&i.addr) {
-                for w in &i.writes {
-                    if !ignored(w) {
-                        cur.insert(w.clone(), BTreeSet::from([id]));
-                    }
-                }
+                record_writes(&mut cur, i, id);
             }
         }
         cur
@@ -235,11 +254,7 @@ pub fn def_use(img: &Image, prog: &Program, f: &Function, max_nodes: usize, max_
                     .collect();
                 out.effects.push(Effect { addr: i.addr, kind: "call", text: name, inputs });
             }
-            for w in &i.writes {
-                if !ignored(w) {
-                    cur.insert(w.clone(), BTreeSet::from([me]));
-                }
-            }
+            record_writes(&mut cur, i, me);
         }
     }
     out.parameters = args.iter().filter(|a| params_used.contains(**a)).map(|a| (*a).to_string()).collect();
@@ -261,6 +276,63 @@ mod tests {
     use crate::program::Limits;
     use craft_anything_testkit as tk;
     use std::sync::Arc;
+
+    fn raw_flow(bytes: Vec<u8>, arch: craft_anything_formats::Arch, thumb: bool) -> DefUse {
+        let mut bin = craft_anything_formats::Binary::raw(arch, 0x1000, bytes.len() as u64, 0);
+        if thumb {
+            bin.entry = Some(0x1001);
+        }
+        let img = Image::from_binary(Arc::from(bytes), bin);
+        let p = Program::analyze(&img, &Limits::default(), &NoControl).unwrap();
+        let f = p.functions.get(&0x1000).unwrap();
+        assert!(f.returns && !f.truncated);
+        let flow = def_use(&img, &p, f, 5000, 10000);
+        assert!(!flow.truncated);
+        flow
+    }
+
+    #[test]
+    fn arm32_calls_define_arm_scratch_registers_and_return_r0() {
+        // Save the link register, call through r3, then restore the caller's return address.
+        let a32 = [0xe92d4010u32, 0xe12fff33, 0xe8bd8010].into_iter().flat_map(u32::to_le_bytes).collect();
+        let thumb = vec![0x10, 0xb5, 0x98, 0x47, 0x10, 0xbd];
+        for (bytes, is_thumb, call_addr, ret_addr) in [(a32, false, 0x1004, 0x1008), (thumb, true, 0x1002, 0x1004)] {
+            let flow = raw_flow(bytes, craft_anything_formats::Arch::Arm, is_thumb);
+            let call = flow.nodes.iter().find(|n| n.addr == Some(call_addr)).unwrap();
+            let ret = flow.nodes.iter().find(|n| n.addr == Some(ret_addr)).unwrap();
+            for register in ["r0", "r1", "r2", "r3", "r12"] {
+                assert!(call.defines.iter().any(|r| r == register), "{flow:?}");
+            }
+            assert!(!call.defines.iter().any(|r| matches!(r.as_str(), "rax" | "rcx" | "rdx" | "eax" | "ecx" | "edx")), "{flow:?}");
+            assert!(flow.edges.iter().any(|e| e.from == call.id && e.to == ret.id && e.register == "r0"), "{flow:?}");
+        }
+    }
+
+    #[test]
+    fn arm32_leaf_results_reach_the_return() {
+        let a32 = [0xe3a00007u32, 0xe12fff1e].into_iter().flat_map(u32::to_le_bytes).collect();
+        let thumb = vec![0x07, 0x20, 0x70, 0x47];
+        for (bytes, is_thumb, ret_addr) in [(a32, false, 0x1004), (thumb, true, 0x1002)] {
+            let flow = raw_flow(bytes, craft_anything_formats::Arch::Arm, is_thumb);
+            let value = flow.nodes.iter().find(|n| n.addr == Some(0x1000)).unwrap();
+            let ret = flow.nodes.iter().find(|n| n.addr == Some(ret_addr)).unwrap();
+            assert!(flow.edges.iter().any(|e| e.from == value.id && e.to == ret.id && e.register == "r0"), "{flow:?}");
+        }
+    }
+
+    #[test]
+    fn other_architectures_keep_their_word_result_registers() {
+        let a64 = [0xd28000e0u32, 0xd65f03c0].into_iter().flat_map(u32::to_le_bytes).collect();
+        let x64 = vec![0xb8, 7, 0, 0, 0, 0xc3];
+        for (bytes, arch, ret_addr, register) in
+            [(a64, craft_anything_formats::Arch::Aarch64, 0x1004, "x0"), (x64, craft_anything_formats::Arch::X86_64, 0x1005, "rax")]
+        {
+            let flow = raw_flow(bytes, arch, false);
+            let value = flow.nodes.iter().find(|n| n.addr == Some(0x1000)).unwrap();
+            let ret = flow.nodes.iter().find(|n| n.addr == Some(ret_addr)).unwrap();
+            assert!(flow.edges.iter().any(|e| e.from == value.id && e.to == ret.id && e.register == register), "{flow:?}");
+        }
+    }
 
     #[test]
     fn helper_def_use() {

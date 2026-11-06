@@ -45,14 +45,17 @@ const fn a(ui: &'static str, does: &'static str, headless: Headless) -> Action {
 const ACTIONS: &[Action] = &[
     // ---- Projects: making something --------------------------------------------------------
     a("start_make",          "start a new project from the Home prompt",       Cli("rebuild <target> <request> --build-with --backend --generate-assets")),
+    a("New project › Work on my project", "edit a project the person already has, in place", Cli("rebuild <target> <request> --project-folder --existing")),
     a("set_backend_enabled", "turn an AI on or off",                           Cli("ai on <name> / ai off <name>")),
     a("remove_backend",      "remove an AI and its key",                       Cli("ai remove <name>")),
     a("set_agent_program",   "run an agent app from a program it isn't found as", Cli("ai program <name> <path>")),
+    a("set_agent_folder",    "keep Claude Code's sign-in in another folder (another account)", Cli("ai folder <name> <path>")),
     a("refresh_projects",    "list the projects",                              Tool(&["project_list"])),
     a("remember_project",    "keep a project in a picked folder in the list",  Tool(&["rebuild_start"])),
     a("add_project_folder",  "list projects from another folder too",          Tool(&["settings_set"])),
     a("remove_project_folder", "stop listing a folder's projects",             Tool(&["settings_set"])),
     a("open_workspace",      "show one project, its feed and checks",          Tool(&["project_show"])),
+    a("fold_plan",           "fold the builder's plan card away (between builds)", Tool(&["project_plan_fold"])),
     a("rename_project",      "give a project a new name",                      Tool(&["project_rename"])),
     a("duplicate_project",   "copy a project to try something else",           Tool(&["project_duplicate"])),
     a("delete_project",      "delete a project, keeping the person's files",   Tool(&["project_delete"])),
@@ -72,6 +75,7 @@ const ACTIONS: &[Action] = &[
     a("stop_pin",            "close what a pin opened",                        Tool(&["project_pin_stop"])),
     a("add_pictures",        "pictures of the original for the builder",       Tool(&["rebuild_start"])),
     a("attach",              "attach pictures to the next message",            Pending { tool: None, why: "rebuild_note and rebuild_start take text; attachments with a message come next" }),
+    a("paste_pictures",      "attach pictures from the clipboard (Ctrl+V)",    UiOnly("the clipboard belongs to the app; headless callers name picture files")),
     a("raise_asset_budget",  "give a project another default budget for generated assets", Tool(&["project_assets_budget"])),
     a("set_generate_assets", "let a game's builder generate pictures and 3D models, or not", Tool(&["project_assets_allow"])),
     a("Project › Open folder", "show the project folder in the file manager",  Tool(&["project_open_folder"])),
@@ -109,6 +113,12 @@ const ACTIONS: &[Action] = &[
     a("add_server",          "connect an AI server by its address",            Cli("ai add <name> --kind --base-url --key-env --key-stdin")),
     a("pick_model",          "list the models an AI can use",                  Cli("ai model <name>")),
     a("set_model",           "change the model an AI uses",                    Cli("ai model <name> <model>")),
+    a("set_effort",          "change how hard a Claude AI thinks",             Cli("ai effort <name> <level>")),
+    a("pick_agent_model",    "list an agent's visible models and thinking depths", Tool(&["ai_models_list"])),
+    a("reload_agent_model",  "reload model-specific thinking choices",         Tool(&["ai_models_list"])),
+    a("set_agent_model",     "choose an agent's model and thinking depth",     Tool(&["ai_model_set"])),
+    a("pick_model_options",  "discover context and reasoning for a model",     Tool(&["ai_model_options_show"])),
+    a("set_model_options",   "save a model's context and reasoning choices",   Tool(&["ai_model_options_set"])),
     a("choose_backend",      "pick the AI brain",                              Cli("chat <question> --backend")),
     a("set_role",            "choose which AI builds or extracts",             Cli("ai extractor <name>")),
 
@@ -133,21 +143,28 @@ const ACTIONS: &[Action] = &[
 /// `CraftApp` methods that aren't person-facing actions: callbacks, polling, drawing, helpers.
 #[rustfmt::skip]
 const PLUMBING: &[(&str, &str)] = &[
+    ("load_agent_model_catalog", "worker dispatch shared by the model picker and its reload action"),
     ("stuck_banner", "draws what the lock watchdog found; `sync::problems` and its log are the headless side"),
     ("act", "runs a button's tool on a worker (play, preview, open folder)"),
     ("waiting_question", "finds the question an answer is for"),
     ("acted", "shows a button tool's result (toast, open the preview)"),
     ("engines_found", "a job's result"), ("engine_got", "a job's result"), ("ghidra_got", "a job's result"),
     ("ghidra_ready", "a query"), ("ghidra_missing", "a query"),
-    ("load_prefs", "startup"), ("log", "the log panel"), ("toast", "a message"),
+    ("load_prefs", "startup"), ("after_first_frames", "startup"), ("install_menu_bar", "startup; its items run palette commands"), ("log", "the log panel"), ("toast", "a message"),
+    ("check_pictures", "a picture-size preflight"), ("picture_check_finished", "a preflight's result"),
+    ("keep_attachments", "part of pictures_checked"),
+    ("attach_checked", "part of pictures_checked"), ("add_pictures_checked", "part of pictures_checked"),
+    ("show_picture_refused", "a job's refusal"), ("restore_attachments", "part of unsend"),
     ("settings_changed", "marks settings dirty; each setting has its row"), ("flush_settings", "saves settings"),
     ("refresh_view", "redraw data"), ("resolve_chat_evidence", "redraw data"), ("mark_dirty", "redraw data"),
     ("poll_conversation", "polling"), ("allow_for_project", "part of answer_consent"),
     ("handle_done", "a job's result"), ("tool_done", "a job's result"),
+    ("select_backend", "part of choose_backend; also selects an AI that finished connecting"),
     ("tick", "the frame loop"), ("show", "drawing"), ("toasts", "drawing"), ("shortcuts", "keys"),
     ("builder_backend", "part of start_make"), ("need_builder", "part of start_make"), ("start_run", "part of start_make"), ("start_run_with", "part of start_run and continue_build"),
     ("resume", "part of follow_up"), ("poll_run", "polling"), ("launch", "part of start_run: RunSet::start, the queue rebuild_start uses too"),
     ("thumb_ready", "a job's result"), ("thumb", "drawing"), ("refresh_side_panel", "a view tally"),
+    ("previews", "drawing"), ("preview", "drawing"), ("preview_ready", "a job's result"),
 ];
 
 fn crate_dir() -> PathBuf {

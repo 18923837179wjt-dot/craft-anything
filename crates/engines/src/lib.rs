@@ -15,6 +15,8 @@ pub mod gdb;
 pub mod ghidra;
 pub mod install;
 pub mod jadx;
+#[cfg(test)]
+mod known_roots_tests;
 pub mod mcp_client;
 pub mod rizin;
 pub mod table;
@@ -45,8 +47,19 @@ pub fn display_name(id: &str) -> &'static str {
 }
 
 /// Find an engine: user override, then the managed store (`<store>/<id>/bin/<exe>`), then PATH,
-/// then its standard install folders.
+/// then its standard install folders, then the folders where an unpacked copy is usually kept.
 pub fn locate(id: &str, overrides: &dyn ToolPathLookup, store: &Path) -> Option<PathBuf> {
+    locate_configured(id, overrides, store).or_else(|| {
+        let e = engine(id)?;
+        find_on_path(e.host_exes())
+            .or_else(|| e.known_install_paths().into_iter().find(|p| p.is_file()))
+            .or_else(|| find_in_known_roots(id, e.host_exes(), &e.known_root_folders()))
+    })
+}
+
+/// Find an engine where the settings or the managed store say only: what [`locate`] finds before
+/// it looks around the computer (PATH and standard install folders).
+pub fn locate_configured(id: &str, overrides: &dyn ToolPathLookup, store: &Path) -> Option<PathBuf> {
     if let Some(p) = overrides.override_for(id)
         && p.exists()
     {
@@ -65,7 +78,7 @@ pub fn locate(id: &str, overrides: &dyn ToolPathLookup, store: &Path) -> Option<
             return Some(store.join(id).join(name));
         }
     }
-    find_on_path(exes).or_else(|| e.known_install_paths().into_iter().find(|p| p.is_file()))
+    None
 }
 
 /// An executable in a managed install folder: `<dir>/<exe>`, `<dir>/bin/<exe>` or
@@ -79,6 +92,28 @@ fn in_managed(dir: &Path, exes: &[&str]) -> Option<PathBuf> {
     let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
     subs.sort();
     subs.iter().rev().find_map(|d| here(d))
+}
+
+/// An unpacked install in one of `roots` (each with how many levels down to look): a folder whose
+/// name starts with the engine id (`ghidra`, `Ghidra`, `ghidra_12.1.4_PUBLIC`) and holds one of
+/// `exes` (see [`in_managed`]). Newer names first. Reads folder names only, never file contents.
+pub fn find_in_known_roots(id: &str, exes: &[&str], roots: &[(PathBuf, usize)]) -> Option<PathBuf> {
+    roots.iter().find_map(|(root, depth)| search_named(root, id, exes, *depth))
+}
+
+fn search_named(dir: &Path, id: &str, exes: &[&str], depth: usize) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    subs.sort();
+    subs.iter().rev().find_map(|d| {
+        let named = d.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().starts_with(id));
+        if named && let Some(p) = in_managed(d, exes) {
+            return Some(p);
+        }
+        search_named(d, id, exes, depth - 1)
+    })
 }
 
 /// Standard install locations for programs that don't put themselves on PATH (browsers on

@@ -12,6 +12,13 @@
       ],
       "default": null
     },
+    "agent_session_by": {
+      "description": "The coding agent that saved `agent_session` (`claude-code`, `codex`…); none: saved before\nthis was kept.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "allowed_actions": {
       "description": "Kinds of agent action the person allowed for this workspace (\"bash:npm\", \"web_fetch\"…).",
       "type": "array",
@@ -65,6 +72,12 @@
     },
     "name": {
       "type": "string"
+    },
+    "not_working_checks": {
+      "description": "Checks in a row, across runs, that found the build not working (it didn't build or serve).\nA run stops when this reaches the limit; a new request from the person starts it again.\nKept in the project so \"Try again\" can't restart the count.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
     },
     "note": {
       "description": "One line on what's happening or what went wrong.",

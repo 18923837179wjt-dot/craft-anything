@@ -131,29 +131,7 @@ pub fn base64(data: &[u8]) -> String {
 
 /// Decode base64, ignoring whitespace; `None` on invalid characters.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let mut acc = 0u32;
-    let mut bits = 0u32;
-    for c in text.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            b' ' | b'\t' | b'\r' | b'\n' => continue,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
+    crate::bytes::decode_base64(text, false)
 }
 
 /// An Apple absolute time (seconds since 2001-01-01Z) as ISO-8601 UTC.
@@ -230,13 +208,15 @@ pub fn parse_binary(data: &[u8]) -> Result<Value, FormatError> {
     for i in 0..num {
         let o = read_be(&r, table + i * off_size, off_size).ok_or_else(|| FormatError::Truncated("offset table".into()))?;
         let o = usize::try_from(o).map_err(|_| FormatError::Malformed("object offset".into()))?;
-        if o >= table {
+        if o < 8 || o >= table {
             return Err(FormatError::Malformed(format!("object {i} lies outside the object area")));
         }
         offsets.push(o);
     }
     let top = usize::try_from(top).map_err(|_| FormatError::Malformed("top object".into()))?;
-    let mut b = Bin { r, offsets, ref_size, nodes: 0 };
+    // Object payloads and references must not borrow bytes from the offset table or trailer.
+    let objects = data.get(..table).ok_or_else(|| FormatError::Truncated("object area".into()))?;
+    let mut b = Bin { r: Reader::new(objects), offsets, ref_size, nodes: 0 };
     let mut stack = Vec::new();
     b.object(top, &mut stack)
 }
@@ -255,7 +235,10 @@ impl Bin<'_> {
         if m & 0xf0 != 0x10 {
             return Err(FormatError::Malformed("bad extended length marker".into()));
         }
-        let n = 1usize << (m & 0x0f).min(3);
+        if m & 0x0f > 3 {
+            return Err(FormatError::Malformed("extended length width exceeds 64 bits".into()));
+        }
+        let n = 1usize << (m & 0x0f);
         let v = read_be(&self.r, at + 2, n).ok_or_else(|| FormatError::Truncated("length".into()))?;
         let v = usize::try_from(v).map_err(|_| FormatError::Malformed("length".into()))?;
         Ok((v, at + 2 + n))
@@ -289,7 +272,10 @@ impl Bin<'_> {
                 _ => Value::Null,
             },
             0x1 => {
-                let n = 1usize << lo.min(4);
+                if lo > 4 {
+                    return Err(FormatError::Malformed("integer width exceeds 128 bits".into()));
+                }
+                let n = 1usize << lo;
                 let bytes = self.r.slice(at + 1, n).ok_or_else(|| FormatError::Truncated("integer".into()))?;
                 let v = match n {
                     8 => i128::from(i64::from_be_bytes(bytes.try_into().map_err(|_| FormatError::Truncated("integer".into()))?)),
@@ -325,6 +311,9 @@ impl Bin<'_> {
                 Value::String(String::from_utf16_lossy(&units))
             }
             0x8 => {
+                if lo > 7 {
+                    return Err(FormatError::Malformed("uid width exceeds 64 bits".into()));
+                }
                 let n = usize::from(lo) + 1;
                 Value::Uid(read_be(&self.r, at + 1, n).ok_or_else(|| FormatError::Truncated("uid".into()))?)
             }
@@ -593,9 +582,32 @@ impl Xml {
     }
 }
 
+/// Decode a UTF-16 XML property list after its byte-order mark into UTF-8 text.
+/// Surrogate pairs join normally; a lone surrogate fails as malformed rather
+/// than turning into replacement characters that tokenize into garbage element
+/// names.
+fn decode_utf16_xml(data: &[u8], big_endian: bool) -> Result<String, FormatError> {
+    let r = Reader::new(data);
+    let mut units = Vec::with_capacity(data.len() / 2);
+    let mut off = 0;
+    while let Some(unit) = if big_endian { r.u16_be(off) } else { r.u16_le(off) } {
+        units.push(unit);
+        off += 2;
+    }
+    String::from_utf16(&units).map_err(|_| FormatError::Malformed("invalid UTF-16 in XML plist".into()))
+}
+
 /// Parse an XML property list.
 pub fn parse_xml(data: &[u8]) -> Result<Value, FormatError> {
-    let text = String::from_utf8_lossy(data);
+    // Apple's Core Foundation reader accepts XML plists in UTF-16 as well as
+    // UTF-8: it recognises both byte-order marks. `from_utf8_lossy` turns a
+    // UTF-16 byte stream into NUL-separated text, so the encoding is settled
+    // here, before tokenizing.
+    let text = match data {
+        [0xFF, 0xFE, rest @ ..] => decode_utf16_xml(rest, false)?,
+        [0xFE, 0xFF, rest @ ..] => decode_utf16_xml(rest, true)?,
+        _ => String::from_utf8_lossy(data).into_owned(),
+    };
     let toks = tokenize(&text)?;
     let mut x = Xml { toks, pos: 0, nodes: 0 };
     x.skip_text();
@@ -673,5 +685,22 @@ mod tests {
         assert!(parse(&cyc).is_err());
         let deep = "<plist>".to_string() + &"<array>".repeat(1000) + &"</array>".repeat(1000) + "</plist>";
         assert!(parse(deep.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn xml_plist_utf16_byte_orders_parse() {
+        // Apple's Core Foundation reader accepts UTF-16 XML plists with either
+        // byte-order mark; the reader used to lossy-decode them as UTF-8 and
+        // reject the NUL-separated text (issue #333).
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Message</key><string>hello</string></dict></plist>";
+        let units: Vec<u16> = xml.encode_utf16().collect();
+        let mut le = vec![0xFF, 0xFE];
+        le.extend(units.iter().copied().flat_map(u16::to_le_bytes));
+        let mut be = vec![0xFE, 0xFF];
+        be.extend(units.iter().copied().flat_map(u16::to_be_bytes));
+        for data in [&le[..], &be[..]] {
+            let v = parse(data).unwrap_or_else(|e| panic!("UTF-16 XML plist should parse: {e}"));
+            assert_eq!(v.get("Message").and_then(Value::as_str), Some("hello"));
+        }
     }
 }

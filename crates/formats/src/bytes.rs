@@ -86,6 +86,67 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Decode one modified UTF-8 code unit. Invalid bytes consume only themselves,
+/// so a damaged sequence cannot hide valid text or borrow missing bytes.
+pub(crate) fn mutf8_unit(bytes: &[u8]) -> (u16, usize) {
+    match bytes {
+        [a @ 0x00..=0x7f, ..] => (u16::from(*a), 1),
+        [0xc0, 0x80, ..] => (0, 2),
+        [a @ 0xc2..=0xdf, b @ 0x80..=0xbf, ..] => ((u16::from(*a & 0x1f) << 6) | u16::from(*b & 0x3f), 2),
+        [a @ 0xe0..=0xef, b @ 0x80..=0xbf, c @ 0x80..=0xbf, ..] if *a != 0xe0 || *b >= 0xa0 => {
+            ((u16::from(*a & 0x0f) << 12) | (u16::from(*b & 0x3f) << 6) | u16::from(*c & 0x3f), 3)
+        }
+        _ => (0xfffd, 1),
+    }
+}
+
+/// Decode base64 with optional padding and ASCII whitespace.
+/// Padding must finish the last quantum; data after it is never ignored.
+pub(crate) fn decode_base64(text: &str, url_safe: bool) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    let mut digits = 0usize;
+    let mut padding = 0usize;
+    for c in text.bytes() {
+        match c {
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            b'=' => {
+                padding += 1;
+                if padding > 2 {
+                    return None;
+                }
+                continue;
+            }
+            _ if padding != 0 => return None,
+            _ => {}
+        }
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'-' if url_safe => 62,
+            b'_' if url_safe => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(value);
+        bits += 6;
+        digits += 1;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    let remainder = digits % 4;
+    if remainder == 1 || (padding != 0 && !matches!((remainder, padding), (2, 2) | (3, 1))) {
+        return None;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -119,6 +119,8 @@ pub enum CellValue {
     Real(f64),
     Text { text: String, truncated: bool },
     Blob { len: usize, sha256_prefix: String },
+    PartialBlob { len: usize },
+    NotRead,
 }
 
 impl Serialize for CellValue {
@@ -144,6 +146,17 @@ impl Serialize for CellValue {
                 m.serialize_entry("sha256_prefix", sha256_prefix)?;
                 m.end()
             }
+            CellValue::PartialBlob { len } => {
+                let mut m = s.serialize_map(Some(2))?;
+                m.serialize_entry("blob_len", len)?;
+                m.serialize_entry("truncated", &true)?;
+                m.end()
+            }
+            CellValue::NotRead => {
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry("not_read", &true)?;
+                m.end()
+            }
         }
     }
 }
@@ -151,7 +164,8 @@ impl Serialize for CellValue {
 /// One table row.
 #[derive(Debug, Clone, Serialize)]
 pub struct Row {
-    pub rowid: i64,
+    /// Absent for WITHOUT ROWID tables.
+    pub rowid: Option<i64>,
     pub values: Vec<CellValue>,
 }
 
@@ -171,13 +185,14 @@ pub struct RowPage {
 #[derive(Debug, Clone, Serialize)]
 pub struct RowCount {
     pub count: u64,
-    /// True when the walk hit a budget, so the count is a lower bound.
+    /// True when a budget or an unreadable page/child stopped the walk; the count is a lower bound.
     pub bounded: bool,
 }
 
 /// Accumulator for a bounded b-tree row walk: the rows gathered so far, a visited-page set to
 /// stop cycles, the remaining page-walk budget, how many rows are wanted, and any notes.
 struct RowWalk {
+    index_tree: bool,
     visited: Vec<u32>,
     budget: usize,
     out: Vec<Row>,
@@ -188,7 +203,7 @@ struct RowWalk {
 
 impl RowWalk {
     fn new(want: usize) -> Self {
-        RowWalk { visited: Vec::new(), budget: MAX_PAGES_WALKED, out: Vec::new(), notes: Vec::new(), want }
+        RowWalk { index_tree: false, visited: Vec::new(), budget: MAX_PAGES_WALKED, out: Vec::new(), notes: Vec::new(), want }
     }
 }
 
@@ -197,6 +212,27 @@ pub struct SqliteDb<'a> {
     data: &'a [u8],
     header: Header,
     usable: usize,
+}
+
+/// A b-tree page limited to its available, non-reserved bytes.
+struct BtreePage<'a> {
+    data: &'a [u8],
+    header: usize,
+    kind: u8,
+    cells: usize,
+    pointers: usize,
+    pointers_end: usize,
+}
+
+impl BtreePage<'_> {
+    fn cell_offset(&self, index: usize) -> Option<usize> {
+        if index >= self.cells {
+            return None;
+        }
+        let pointer = self.pointers.checked_add(index.checked_mul(2)?)?;
+        let offset = usize::from(read_u16_be(self.data, pointer)?);
+        (offset >= self.pointers_end && offset < self.data.len()).then_some(offset)
+    }
 }
 
 /// True when `data` starts with the SQLite 3 magic string.
@@ -323,6 +359,24 @@ impl<'a> SqliteDb<'a> {
         if pageno == 1 { base.checked_add(100) } else { Some(base) }
     }
 
+    fn btree_page(&self, pageno: u32) -> Option<BtreePage<'_>> {
+        let base = self.page_base(pageno)?;
+        let end = base.checked_add(self.usable)?.min(self.data.len());
+        let data = self.data.get(base..end)?;
+        let header: usize = if pageno == 1 { 100 } else { 0 };
+        let kind = *data.get(header)?;
+        let header_size = match kind {
+            0x05 | 0x02 => 12,
+            0x0d | 0x0a => 8,
+            _ => return None,
+        };
+        let cells = usize::from(read_u16_be(data, header.checked_add(3)?)?);
+        let pointers = header.checked_add(header_size)?;
+        let pointers_end = pointers.checked_add(cells.checked_mul(2)?)?;
+        data.get(header..pointers_end)?;
+        Some(BtreePage { data, header, kind, cells, pointers, pointers_end })
+    }
+
     /// Build the whole-database overview, including the schema.
     pub fn overview(&self) -> Overview {
         let (schema, schema_truncated) = self.schema();
@@ -379,12 +433,17 @@ impl<'a> SqliteDb<'a> {
         schema.into_iter().find(|o| o.name.eq_ignore_ascii_case(name))
     }
 
-    /// Count the rows of the table rooted at `rootpage` by walking its b-tree leaves.
+    fn without_rowid_table(&self, rootpage: u32) -> Option<SchemaObject> {
+        self.schema().0.into_iter().find(|obj| obj.obj_type == "table" && obj.rootpage == rootpage && is_without_rowid(&obj.sql))
+    }
+
+    /// Count the rows of the table rooted at `rootpage`, including interior index records.
     pub fn count_rows(&self, rootpage: u32) -> RowCount {
         let mut count: u64 = 0;
         let mut visited = Vec::new();
         let mut budget = MAX_PAGES_WALKED;
-        let bounded = !self.count_leaf_cells(rootpage, 0, &mut visited, &mut budget, &mut count);
+        let index_tree = self.btree_header_off(rootpage).and_then(|hdr| self.data.get(hdr)).is_some_and(|ptype| matches!(*ptype, 0x02 | 0x0a));
+        let bounded = !self.count_leaf_cells(rootpage, 0, &mut visited, &mut budget, &mut count, index_tree);
         RowCount { count, bounded }
     }
 
@@ -394,23 +453,51 @@ impl<'a> SqliteDb<'a> {
         // Collect offset+limit rows, then drop the leading `offset`.
         let want = offset.saturating_add(limit);
         let mut w = RowWalk::new(want);
+        let table = self.without_rowid_table(rootpage);
+        w.index_tree = table.is_some();
         self.collect_table_rows(&mut w, rootpage, 0);
+        if let Some(table) = table {
+            if let Some(order) = without_rowid_order(&table) {
+                for row in &mut w.out {
+                    row.values = order.iter().map(|&i| row.values.get(i).cloned().unwrap_or(CellValue::Null)).collect();
+                }
+            } else {
+                w.notes.push("Could not determine the primary-key column order; values remain in storage order.".into());
+            }
+        }
         let hit_cap = w.out.len() >= want && want > 0;
         let skipped = offset.min(w.out.len());
         let mut page: Vec<Row> = w.out.into_iter().skip(offset).take(limit).collect();
         let (schema, _) = self.schema();
-        if let Some(index) = schema.iter().find(|o| o.obj_type == "table" && o.rootpage == rootpage).and_then(|o| rowid_alias_index(&o.sql)) {
+        if let Some(table) = schema.iter().find(|o| o.obj_type == "table" && o.rootpage == rootpage) {
+            let defaults: Vec<_> = column_definitions(&table.sql).into_iter().map(|(_, rest)| column_default(rest)).collect();
+            let mut unsupported = vec![false; defaults.len()];
             for row in &mut page {
-                if let Some(value @ CellValue::Null) = row.values.get_mut(index) {
-                    *value = CellValue::Int(row.rowid);
+                for ((value, supported), disclosed) in defaults.iter().zip(&mut unsupported).skip(row.values.len()) {
+                    row.values.push(value.clone());
+                    if !supported {
+                        *disclosed = true;
+                    }
+                }
+            }
+            for (i, disclosed) in unsupported.into_iter().enumerate() {
+                if disclosed {
+                    w.notes.push(format!("Column {} has an unsupported DEFAULT expression; missing values were filled as NULL.", i + 1));
+                }
+            }
+            if let Some(index) = rowid_alias_index(&table.sql) {
+                for row in &mut page {
+                    if let (Some(rowid), Some(value @ CellValue::Null)) = (row.rowid, row.values.get_mut(index)) {
+                        *value = CellValue::Int(rowid);
+                    }
                 }
             }
         }
         RowPage { rows: page, offset: skipped, truncated: hit_cap, notes: w.notes }
     }
 
-    /// Recursively count leaf cells. Returns false when a budget stopped the walk.
-    fn count_leaf_cells(&self, pageno: u32, depth: usize, visited: &mut Vec<u32>, budget: &mut usize, count: &mut u64) -> bool {
+    /// Recursively count rows. Returns false when a budget or an unreadable page/child stopped the walk.
+    fn count_leaf_cells(&self, pageno: u32, depth: usize, visited: &mut Vec<u32>, budget: &mut usize, count: &mut u64, index_tree: bool) -> bool {
         if depth > MAX_DEPTH || *budget == 0 {
             return false;
         }
@@ -419,27 +506,36 @@ impl<'a> SqliteDb<'a> {
         }
         visited.push(pageno);
         *budget -= 1;
-        let Some(hdr) = self.btree_header_off(pageno) else { return true };
-        let ptype = *self.data.get(hdr).unwrap_or(&0);
-        let ncells = read_u16_be(self.data, hdr.saturating_add(3)).unwrap_or(0) as usize;
+        let Some(page) = self.btree_page(pageno) else { return false };
+        let ptype = page.kind;
+        let ncells = page.cells;
         match ptype {
-            0x0d => {
+            0x0d if !index_tree => {
                 *count = count.saturating_add(ncells as u64);
                 true
             }
-            0x05 => {
+            0x0a if index_tree => {
+                *count = count.saturating_add(ncells as u64);
+                true
+            }
+            0x05 | 0x02 if (ptype == 0x02) == index_tree => {
+                if index_tree {
+                    *count = count.saturating_add(ncells as u64);
+                }
                 let mut ok = true;
                 // Child pointers live in each cell; the right-most pointer is in the header.
                 for i in 0..ncells {
                     if *budget == 0 {
                         return false;
                     }
-                    if let Some(child) = self.interior_child(pageno, hdr, i) {
-                        ok &= self.count_leaf_cells(child, depth + 1, visited, budget, count);
+                    if let Some(child) = Self::interior_child(&page, i) {
+                        ok &= self.count_leaf_cells(child, depth + 1, visited, budget, count, index_tree);
+                    } else {
+                        ok = false;
                     }
                 }
-                if let Some(right) = read_u32_be(self.data, hdr.saturating_add(8)) {
-                    ok &= self.count_leaf_cells(right, depth + 1, visited, budget, count);
+                if let Some(right) = read_u32_be(page.data, page.header.saturating_add(8)) {
+                    ok &= self.count_leaf_cells(right, depth + 1, visited, budget, count, index_tree);
                 }
                 ok
             }
@@ -457,35 +553,53 @@ impl<'a> SqliteDb<'a> {
         }
         w.visited.push(pageno);
         w.budget -= 1;
-        let Some(hdr) = self.btree_header_off(pageno) else { return };
-        let Some(base) = self.page_base(pageno) else { return };
-        let ptype = *self.data.get(hdr).unwrap_or(&0);
-        let ncells = read_u16_be(self.data, hdr.saturating_add(3)).unwrap_or(0) as usize;
-        let cell_ptr_base = hdr.saturating_add(if ptype == 0x05 || ptype == 0x02 { 12 } else { 8 });
+        let Some(page) = self.btree_page(pageno) else {
+            w.notes.push(format!("Skipped an unreadable b-tree page {pageno}."));
+            return;
+        };
+        let ptype = page.kind;
+        let ncells = page.cells;
         match ptype {
-            0x0d => {
+            0x0d | 0x0a if (ptype == 0x0a) == w.index_tree => {
                 for i in 0..ncells {
                     if w.want != 0 && w.out.len() >= w.want {
                         return;
                     }
-                    let Some(ptr) = read_u16_be(self.data, cell_ptr_base.saturating_add(i * 2)) else { continue };
-                    let cell_off = base.saturating_add(ptr as usize);
-                    match self.read_table_leaf_cell(cell_off, &mut w.notes) {
+                    let row = page.cell_offset(i).and_then(|cell_off| {
+                        if w.index_tree {
+                            self.read_index_cell(page.data, cell_off, &mut w.notes)
+                        } else {
+                            self.read_table_leaf_cell(page.data, cell_off, &mut w.notes)
+                        }
+                    });
+                    match row {
                         Some(row) => w.out.push(row),
                         None => w.notes.push(format!("Skipped an unreadable row on page {pageno}.")),
                     }
                 }
             }
-            0x05 => {
+            0x05 | 0x02 if (ptype == 0x02) == w.index_tree => {
                 for i in 0..ncells {
                     if (w.want != 0 && w.out.len() >= w.want) || w.budget == 0 {
                         return;
                     }
-                    if let Some(child) = self.interior_child(pageno, hdr, i) {
+                    if let Some(child) = Self::interior_child(&page, i) {
                         self.collect_table_rows(w, child, depth + 1);
+                    } else {
+                        w.notes.push(format!("Skipped an unreadable child pointer on page {pageno}."));
+                    }
+                    if w.index_tree {
+                        if w.want != 0 && w.out.len() >= w.want {
+                            return;
+                        }
+                        let row = page.cell_offset(i).and_then(|off| off.checked_add(4)).and_then(|off| self.read_index_cell(page.data, off, &mut w.notes));
+                        match row {
+                            Some(row) => w.out.push(row),
+                            None => w.notes.push(format!("Skipped an unreadable row on page {pageno}.")),
+                        }
                     }
                 }
-                if let Some(right) = read_u32_be(self.data, hdr.saturating_add(8)) {
+                if let Some(right) = read_u32_be(page.data, page.header.saturating_add(8)) {
                     self.collect_table_rows(w, right, depth + 1);
                 }
             }
@@ -493,29 +607,33 @@ impl<'a> SqliteDb<'a> {
         }
     }
 
-    /// The left-child page number of cell `i` on an interior table page.
-    fn interior_child(&self, pageno: u32, hdr: usize, i: usize) -> Option<u32> {
-        let base = self.page_base(pageno)?;
-        let cell_ptr_base = hdr.checked_add(12)?;
-        let ptr = read_u16_be(self.data, cell_ptr_base.checked_add(i.checked_mul(2)?)?)?;
-        let cell_off = base.checked_add(ptr as usize)?;
-        read_u32_be(self.data, cell_off)
+    /// The left-child page number of cell `i` on an interior page.
+    fn interior_child(page: &BtreePage<'_>, i: usize) -> Option<u32> {
+        read_u32_be(page.data, page.cell_offset(i)?)
     }
 
     /// Decode one table-leaf cell into a row, following overflow pages if needed.
-    fn read_table_leaf_cell(&self, cell_off: usize, notes: &mut Vec<String>) -> Option<Row> {
-        let (payload_len, n1) = varint(self.data, cell_off)?;
-        let (rowid, n2) = varint(self.data, cell_off.checked_add(n1)?)?;
+    fn read_table_leaf_cell(&self, page: &[u8], cell_off: usize, notes: &mut Vec<String>) -> Option<Row> {
+        let (payload_len, n1) = varint(page, cell_off)?;
+        let (rowid, n2) = varint(page, cell_off.checked_add(n1)?)?;
         let body_off = cell_off.checked_add(n1)?.checked_add(n2)?;
-        let payload_len = (payload_len as usize).min(MAX_CELL_SIZE);
-        let payload = self.assemble_payload(body_off, payload_len, true, notes)?;
-        let values = parse_record(&payload);
+        let payload_len = usize::try_from(payload_len).ok()?;
+        let payload = self.assemble_payload(page, body_off, payload_len, true, notes)?;
+        let values = parse_record(&payload, self.header.text_encoding);
         let rowid = i64::from_le_bytes(rowid.to_le_bytes());
-        Some(Row { rowid, values })
+        Some(Row { rowid: Some(rowid), values })
+    }
+
+    /// Index cells hold a whole row, without a rowid, using the index local-payload formula.
+    fn read_index_cell(&self, page: &[u8], cell_off: usize, notes: &mut Vec<String>) -> Option<Row> {
+        let (payload_len, n) = varint(page, cell_off)?;
+        let payload_len = usize::try_from(payload_len).ok()?;
+        let payload = self.assemble_payload(page, cell_off.checked_add(n)?, payload_len, false, notes)?;
+        Some(Row { rowid: None, values: parse_record(&payload, self.header.text_encoding) })
     }
 
     /// Assemble a cell payload: the local part plus any overflow-page chain, capped.
-    fn assemble_payload(&self, local_off: usize, payload_len: usize, is_table_leaf: bool, notes: &mut Vec<String>) -> Option<Vec<u8>> {
+    fn assemble_payload(&self, page: &[u8], local_off: usize, payload_len: usize, is_table_leaf: bool, notes: &mut Vec<String>) -> Option<Vec<u8>> {
         let usable = self.usable;
         // Maximum bytes stored on the page before spilling to overflow.
         let x = if is_table_leaf { usable.saturating_sub(35) } else { ((usable.saturating_sub(12)) * 64 / 255).saturating_sub(23) };
@@ -529,17 +647,22 @@ impl<'a> SqliteDb<'a> {
             if k <= x { k } else { m }
         };
         let mut out = Vec::new();
-        let first = self.data.get(local_off..local_off.checked_add(local)?)?;
+        let first = page.get(local_off..local_off.checked_add(local)?)?;
         out.extend_from_slice(first);
         if local < payload_len {
             // The 4 bytes after the local part point at the first overflow page.
             let next_off = local_off.checked_add(local)?;
-            let mut next = read_u32_be(self.data, next_off).unwrap_or(0);
+            let mut next = read_u32_be(page, next_off).unwrap_or(0);
             let per_page = usable.saturating_sub(4);
             let mut pages = 0usize;
+            let mut visited = std::collections::BTreeSet::new();
             while next != 0 && out.len() < payload_len.min(MAX_CELL_SIZE) {
                 if pages >= MAX_OVERFLOW_PAGES {
                     notes.push("An overflow chain was cut at the page cap; a value is partial.".into());
+                    break;
+                }
+                if !visited.insert(next) {
+                    notes.push("An overflow chain repeats a page; a value is partial.".into());
                     break;
                 }
                 pages += 1;
@@ -547,22 +670,21 @@ impl<'a> SqliteDb<'a> {
                 let Some(chunk) = self.data.get(pbase.checked_add(4)?..pbase.checked_add(4)?.checked_add(per_page).unwrap_or(pbase)) else {
                     break;
                 };
-                let remaining = payload_len.saturating_sub(out.len());
+                let remaining = payload_len.min(MAX_CELL_SIZE).saturating_sub(out.len());
                 let take = remaining.min(chunk.len());
                 out.extend_from_slice(chunk.get(..take)?);
                 next = read_u32_be(self.data, pbase).unwrap_or(0);
-                if out.len() >= MAX_CELL_SIZE {
-                    notes.push("A value was cut at the cell-size cap.".into());
-                    break;
-                }
             }
+        }
+        if out.len() < payload_len {
+            notes.push("A cell payload was only partially read; some values are truncated or not read.".into());
         }
         Some(out)
     }
 }
 
 /// Decode a SQLite record (the "payload") into column values.
-fn parse_record(payload: &[u8]) -> Vec<CellValue> {
+fn parse_record(payload: &[u8], text_encoding: &str) -> Vec<CellValue> {
     let mut out = Vec::new();
     let Some((hdr_len, n)) = varint(payload, 0) else { return out };
     let hdr_len = hdr_len as usize;
@@ -586,21 +708,28 @@ fn parse_record(payload: &[u8]) -> Vec<CellValue> {
     // Then read each value from the body region.
     let mut body = hdr_len;
     for st in types {
-        let (val, size) = decode_serial(st, payload, body);
+        let (val, size) = decode_serial(st, payload, body, text_encoding);
         out.push(val);
-        body = match body.checked_add(size) {
-            Some(v) => v,
-            None => break,
-        };
-        if body > payload.len() {
-            break;
-        }
+        body = body.saturating_add(size);
     }
     out
 }
 
 /// Decode one serial-typed value at `off`; returns the value and its byte size.
-fn decode_serial(serial: u64, data: &[u8], off: usize) -> (CellValue, usize) {
+fn decode_serial(serial: u64, data: &[u8], off: usize, text_encoding: &str) -> (CellValue, usize) {
+    let size = match serial {
+        1..=4 => serial as usize,
+        5 => 6,
+        6 | 7 => 8,
+        n if n >= 12 => usize::try_from((n - 12) / 2).unwrap_or(usize::MAX),
+        _ => 0,
+    };
+    if off > data.len() || (off == data.len() && size != 0) {
+        return (CellValue::NotRead, size);
+    }
+    if serial < 12 && size > data.len().saturating_sub(off) {
+        return (CellValue::NotRead, size);
+    }
     match serial {
         0 => (CellValue::Null, 0),
         1 => (int_be(data, off, 1), 1),
@@ -617,16 +746,22 @@ fn decode_serial(serial: u64, data: &[u8], off: usize) -> (CellValue, usize) {
         9 => (CellValue::Int(1), 0),
         10 | 11 => (CellValue::Null, 0), // reserved for internal use.
         n if n >= 12 && n % 2 == 0 => {
-            let len = ((n - 12) / 2) as usize;
-            let slice = data.get(off..off.saturating_add(len)).unwrap_or(&[]);
-            (blob_value(slice, len), len)
+            let len = size;
+            let slice = data.get(off..off.saturating_add(len).min(data.len())).unwrap_or(&[]);
+            let value = if slice.len() < len { CellValue::PartialBlob { len } } else { blob_value(slice, len) };
+            (value, len)
         }
-        n => {
-            // Odd and >= 13: text of (n-13)/2 bytes (encoding handled by the caller's DB header;
-            // decoded here as UTF-8 lossily, which is correct for the common case).
-            let len = ((n - 13) / 2) as usize;
-            let slice = data.get(off..off.saturating_add(len)).unwrap_or(&[]);
-            (text_value(slice), len)
+        _ => {
+            // Odd and >= 13: text of (n-13)/2 bytes, using the database's declared encoding.
+            let len = size;
+            let slice = data.get(off..off.saturating_add(len).min(data.len())).unwrap_or(&[]);
+            let mut value = encoded_text_value(slice, text_encoding);
+            if slice.len() < len
+                && let CellValue::Text { truncated, .. } = &mut value
+            {
+                *truncated = true;
+            }
+            (value, len)
         }
     }
 }
@@ -641,9 +776,25 @@ fn int_be(data: &[u8], off: usize, len: usize) -> CellValue {
 }
 
 fn text_value(slice: &[u8]) -> CellValue {
+    encoded_text_value(slice, "utf-8")
+}
+
+fn encoded_text_value(slice: &[u8], encoding: &str) -> CellValue {
     let truncated = slice.len() > MAX_TEXT;
     let take = slice.get(..MAX_TEXT.min(slice.len())).unwrap_or(slice);
-    CellValue::Text { text: String::from_utf8_lossy(take).into_owned(), truncated }
+    let text = match encoding {
+        "utf-16le" | "utf-16be" => {
+            let (pairs, _) = take.as_chunks::<2>();
+            let units: Vec<u16> = pairs.iter().map(|&pair| if encoding == "utf-16le" { u16::from_le_bytes(pair) } else { u16::from_be_bytes(pair) }).collect();
+            let mut text = String::from_utf16_lossy(&units);
+            if !take.len().is_multiple_of(2) {
+                text.push(char::REPLACEMENT_CHARACTER);
+            }
+            text
+        }
+        _ => String::from_utf8_lossy(take).into_owned(),
+    };
+    CellValue::Text { text, truncated }
 }
 
 fn blob_value(slice: &[u8], len: usize) -> CellValue {
@@ -653,25 +804,75 @@ fn blob_value(slice: &[u8], len: usize) -> CellValue {
     CellValue::Blob { len, sha256_prefix: prefix }
 }
 
+fn is_without_rowid(sql: &str) -> bool {
+    let Some(close) = sql.rfind(')') else { return false };
+    sql_tokens(close.checked_add(1).and_then(|start| sql.get(start..)).unwrap_or(""))
+        .windows(2)
+        .any(|pair| pair.first().is_some_and(|s| s.eq_ignore_ascii_case("WITHOUT")) && pair.get(1).is_some_and(|s| s.eq_ignore_ascii_case("ROWID")))
+}
+
+/// Output-column positions in the stored record: PK columns first, then all remaining columns.
+fn without_rowid_order(table: &SchemaObject) -> Option<Vec<usize>> {
+    let open = table.sql.find('(')?;
+    let close = table.sql.rfind(')')?;
+    let body = table.sql.get(open.checked_add(1)?..close)?;
+    let mut stored = Vec::new();
+    for segment in split_top_level(body) {
+        let tokens = sql_tokens(segment);
+        let Some(pk) = tokens
+            .windows(2)
+            .position(|pair| pair.first().is_some_and(|s| s.eq_ignore_ascii_case("PRIMARY")) && pair.get(1).is_some_and(|s| s.eq_ignore_ascii_case("KEY")))
+        else {
+            continue;
+        };
+        let table_constraint = tokens.first().is_some_and(|s| s.eq_ignore_ascii_case("PRIMARY") || s.eq_ignore_ascii_case("CONSTRAINT"));
+        let names: Vec<&str> = if table_constraint {
+            let tail = tokens.get(pk.checked_add(3)?..)?;
+            let end = tail.iter().position(|s| *s == ")")?;
+            tail.get(..end)?.split(|s| *s == ",").filter_map(|part| part.first().copied()).collect()
+        } else {
+            vec![*tokens.first()?]
+        };
+        for token in names {
+            let (name, _) = take_identifier(token);
+            let position = table.columns.iter().position(|column| column.name.eq_ignore_ascii_case(&name))?;
+            if !stored.contains(&position) {
+                stored.push(position);
+            }
+        }
+    }
+    if stored.is_empty() {
+        return None;
+    }
+    for i in 0..table.columns.len() {
+        if !stored.contains(&i) {
+            stored.push(i);
+        }
+    }
+    (0..table.columns.len()).map(|i| stored.iter().position(|&column| column == i)).collect()
+}
+
 /// Parse column names and types from a CREATE TABLE statement (best effort, bounded).
 pub fn parse_create_columns(sql: &str) -> Vec<Column> {
+    column_definitions(sql).into_iter().map(|(column, _)| column).collect()
+}
+
+fn column_definitions(sql: &str) -> Vec<(Column, &str)> {
     let mut cols = Vec::new();
     // Take the text inside the outermost parentheses.
     let Some(open) = sql.find('(') else { return cols };
     let inner = &sql[open + 1..];
-    let mut depth = 1i32;
+    let mut depth = 1usize;
     let mut end = inner.len();
-    for (i, c) in inner.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = i;
-                    break;
-                }
-            }
+    for token in sql_tokens(inner) {
+        match token {
+            "(" => depth = depth.saturating_add(1),
+            ")" => depth = depth.saturating_sub(1),
             _ => {}
+        }
+        if depth == 0 {
+            end = (token.as_ptr() as usize).saturating_sub(inner.as_ptr() as usize);
+            break;
         }
     }
     let body = inner.get(..end).unwrap_or("");
@@ -693,7 +894,7 @@ pub fn parse_create_columns(sql: &str) -> Vec<Column> {
             continue;
         }
         let type_name = extract_type(rest.trim());
-        cols.push(Column { name, type_name });
+        cols.push((Column { name, type_name }, rest));
     }
     cols
 }
@@ -803,13 +1004,79 @@ fn sql_tokens(mut sql: &str) -> Vec<&str> {
                     }
                 }
             }
-        } else if !matches!(first, '(' | ')' | ',') {
-            end = sql.find(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '\'' | '"' | '`' | '[')).unwrap_or(sql.len());
+        } else if !matches!(first, '(' | ')' | ',' | '/') {
+            end = sql.find(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '\'' | '"' | '`' | '[' | '/')).unwrap_or(sql.len());
         }
         tokens.push(sql.get(..end).unwrap_or(""));
         sql = sql.get(end..).unwrap_or("");
     }
     tokens
+}
+
+/// Missing trailing fields use literal defaults; expressions remain explicitly unknown.
+fn column_default(rest: &str) -> (CellValue, bool) {
+    let tokens = sql_tokens(rest);
+    let mut depth = 0usize;
+    for (i, token) in tokens.iter().enumerate() {
+        if depth == 0 && token.eq_ignore_ascii_case("DEFAULT") {
+            return tokens.get(i.saturating_add(1)..).and_then(literal_default).map(|v| (v, true)).unwrap_or((CellValue::Null, false));
+        }
+        match *token {
+            "(" => depth = depth.saturating_add(1),
+            ")" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    (CellValue::Null, true)
+}
+
+fn literal_default(tokens: &[&str]) -> Option<CellValue> {
+    let token = *tokens.first()?;
+    if token.eq_ignore_ascii_case("NULL") {
+        return Some(CellValue::Null);
+    }
+    if token.eq_ignore_ascii_case("TRUE") || token.eq_ignore_ascii_case("FALSE") {
+        return Some(CellValue::Int(i64::from(token.eq_ignore_ascii_case("TRUE"))));
+    }
+    if token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2 {
+        return Some(text_value(token.get(1..token.len().checked_sub(1)?)?.replace("''", "'").as_bytes()));
+    }
+    if token.eq_ignore_ascii_case("X") {
+        let quoted = *tokens.get(1)?;
+        if !quoted.starts_with('\'') || !quoted.ends_with('\'') || quoted.len() < 2 {
+            return None;
+        }
+        let hex = quoted.get(1..quoted.len().checked_sub(1)?)?;
+        if !hex.len().is_multiple_of(2) {
+            return None;
+        }
+        let bytes: Option<Vec<u8>> = hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let high = char::from(*pair.first()?).to_digit(16)?;
+                let low = char::from(*pair.get(1)?).to_digit(16)?;
+                Some((high * 16 + low) as u8)
+            })
+            .collect();
+        let bytes = bytes?;
+        return Some(blob_value(&bytes, bytes.len()));
+    }
+    let number = if matches!(token, "+" | "-") {
+        let value = *tokens.get(1)?;
+        format!("{token}{value}")
+    } else {
+        token.to_owned()
+    };
+    if !number.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E')) {
+        return None;
+    }
+    if let Ok(n) = number.parse::<i64>() {
+        return Some(CellValue::Int(n));
+    }
+    number.parse::<f64>().ok().filter(|n| n.is_finite()).map(CellValue::Real)
 }
 
 /// Split on top-level commas (ignoring commas inside parentheses).
@@ -902,6 +1169,184 @@ fn extract_type(rest: &str) -> String {
 mod tests {
     use super::*;
 
+    fn payload_cap_case(case: u8) {
+        use craft_anything_testkit::sqlite::{Val, overflow_row_db};
+        use sha2::Digest as _;
+        let values = match case {
+            1 => vec![Val::Text("x".repeat(8_000_000))],
+            2 => vec![Val::Text("x".repeat(8_400_000))],
+            3 => vec![Val::Blob(vec![0x5a; 8_400_000])],
+            4 => vec![Val::Text("x".repeat(4_300_000)), Val::Blob(vec![0x5a; 4_300_000])],
+            5 => vec![Val::Int(42), Val::Blob(vec![0x5a; 8_400_000]), Val::Int(73)],
+            6 => vec![Val::Blob(vec![0x5a; 1_000_000])],
+            _ => panic!("unknown payload-cap case"),
+        };
+        let bytes = overflow_row_db(&values);
+        let db = SqliteDb::parse(&bytes).expect("fixture parses");
+        let page = db.read_rows(2, 0, 1);
+        assert_eq!(page.rows.len(), 1);
+        let row = &page.rows[0];
+        assert_eq!(row.values.len(), values.len(), "d{case}: every column is present");
+        for (i, source) in values.iter().enumerate() {
+            let value = serde_json::to_value(&row.values[i]).expect("serializes");
+            match source {
+                Val::Text(_) => assert_eq!(value, serde_json::json!({"text": "x".repeat(MAX_TEXT), "truncated": true}), "d{case}: text prefix"),
+                Val::Blob(blob) => {
+                    assert_eq!(value["blob_len"], blob.len(), "d{case}: true blob length");
+                    if case == 6 {
+                        let hash: String = sha2::Sha256::digest(blob).iter().take(8).map(|b| format!("{b:02x}")).collect();
+                        assert_eq!(value, serde_json::json!({"blob_len": blob.len(), "sha256_prefix": hash}));
+                    } else {
+                        assert_eq!(value["truncated"], true, "d{case}: partial blob marked");
+                        assert!(value.get("sha256_prefix").is_none_or(serde_json::Value::is_null), "d{case}: no partial hash");
+                    }
+                }
+                Val::Int(n) if i == 0 => assert_eq!(value, *n),
+                Val::Int(_) => assert_eq!(value, serde_json::json!({"not_read": true})),
+                _ => panic!("unexpected payload-cap fixture value"),
+            }
+        }
+        assert_eq!(page.notes.is_empty(), matches!(case, 1 | 6), "d{case}: cap disclosure");
+    }
+
+    #[test]
+    fn payload_cap_d1() {
+        payload_cap_case(1);
+    }
+    #[test]
+    fn payload_cap_d2() {
+        payload_cap_case(2);
+    }
+    #[test]
+    fn payload_cap_d3() {
+        payload_cap_case(3);
+    }
+    #[test]
+    fn payload_cap_d4() {
+        payload_cap_case(4);
+    }
+    #[test]
+    fn payload_cap_d5() {
+        payload_cap_case(5);
+    }
+    #[test]
+    fn payload_cap_d6() {
+        payload_cap_case(6);
+    }
+
+    #[test]
+    fn payload_cap_d7_without_rowid() {
+        use craft_anything_testkit::sqlite::{Val, without_rowid_db};
+        let bytes = without_rowid_db(
+            "CREATE TABLE t(v BLOB, k INT PRIMARY KEY, tail INT) WITHOUT ROWID",
+            &[vec![Val::Int(42), Val::Blob(vec![0x5a; 8_400_000]), Val::Int(73)]],
+        );
+        let page = SqliteDb::parse(&bytes).expect("fixture").read_rows(2, 0, 10);
+        assert_eq!(page.rows.len(), 1, "d7: capped index rows must remain present");
+        assert_eq!(page.rows[0].rowid, None);
+        assert_eq!(
+            serde_json::to_value(&page.rows[0].values).unwrap(),
+            serde_json::json!([
+                {"blob_len": 8_400_000, "truncated": true}, 42, {"not_read": true}
+            ])
+        );
+        assert!(!page.notes.is_empty(), "d7: cap disclosure");
+    }
+
+    fn short_record_case(declarations: &str, defaults: Vec<CellValue>, note: bool) {
+        use craft_anything_testkit::sqlite::{Val, table_db};
+        let mut full = vec![Val::Int(2)];
+        full.extend(defaults.iter().map(|v| match v {
+            CellValue::Int(n) => Val::Int(*n),
+            CellValue::Real(n) => Val::Real(*n),
+            CellValue::Text { text, .. } => Val::Text(text.clone()),
+            CellValue::Blob { .. } => Val::Blob(vec![0, 255]),
+            CellValue::Null => Val::Null,
+            _ => panic!("unexpected default fixture value"),
+        }));
+        let bytes = table_db(&format!("CREATE TABLE t(n INT, {declarations})"), &[(1, vec![Val::Int(1)]), (2, full)]);
+        let db = SqliteDb::parse(&bytes).expect("fixture");
+        let page = db.read_rows(2, 0, 10);
+        let mut expected = vec![CellValue::Int(1)];
+        expected.extend(defaults.clone());
+        assert_eq!(page.rows[0].values, expected, "old record must include trailing defaults");
+        expected[0] = CellValue::Int(2);
+        assert_eq!(page.rows[1].values, expected, "full record must stay unchanged");
+        assert_eq!(!page.notes.is_empty(), note, "unsupported defaults must be disclosed");
+    }
+
+    #[test]
+    fn added_columns_c1_integer() {
+        short_record_case("x INT DEFAULT 42", vec![CellValue::Int(42)], false);
+    }
+    #[test]
+    fn added_columns_c2_null() {
+        short_record_case("x INT", vec![CellValue::Null], false);
+    }
+    #[test]
+    fn added_columns_c3_real_text() {
+        short_record_case("x REAL DEFAULT -1.5, y TEXT DEFAULT 'it''s'", vec![CellValue::Real(-1.5), text_value(b"it's")], false);
+    }
+    #[test]
+    fn added_columns_c4_blob() {
+        short_record_case("x BLOB DEFAULT X'00ff'", vec![blob_value(&[0, 255], 2)], false);
+    }
+    #[test]
+    fn added_columns_c7_expression() {
+        short_record_case("d TEXT DEFAULT (lower('A'))", vec![CellValue::Null], true);
+    }
+    #[test]
+    fn added_columns_c5_rewritten_control() {
+        use craft_anything_testkit::sqlite::{Val, table_db};
+        let bytes = table_db("CREATE TABLE t(n INT, x INT DEFAULT 42)", &[(1, vec![Val::Int(1), Val::Int(42)])]);
+        let page = SqliteDb::parse(&bytes).expect("fixture").read_rows(2, 0, 10);
+        assert_eq!(page.rows[0].values, vec![CellValue::Int(1), CellValue::Int(42)]);
+        assert!(page.notes.is_empty());
+    }
+
+    #[test]
+    fn added_columns_literal_forms_and_unknowns() {
+        for (declaration, value) in [
+            ("x INT DEFAULT +42 NOT NULL", CellValue::Int(42)),
+            ("x INT DEFAULT - 42", CellValue::Int(-42)),
+            ("x REAL DEFAULT + 1.25e-2", CellValue::Real(0.0125)),
+            ("x INT DEFAULT true", CellValue::Int(1)),
+            ("x INT DEFAULT FALSE", CellValue::Int(0)),
+            ("x DEFAULT null", CellValue::Null),
+            ("x TEXT DEFAULT 'a),b''c'", text_value(b"a),b'c")),
+            ("x INT CHECK(x <> 'DEFAULT') DEFAULT /* literal */ 7", CellValue::Int(7)),
+        ] {
+            short_record_case(declaration, vec![value], false);
+        }
+        for declaration in ["x TEXT DEFAULT CURRENT_TIMESTAMP", "x DEFAULT (42)", "x DEFAULT (lower('A'))", "x DEFAULT X'zz'"] {
+            short_record_case(declaration, vec![CellValue::Null], true);
+        }
+        assert_eq!(blob_value(&[0, 255], 2), CellValue::Blob { len: 2, sha256_prefix: "06eb7d6a69ee19e5".into() });
+        assert_eq!(literal_default(&sql_tokens("x''")), Some(blob_value(&[], 0)));
+    }
+
+    #[test]
+    fn added_columns_preserve_stored_nulls_and_long_records() {
+        use craft_anything_testkit::sqlite::{Val, table_db};
+        let bytes = table_db("CREATE TABLE t(n INT, x INT DEFAULT 42)", &[(1, vec![Val::Int(1), Val::Null]), (2, vec![Val::Int(2), Val::Int(7), Val::Int(9)])]);
+        let page = SqliteDb::parse(&bytes).expect("fixture").read_rows(2, 0, 10);
+        assert_eq!(page.rows[0].values, vec![CellValue::Int(1), CellValue::Null]);
+        assert_eq!(page.rows[1].values, vec![CellValue::Int(2), CellValue::Int(7), CellValue::Int(9)]);
+        assert!(page.notes.is_empty());
+    }
+
+    #[test]
+    fn added_columns_c6_short_rowid_alias() {
+        use craft_anything_testkit::sqlite::{Val, table_db};
+        for stored in [vec![Val::Null, Val::Int(10)], vec![]] {
+            let bytes = table_db("CREATE TABLE t(id INTEGER PRIMARY KEY, n INT DEFAULT 10, x INT DEFAULT 42)", &[(7, stored)]);
+            let page = SqliteDb::parse(&bytes).expect("fixture").read_rows(2, 0, 10);
+            assert_eq!(page.rows[0].rowid, Some(7));
+            assert_eq!(page.rows[0].values, vec![CellValue::Int(7), CellValue::Int(10), CellValue::Int(42)]);
+            assert!(page.notes.is_empty());
+        }
+    }
+
     #[test]
     fn version_formatting() {
         assert_eq!(version_string(3_045_001), "3.45.1");
@@ -972,7 +1417,7 @@ mod tests {
 
         let page = parsed.read_rows(items.rootpage, 0, 10);
         assert_eq!(page.rows.len(), 3);
-        assert_eq!(page.rows[0].rowid, 1);
+        assert_eq!(page.rows[0].rowid, Some(1));
         assert_eq!(page.rows[0].values[0], CellValue::Int(1));
         assert_eq!(page.rows[0].values[1], CellValue::Text { text: "alpha".into(), truncated: false });
         assert_eq!(page.rows[0].values[2], CellValue::Real(1.5));
@@ -985,7 +1430,7 @@ mod tests {
         // Paging: offset 1, limit 1 yields the second row only.
         let mid = parsed.read_rows(items.rootpage, 1, 1);
         assert_eq!(mid.rows.len(), 1);
-        assert_eq!(mid.rows[0].rowid, 2);
+        assert_eq!(mid.rows[0].rowid, Some(2));
 
         // find_object is case-insensitive.
         assert!(parsed.find_object("ITEMS").is_some());
@@ -1017,7 +1462,7 @@ mod tests {
         let page = db.read_rows(2, 0, 10);
         assert_eq!(page.rows.len(), 2);
         for (row, (rowid, _)) in page.rows.iter().zip(&rows) {
-            assert_eq!(row.rowid, *rowid);
+            assert_eq!(row.rowid, Some(*rowid));
             let mut expected = vec![CellValue::Text { text: "x".into(), truncated: false }; columns.len()];
             expected[column] = if alias { CellValue::Int(*rowid) } else { CellValue::Null };
             assert_eq!(row.values, expected, "{declaration}, rowid {rowid}");
@@ -1053,11 +1498,9 @@ mod tests {
 
     #[test]
     fn a_without_rowid_table_has_no_rowid_alias() {
-        // Only test alias classification here; index b-tree reading is a separate defect.
-        let sql = "CREATE TABLE t(id INTEGER PRIMARY KEY) WITHOUT ROWID";
-        let bytes = craft_anything_testkit::sqlite::table_db(sql, &[(7, vec![craft_anything_testkit::sqlite::Val::Null])]);
-        let db = SqliteDb::parse(&bytes).expect("fixture parses");
-        assert_eq!(db.read_rows(2, 0, 1).rows[0].values, vec![CellValue::Null]);
+        // Read through the index b-tree (database_tools `without_rowid_b4_integer_key` covers the rows).
+        assert_eq!(rowid_alias_index("CREATE TABLE t(id INTEGER PRIMARY KEY) WITHOUT ROWID"), None);
+        assert_eq!(rowid_alias_index("CREATE TABLE t(id INTEGER PRIMARY KEY)"), Some(0));
     }
 
     #[test]
@@ -1106,16 +1549,37 @@ mod tests {
     }
 
     #[test]
+    fn without_rowid_damaged_pages_never_panic() {
+        use craft_anything_testkit::sqlite::{Val, without_rowid_db};
+        let rows = (0..9).map(|i| vec![Val::Int(i), Val::Text("x".repeat(2000))]).collect::<Vec<_>>();
+        let base = without_rowid_db("CREATE TABLE t(k INT PRIMARY KEY, v TEXT) WITHOUT ROWID", &rows);
+        for cut in (100..base.len()).step_by(31) {
+            let db = SqliteDb::parse(&base[..cut]).unwrap();
+            let _ = db.count_rows(2);
+            let _ = db.read_rows(2, 1, 20);
+        }
+        for off in 4096..4120 {
+            for value in [0, 2, 10, 255] {
+                let mut bytes = base.clone();
+                bytes[off] = value;
+                let db = SqliteDb::parse(&bytes).unwrap();
+                let _ = db.count_rows(2);
+                let _ = db.read_rows(2, 0, 20);
+            }
+        }
+    }
+
+    #[test]
     fn decode_serial_types() {
-        assert_eq!(decode_serial(0, &[], 0).0, CellValue::Null);
-        assert_eq!(decode_serial(8, &[], 0).0, CellValue::Int(0));
-        assert_eq!(decode_serial(9, &[], 0).0, CellValue::Int(1));
-        assert_eq!(decode_serial(1, &[0xff], 0).0, CellValue::Int(-1));
-        assert_eq!(decode_serial(2, &[0x01, 0x00], 0).0, CellValue::Int(256));
+        assert_eq!(decode_serial(0, &[], 0, "utf-8").0, CellValue::Null);
+        assert_eq!(decode_serial(8, &[], 0, "utf-8").0, CellValue::Int(0));
+        assert_eq!(decode_serial(9, &[], 0, "utf-8").0, CellValue::Int(1));
+        assert_eq!(decode_serial(1, &[0xff], 0, "utf-8").0, CellValue::Int(-1));
+        assert_eq!(decode_serial(2, &[0x01, 0x00], 0, "utf-8").0, CellValue::Int(256));
         // text: serial 13 -> (13-13)/2 = 0 bytes; serial 19 -> 3 bytes
-        assert_eq!(decode_serial(19, b"abc", 0), (CellValue::Text { text: "abc".into(), truncated: false }, 3));
+        assert_eq!(decode_serial(19, b"abc", 0, "utf-8"), (CellValue::Text { text: "abc".into(), truncated: false }, 3));
         // blob: serial 18 -> (18-12)/2 = 3 bytes
-        match decode_serial(18, b"xyz", 0).0 {
+        match decode_serial(18, b"xyz", 0, "utf-8").0 {
             CellValue::Blob { len, .. } => assert_eq!(len, 3),
             other => panic!("expected blob, got {other:?}"),
         }

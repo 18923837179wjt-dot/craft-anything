@@ -67,10 +67,59 @@ pub trait DeepDecompiler: Send + Sync {
     fn language_id(&self) -> Option<String> {
         None
     }
-    /// Decompile the function at `entry`. `Ok(None)` means the engine has no better answer.
+    /// Where the engine loaded the program (its image base), when it said. Ghidra puts a
+    /// position-independent ELF at 0x100000, not at the 0 its program headers give, so its
+    /// addresses differ from ours by that much; see [`Rebase`].
+    fn image_base(&self) -> Option<u64> {
+        None
+    }
+    /// Decompile the function at `entry` (an address in the engine's own space). `Ok(None)` means
+    /// the engine has no better answer.
     fn decompile(&self, entry: u64) -> Result<Option<DeepFunction>, GhidraError>;
     /// List the functions the engine found.
     fn list_functions(&self) -> Result<Vec<DeepFunction>, GhidraError>;
+}
+
+/// Moves addresses between our built-in engine's view of a program and the Deep engine's, which
+/// may have loaded it somewhere else: Ghidra puts a position-independent ELF (lowest segment at 0)
+/// at 0x100000. Both sides keep the same offsets from their image base, so moving an address is
+/// one subtraction and one addition. An address below the base it's moved from stays as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rebase {
+    ours: u64,
+    theirs: u64,
+}
+
+impl Rebase {
+    /// `ours`: our image base; `theirs`: the engine's, `None` when it didn't say (then no move).
+    pub fn new(ours: u64, theirs: Option<u64>) -> Rebase {
+        Rebase { ours, theirs: theirs.unwrap_or(ours) }
+    }
+
+    /// Our image base.
+    pub fn ours(&self) -> u64 {
+        self.ours
+    }
+
+    /// The engine's image base (ours when it didn't say).
+    pub fn theirs(&self) -> u64 {
+        self.theirs
+    }
+
+    /// Whether both sides use the same addresses.
+    pub fn is_identity(&self) -> bool {
+        self.ours == self.theirs
+    }
+
+    /// Our address as the engine knows it.
+    pub fn to_engine(&self, a: u64) -> u64 {
+        a.checked_sub(self.ours).and_then(|o| o.checked_add(self.theirs)).unwrap_or(a)
+    }
+
+    /// The engine's address as we know it.
+    pub fn from_engine(&self, a: u64) -> u64 {
+        a.checked_sub(self.theirs).and_then(|o| o.checked_add(self.ours)).unwrap_or(a)
+    }
 }
 
 /// Where Ghidra and its JDK live, and how long to wait.
@@ -245,6 +294,8 @@ pub struct Session {
     version: Option<String>,
     /// The forced language id, when Deep mode was pinned to a processor.
     language_id: Option<String>,
+    /// Where Ghidra loaded the program, from the bridge's handshake.
+    image_base: Option<u64>,
 }
 
 impl std::fmt::Debug for Session {
@@ -273,6 +324,69 @@ pub fn project_cache_dir(store: &Path, target_sha256: &str, settings_hash: &str)
     let key = format!("{}-{}", target_sha256.get(..16).unwrap_or(target_sha256), settings_hash.get(..16).unwrap_or(settings_hash));
     // Ghidra rejects project path elements that start with a dot.
     store.join("ghidra-cache").join(key)
+}
+
+/// The folder to give Ghidra for the engine store. Ghidra refuses a project path with a part that
+/// starts with a dot ("Path element starting with '.' is not permitted"), and the default store on
+/// Linux is under `~/.config`. Then Ghidra gets a dot-free link to the store, so the analyses it
+/// saves still land in the store and are found again next time.
+fn ghidra_root(store: &Path) -> Result<PathBuf, GhidraError> {
+    if !has_dot_part(store) {
+        return Ok(store.to_path_buf());
+    }
+    #[cfg(unix)]
+    if let Some(link) = dot_free_link(store)? {
+        return Ok(link);
+    }
+    Ok(store.to_path_buf())
+}
+
+/// Whether a part of `p` starts with a dot, which Ghidra refuses in a project path.
+fn has_dot_part(p: &Path) -> bool {
+    p.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+}
+
+/// A link to `store` in a private folder of this user in the runtime folder (`XDG_RUNTIME_DIR`)
+/// or the temp folder, one per store. `None` when those have a dot part too.
+#[cfg(unix)]
+fn dot_free_link(store: &Path) -> Result<Option<PathBuf>, GhidraError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let launch = |what: &str, e: std::io::Error| GhidraError::Launch(format!("{what}: {e}"));
+    let store = std::path::absolute(store).map_err(|e| launch("finding the engine store", e))?;
+    make_private_dir(&store)?;
+    let owner = std::fs::metadata(&store).map_err(|e| launch("reading the engine store", e))?.uid();
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| p.is_absolute() && !has_dot_part(p)).unwrap_or_else(std::env::temp_dir);
+    if !base.is_absolute() || has_dot_part(&base) {
+        return Ok(None);
+    }
+    let dir = base.join(format!("craft-anything-{owner}"));
+    make_private_dir(&dir)?;
+    // In a shared temp folder, a folder someone else made (or a link to one) isn't ours to use.
+    let meta = std::fs::symlink_metadata(&dir).map_err(|e| launch("checking the link folder", e))?;
+    if !meta.is_dir() || meta.uid() != owner || meta.permissions().mode() & 0o077 != 0 {
+        return Err(GhidraError::Launch(format!(
+            "{} isn't a private folder of yours, so Ghidra can't be given a path to the engine store without a dot folder",
+            dir.display()
+        )));
+    }
+    let key = craft_anything_evidence::sha256_hex(store.as_os_str().as_encoded_bytes());
+    let link = dir.join(format!("engines-{}", key.get(..16).unwrap_or(&key)));
+    // Two processes can make the link at once: whoever loses checks the one the other made.
+    for _ in 0..2 {
+        match std::fs::read_link(&link) {
+            Ok(to) if to == store => return Ok(Some(link)),
+            Ok(_) => {
+                let _ = std::fs::remove_file(&link);
+            }
+            Err(_) => {}
+        }
+        match std::os::unix::fs::symlink(&store, &link) {
+            Ok(()) => return Ok(Some(link)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(launch("linking the engine store", e)),
+        }
+    }
+    Err(GhidraError::Launch(format!("{} is in the way of the link to the engine store", link.display())))
 }
 
 /// Create a fresh private directory under `base`.
@@ -388,7 +502,9 @@ fn lock_is_fresh(lock: &Path) -> bool {
 
 /// Make sure the target is analysed and saved in its cached project, analysing it now if no one
 /// has (a big program can take hours; it happens once). If another process is already analysing
-/// it, wait for that instead of starting over. Returns the cached project folder.
+/// it, wait for that instead of starting over. Returns the cached project folder, as the path to
+/// give Ghidra: through the store's dot-free link when the store is under a dot folder
+/// ([`ghidra_root`]), so the same folder, not always the same path.
 pub fn analyse(
     cfg: &Config,
     target_bytes: &[u8],
@@ -400,10 +516,11 @@ pub fn analyse(
     let started = Instant::now();
     let minutes = || started.elapsed().as_secs() / 60;
     let deadline = started + cfg.startup_timeout;
-    let project_dir = project_cache_dir(&cfg.store_dir, target_sha256, settings_hash);
+    let root = ghidra_root(&cfg.store_dir)?;
+    let project_dir = project_cache_dir(&root, target_sha256, settings_hash);
     let lock = lock_path(&project_dir);
     // The lock sits beside the project, in the cache folder a fresh store doesn't have yet.
-    make_private_dir(lock.parent().unwrap_or(&cfg.store_dir))?;
+    make_private_dir(lock.parent().unwrap_or(&root))?;
     loop {
         if is_analysed(&project_dir) {
             return Ok(project_dir);
@@ -430,7 +547,7 @@ pub fn analyse(
         }
     }
     let held = HeldLock(lock.clone());
-    let scratch = Scratch::new(&cfg.store_dir, "ghidra-analysis")?;
+    let scratch = Scratch::new(&root, "ghidra-analysis")?;
     let program = format!("target-{}", target_sha256.get(..12).unwrap_or(target_sha256));
     // Beside the saved analysis, so it can be read after a failure.
     let log = project_dir.with_extension("log");
@@ -472,7 +589,11 @@ pub fn analyse(
     match done {
         Ok(true) => write_atomic_private(&project_dir.join(ANALYSED_MARKER), program.as_bytes())
             .map_err(|e| GhidraError::Launch(format!("saving the analysis: {e}")))?,
-        Ok(false) => return Err(GhidraError::Launch(format!("Ghidra's analysis failed; see {}", log.display()))),
+        Ok(false) => {
+            // The log as it is in the store, not through the link Ghidra was given.
+            let shown = project_cache_dir(&cfg.store_dir, target_sha256, settings_hash).with_extension("log");
+            return Err(GhidraError::Launch(format!("Ghidra's analysis failed; see {}", shown.display())));
+        }
         Err(m) => return Err(GhidraError::Timeout(m)),
     }
     drop(held);
@@ -493,7 +614,7 @@ impl Session {
         let run_id = random_token();
         let token = random_token();
         let project_dir = analyse(cfg, target_bytes, target_sha256, settings_hash, cancel, progress)?;
-        let scratch = Scratch::new(&cfg.store_dir, "ghidra-runtime")?;
+        let scratch = Scratch::new(&ghidra_root(&cfg.store_dir)?, "ghidra-runtime")?;
         let runtime_root = scratch.0.clone();
         let program = format!("target-{}", target_sha256.get(..12).unwrap_or(target_sha256));
         let log = runtime_root.join("ghidra.log");
@@ -558,6 +679,7 @@ impl Session {
         // First ping proves the token and that analysis finished.
         let info = client.ping(cancel, deadline)?;
         let version = info.get("provider").and_then(|p| p.get("version")).and_then(Value::as_str).map(String::from);
+        let image_base = image_base_of(&info);
         if info.get("analysis_cut_short").and_then(Value::as_bool) == Some(true) {
             return Err(GhidraError::Timeout("Ghidra reported that analysis timed out".into()));
         }
@@ -569,6 +691,7 @@ impl Session {
             runtime_root: scratch.keep(),
             version,
             language_id: cfg.language_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from),
+            image_base,
         })
     }
 
@@ -593,6 +716,10 @@ impl DeepDecompiler for Session {
 
     fn language_id(&self) -> Option<String> {
         self.language_id.clone()
+    }
+
+    fn image_base(&self) -> Option<u64> {
+        self.image_base
     }
 
     fn decompile(&self, entry: u64) -> Result<Option<DeepFunction>, GhidraError> {
@@ -636,6 +763,11 @@ fn decompiled(entry: u64, v: &Value) -> Option<DeepFunction> {
         pseudocode: v.get("pseudocode").and_then(Value::as_str).map(String::from),
         created: v.get("created").and_then(Value::as_bool).unwrap_or(false),
     })
+}
+
+/// Where the bridge's handshake says Ghidra loaded the program (`None` when it didn't say).
+fn image_base_of(ping: &Value) -> Option<u64> {
+    ping.get("target").and_then(|t| t.get("image_base")).and_then(Value::as_str).and_then(parse_hex)
 }
 
 fn parse_hex(s: &str) -> Option<u64> {

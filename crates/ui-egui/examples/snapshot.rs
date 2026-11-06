@@ -193,8 +193,8 @@ fn main() {
                 let root = ws.root.clone();
                 let _ = a.runs.start(&a.hub, ws, RunOptions::default());
                 if let Some(run) = a.runs.get(&root) {
-                    run.add_note("Make the header blue".into(), "Make the header blue".into());
-                    run.add_note("And add a contact form".into(), "And add a contact form".into());
+                    run.add_note("Make the header blue".into(), "Make the header blue".into(), Vec::new());
+                    run.add_note("And add a contact form".into(), "And add a contact form".into(), Vec::new());
                 }
             }
             a
@@ -355,12 +355,12 @@ fn main() {
         let b = |name: &str, kind, model: &str| BackendConfig { name: name.into(), kind, model: model.into(), base_url: None, ssh_host: None, enabled: true };
         a.backends = vec![
             b("Claude Code", BackendKind::AgentCli, "claude-code"),
-            b("Kimi K3 (OpenRouter)", BackendKind::Openrouter, "moonshotai/kimi-k3"),
+            b("Kimi K3.1 Pro (OpenRouter)", BackendKind::Openrouter, "moonshotai/kimi-k3.1-pro"),
             b("Claude", BackendKind::Anthropic, "claude-opus-5-5"),
         ];
         a.state.backend = Some("Claude".into());
         a.builder = Some("Claude Code".into());
-        a.extractor = Some("Kimi K3 (OpenRouter)".into());
+        a.extractor = Some("Kimi K3.1 Pro (OpenRouter)".into());
         if error {
             a.toast("Couldn't save C:/Users/me/AppData/Roaming/craft-anything/config.toml: access is denied.", true);
         }
@@ -391,7 +391,7 @@ fn main() {
             render(&out, "project-game", w, h, scale, move || {
                 let mut a = demo::app(demo::engine(Mode::Beginner, true));
                 a.state.feed = vec![
-                    craft_anything_ui_egui::state::FeedItem::User("A snake game".into()),
+                    craft_anything_ui_egui::state::FeedItem::User(craft_anything_ui_egui::state::UserItem::Text("A snake game".into())),
                     craft_anything_ui_egui::state::FeedItem::Agent {
                         text: "Your snake game is ready: arrow keys to steer, eat the dots to grow, and the speed goes up as you score.".into(),
                         streaming: false,
@@ -422,11 +422,9 @@ fn main() {
         render(&out, "project-long-prompt", w, h, scale, || {
             let mut a = demo::app(demo::engine(Mode::Beginner, true));
             demo::fill_project(&mut a);
-            a.state.feed.push(craft_anything_ui_egui::state::FeedItem::User(format!(
-                "{}https://example.com/{}",
-                "Make it exactly like the original, with the same menus, weapons and maps. ".repeat(6),
-                "a".repeat(160)
-            )));
+            let text =
+                format!("{}https://example.com/{}", "Make it exactly like the original, with the same menus, weapons and maps. ".repeat(6), "a".repeat(160));
+            a.state.feed.push(craft_anything_ui_egui::state::FeedItem::User(craft_anything_ui_egui::state::UserItem::Text(text)));
             a
         });
     }

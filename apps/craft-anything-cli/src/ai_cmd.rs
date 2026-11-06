@@ -3,7 +3,7 @@
 use crate::output::Format;
 use crate::{Cli, INTERRUPTED, emit, fail, make_engine, out};
 use clap::{Args, Subcommand};
-use craft_anything_ai::{AgentEvent, AiHub, BackendConfig, BackendKind};
+use craft_anything_ai::{AgentEvent, AiHub, BackendConfig, BackendKind, Effort};
 use craft_anything_evidence::ToolError;
 use serde_json::{Value, json};
 use std::io::{Read as _, Write as _};
@@ -59,9 +59,25 @@ pub enum AiCommand {
     /// Set the program an agent app runs, when it's installed where it isn't found (leave the
     /// path out to find it by its usual name again).
     Program { name: String, path: Option<String> },
+    /// Set the folder Claude Code keeps its sign-in, settings and sessions in (its
+    /// CLAUDE_CONFIG_DIR), so this AI uses another account: a full path or one under `~/`, on the
+    /// computer it runs on. Leave the path out for its usual folder.
+    Folder { name: String, path: Option<String> },
     /// Set the model an AI uses (Claude Code: the model it's asked for); leave it out to list the
     /// ones it can use.
-    Model { name: String, model: Option<String> },
+    Model {
+        name: String,
+        model: Option<String>,
+        /// OpenCode thinking variant; only those offered by the selected model are accepted.
+        #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
+        thinking: Option<String>,
+        /// Use OpenCode's default model and thinking depth.
+        #[arg(long, conflicts_with_all = ["model", "thinking"])]
+        default: bool,
+    },
+    /// Set how hard a Claude backend thinks (the Claude API or Claude Code): low, medium, high,
+    /// xhigh or max, or `default` for the usual level; leave it out to see the level and choices.
+    Effort { name: String, level: Option<String> },
     /// Send a tiny request and report latency.
     Test { name: String },
     /// Choose the backend that builds (leave the name out to go back to automatic).
@@ -183,6 +199,8 @@ fn read_key(key_env: &Option<String>, key_stdin: bool) -> Result<Option<String>,
     Ok(None)
 }
 
+/// Dispatch AI configuration, discovery and model-selection commands through the shared hub.
+/// Render results in the requested format and return an exit status for success or failure.
 pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
     let hub = match hub(cli) {
         Ok(h) => h,
@@ -207,6 +225,10 @@ pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
         }
         AiCommand::Detect => {
             emit(&serde_json::to_value(hub.detect()).unwrap_or(Value::Null), f);
+            // On stderr, so the list on stdout stays what scripts read.
+            for hint in hub.detect_hints() {
+                eprintln!("note: {} {}", hint.message(), hint.remediation());
+            }
             0
         }
         AiCommand::Add { name, kind, model, base_url, ssh_host, key_env, key_stdin } => {
@@ -255,23 +277,90 @@ pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
                 Err(e) => fail(&e, f),
             }
         }
-        AiCommand::Model { name, model: None } => match hub.model_choices(name) {
+        AiCommand::Model { name, model, thinking, default } if *default || thinking.is_some() => {
+            let depth = thinking.as_deref().and_then(craft_anything_ai::Effort::parse);
+            let model = if *default { None } else { model.clone().or_else(|| hub.options().get(name).and_then(|o| o.cli_model.clone())) };
+            match hub.set_agent_model(name, model.as_deref(), depth) {
+                Ok(found) => {
+                    emit(&json!({"name": name, "model": model, "thinking": depth, "found": found}), f);
+                    if found { 0 } else { 1 }
+                }
+                Err(e) => fail(&e, f),
+            }
+        }
+        AiCommand::Model { name, model: None, .. }
+            if hub.model_context(name).is_ok_and(|c| {
+                c.backend.config.kind == BackendKind::AgentCli && craft_anything_ai::cli_agents::adapter_for(&c.backend.config.model).has_model_catalog()
+            }) =>
+        {
+            match hub.model_context(name).and_then(|c| hub.agent_models(&c)) {
+                Ok(models) => {
+                    emit(&json!({"name": name, "models": models}), f);
+                    0
+                }
+                Err(e) => fail(&e, f),
+            }
+        }
+        AiCommand::Model { name, model: None, .. } => match hub.model_choices(name) {
             Ok(models) => {
                 emit(&json!({"name": name, "models": models}), f);
                 0
             }
             Err(e) => fail(&e, f),
         },
-        AiCommand::Model { name, model: Some(model) } => match hub.set_model(name, model) {
+        AiCommand::Model { name, model: Some(model), .. } => match hub.set_model(name, model) {
             Ok(found) => {
                 emit(&json!({"name": name, "model": model.trim(), "found": found}), f);
                 if found { 0 } else { 1 }
             }
             Err(e) => fail(&e, f),
         },
+        AiCommand::Effort { name, level: None } => {
+            let Some(b) = hub.backends().into_iter().find(|b| b.name == *name) else {
+                return fail(&ToolError::invalid(format!("No AI backend named {name:?}")).with_remediation("See `craft-anything-cli ai list`."), f);
+            };
+            let options = hub.options();
+            match craft_anything_ai::effort_in_use(&b, options.get(name)) {
+                Some(effort) => {
+                    let levels: Vec<&str> = Effort::ALL.iter().map(|e| e.as_str()).collect();
+                    emit(&json!({"name": name, "effort": effort.as_str(), "levels": levels}), f);
+                    0
+                }
+                None => fail(
+                    &ToolError::invalid(format!("{name} doesn't take an effort level.")).with_remediation("Effort is for the Claude API and Claude Code."),
+                    f,
+                ),
+            }
+        }
+        AiCommand::Effort { name, level: Some(level) } => {
+            let effort = match level.trim() {
+                "default" => None,
+                l => match Effort::parse(l) {
+                    Some(e) => Some(e),
+                    None => {
+                        let e = ToolError::invalid(format!("{l:?} isn't an effort level.")).with_remediation("Use low, medium, high, xhigh, max or default.");
+                        return fail(&e, f);
+                    }
+                },
+            };
+            match hub.set_effort(name, effort) {
+                Ok(found) => {
+                    emit(&json!({"name": name, "effort": effort.map(Effort::as_str), "found": found}), f);
+                    if found { 0 } else { 1 }
+                }
+                Err(e) => fail(&e, f),
+            }
+        }
         AiCommand::Program { name, path } => match hub.set_command(name, path.as_deref()) {
             Ok(found) => {
                 emit(&json!({"name": name, "program": path, "found": found}), f);
+                if found { 0 } else { 1 }
+            }
+            Err(e) => fail(&e, f),
+        },
+        AiCommand::Folder { name, path } => match hub.set_config_dir(name, path.as_deref()) {
+            Ok(found) => {
+                emit(&json!({"name": name, "folder": path, "found": found}), f);
                 if found { 0 } else { 1 }
             }
             Err(e) => fail(&e, f),

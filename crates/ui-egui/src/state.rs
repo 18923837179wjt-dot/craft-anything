@@ -52,12 +52,18 @@ pub struct MakeDraft {
     /// The front door is on "Just look inside" rather than "Make my own version".
     #[serde(default)]
     pub look: bool,
+    /// The front door is on "Work on my project": the person's own folder, edited in place.
+    #[serde(default)]
+    pub mine: bool,
     /// The folder the person picked for the project (else a new one in the projects folder).
     #[serde(default)]
     pub folder: Option<PathBuf>,
     /// What's already in that folder: the first names and how many.
     #[serde(default)]
     pub folder_files: Option<(Vec<String>, usize)>,
+    /// The stack those files are built with, read when they're chosen as the app.
+    #[serde(default)]
+    pub folder_stack: Option<String>,
     /// What those files are to the project.
     #[serde(default)]
     pub existing: Option<craft_anything_engine::workspace::ExistingFiles>,
@@ -86,8 +92,10 @@ impl Default for MakeDraft {
             generate_assets: false,
             skip_ghidra: false,
             look: false,
+            mine: false,
             folder: None,
             folder_files: None,
+            folder_stack: None,
             existing: None,
             remember_existing: false,
             ai: None,
@@ -96,7 +104,7 @@ impl Default for MakeDraft {
     }
 }
 
-pub use craft_anything_ai::rebuild::feed::{FeedItem, PlanStatus, PlanStep};
+pub use craft_anything_ai::rebuild::feed::{FeedItem, PlanStatus, PlanStep, UserItem};
 
 /// The first-run steps. Never more than four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -397,6 +405,9 @@ pub struct PaletteState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
+    /// Which half of Detect's findings is showing (a view choice, not part of the project).
+    #[serde(skip)]
+    pub detect_tab: Option<crate::detect_tabs::DetectTab>,
     pub screen: Screen,
     pub first_run: FirstRunStep,
     pub purpose: Purpose,
@@ -442,6 +453,9 @@ pub struct UiState {
     /// The project's prompt box asks questions about the build instead of asking for changes.
     #[serde(default)]
     pub just_ask: bool,
+    /// How tall the plan's steps are, dragged by the person (#826); `None`: the usual height.
+    #[serde(default)]
+    pub plan_height: Option<f32>,
     /// What the Pin dialog is choosing.
     #[serde(skip)]
     pub pin_draft: crate::pins::PinDraft,
@@ -526,6 +540,7 @@ impl PluginForm {
 impl Default for UiState {
     fn default() -> Self {
         UiState {
+            detect_tab: None,
             screen: Screen::Home,
             first_run: FirstRunStep::Welcome,
             purpose: Purpose::OwnOrAuthorized,
@@ -558,6 +573,7 @@ impl Default for UiState {
             sidebar_folded: false,
             pins_collapsed: false,
             just_ask: false,
+            plan_height: None,
             pin_draft: Default::default(),
             answers: BTreeMap::new(),
             plugin_form: PluginForm::default(),

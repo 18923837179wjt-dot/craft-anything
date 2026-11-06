@@ -33,6 +33,9 @@ pub struct Interface {
     /// Timestamp units per second, as a power: (base 10 or 2, exponent).
     #[serde(skip)]
     tsresol: (u8, u8),
+    /// Signed offset in seconds added to timestamps on this interface (`if_tsoffset`).
+    #[serde(skip)]
+    tsoffset: i64,
 }
 
 /// The plain name of a link-layer type.
@@ -96,6 +99,10 @@ fn rd_u32(r: &Reader<'_>, le: bool, off: usize) -> Option<u32> {
     if le { r.u32_le(off) } else { r.u32_be(off) }
 }
 
+fn rd_i64(r: &Reader<'_>, le: bool, off: usize) -> Option<i64> {
+    if le { r.u64_le(off) } else { r.u64_be(off) }.map(|v| v as i64)
+}
+
 /// True when the bytes start like a pcap or pcapng file.
 pub fn is_capture(data: &[u8]) -> bool {
     let r = Reader::new(data);
@@ -124,10 +131,11 @@ impl<'a> Capture<'a> {
             let major = rd_u16(&r, le, 4).ok_or_else(|| FormatError::Truncated("pcap header".into()))?;
             let minor = rd_u16(&r, le, 6).unwrap_or(0);
             let snaplen = rd_u32(&r, le, 16).ok_or_else(|| FormatError::Truncated("pcap header".into()))?;
-            // The top bits of the link field can carry FCS information; the type is the low 28 bits.
-            let link = rd_u32(&r, le, 20).ok_or_else(|| FormatError::Truncated("pcap header".into()))? & 0x0fff_ffff;
+            // Link type: bits 0–15; reserved: 16–25 and 27; FCS-present: 26; FCS length in 16-bit words: 28–31.
+            let link = rd_u32(&r, le, 20).ok_or_else(|| FormatError::Truncated("pcap header".into()))? & 0xffff;
             let res = if nanos { (10, 9) } else { (10, 6) };
-            Ok((Kind::Classic { le, nanos }, format!("{major}.{minor}"), Interface { link_type: link, link_name: link_name(link), snaplen, tsresol: res }))
+            let iface = Interface { link_type: link, link_name: link_name(link), snaplen, tsresol: res, tsoffset: 0 };
+            Ok((Kind::Classic { le, nanos }, format!("{major}.{minor}"), iface))
         };
         match (magic_le, magic_be) {
             (CLASSIC_US, _) | (_, CLASSIC_US) | (CLASSIC_NS, _) | (_, CLASSIC_NS) => {
@@ -162,12 +170,14 @@ impl<'a> Capture<'a> {
 
     fn ts(&self, iface: usize, units: u64) -> Option<u64> {
         let (base, exp) = self.interfaces.get(iface).map(|i| i.tsresol).unwrap_or((10, 6));
+        let offset_s = self.interfaces.get(iface).map(|i| i.tsoffset).unwrap_or(0);
         let ns = if base == 10 {
             if exp <= 9 { u128::from(units) * 10u128.pow(u32::from(9 - exp)) } else { u128::from(units) / 10u128.checked_pow(u32::from(exp - 9))? }
         } else {
             (u128::from(units) * 1_000_000_000) >> exp.min(127)
         };
-        u64::try_from(ns).ok()
+        let adjusted = i128::try_from(ns).ok()?.checked_add(i128::from(offset_s) * 1_000_000_000)?;
+        u64::try_from(adjusted).ok()
     }
 
     fn frame(&mut self, iface: usize, ts_units: u64, data: &'a [u8], original_len: u32) -> Frame<'a> {
@@ -214,14 +224,26 @@ impl<'a> Capture<'a> {
                     _ if r.u32_be(p + 8) == Some(NG_BOM) => false,
                     _ => return self.stop(format!("section header at offset {p} has no byte-order mark")),
                 };
-                self.kind = Kind::Ng { le };
-                self.section_base = self.interfaces.len();
             }
             let Some(blen) = rd_u32(&r, le, p + 4).and_then(|v| usize::try_from(v).ok()) else {
                 return self.stop(format!("block at offset {p} is cut short"));
             };
-            if blen < 12 || blen % 4 != 0 || r.slice(p, blen).is_none() {
+            let minimum = match btype {
+                NG_SHB => 28,
+                1 => 20,
+                2 | 6 => 32,
+                3 => 16,
+                _ => 12,
+            };
+            if blen < minimum || blen % 4 != 0 || r.slice(p, blen).is_none() {
                 return self.stop(format!("block at offset {p} has an impossible length {blen}"));
+            }
+            if rd_u32(&r, le, p + blen - 4).and_then(|n| usize::try_from(n).ok()) != Some(blen) {
+                return self.stop(format!("block at offset {p} has an inconsistent trailing length"));
+            }
+            if btype == NG_SHB {
+                self.kind = Kind::Ng { le };
+                self.section_base = self.interfaces.len();
             }
             self.pos = p + blen;
             let body = p + 8;
@@ -231,6 +253,7 @@ impl<'a> Capture<'a> {
                     let link = u32::from(rd_u16(&r, le, body).unwrap_or(u16::MAX));
                     let snaplen = rd_u32(&r, le, body + 4).unwrap_or(0);
                     let mut tsresol = (10u8, 6u8);
+                    let mut tsoffset = 0i64;
                     let mut o = body + 8;
                     while o + 4 <= body_end {
                         let (Some(code), Some(len)) = (rd_u16(&r, le, o), rd_u16(&r, le, o + 2)) else { break };
@@ -239,13 +262,20 @@ impl<'a> Capture<'a> {
                         }
                         if code == 9
                             && len == 1
+                            && o + 5 <= body_end
                             && let Some(v) = r.u8(o + 4)
                         {
                             tsresol = if v & 0x80 == 0 { (10, v) } else { (2, v & 0x7f) };
+                        } else if code == 14
+                            && len == 8
+                            && o + 12 <= body_end
+                            && let Some(v) = rd_i64(&r, le, o + 4)
+                        {
+                            tsoffset = v;
                         }
                         o += 4 + usize::from(len).div_ceil(4) * 4;
                     }
-                    self.interfaces.push(Interface { link_type: link, link_name: link_name(link), snaplen, tsresol });
+                    self.interfaces.push(Interface { link_type: link, link_name: link_name(link), snaplen, tsresol, tsoffset });
                 }
                 6 | 2 => {
                     let (iface, hi, lo, cap, orig) = if btype == 6 {
@@ -564,25 +594,37 @@ fn ipv6(p: &[u8], d: &mut Decoded) {
     d.protocols.push("ipv6");
     let ip6 = |b: &[u8]| IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(b).unwrap_or([0; 16])));
     let end = (40 + usize::from(plen)).min(p.len());
+    let payload_reader = Reader::new(p.get(..end).unwrap_or(&[]));
     let mut off = 40usize;
     let mut fragment = false;
     for _ in 0..8 {
         match next {
             0 | 43 | 60 => {
-                let (Some(n), Some(l)) = (r.u8(off), r.u8(off + 1)) else { break };
+                let (Some(n), Some(l)) = (payload_reader.u8(off), payload_reader.u8(off + 1)) else { break };
+                let len = (usize::from(l) + 1) * 8;
+                if off.checked_add(len).is_none_or(|next_off| next_off > end) {
+                    break;
+                }
                 next = n;
-                off += (usize::from(l) + 1) * 8;
+                off += len;
             }
             44 => {
-                let (Some(n), Some(fo)) = (r.u8(off), r.u16_be(off + 2)) else { break };
+                if off.checked_add(8).is_none_or(|next_off| next_off > end) {
+                    break;
+                }
+                let (Some(n), Some(fo)) = (payload_reader.u8(off), payload_reader.u16_be(off + 2)) else { break };
                 next = n;
                 fragment = fo & 0xfff8 != 0;
                 off += 8;
             }
             51 => {
-                let (Some(n), Some(l)) = (r.u8(off), r.u8(off + 1)) else { break };
+                let (Some(n), Some(l)) = (payload_reader.u8(off), payload_reader.u8(off + 1)) else { break };
+                let len = (usize::from(l) + 2) * 4;
+                if off.checked_add(len).is_none_or(|next_off| next_off > end) {
+                    break;
+                }
                 next = n;
-                off += (usize::from(l) + 2) * 4;
+                off += len;
             }
             _ => break,
         }
@@ -616,27 +658,47 @@ fn transport(proto: u8, p: &[u8], d: &mut Decoded) {
     };
     match proto {
         6 => {
-            let (Some(sp), Some(dp), Some(seq), Some(ack), Some(off), Some(flags), Some(win)) =
-                (r.u16_be(0), r.u16_be(2), r.u32_be(4), r.u32_be(8), r.u8(12), r.u8(13), r.u16_be(14))
-            else {
+            let (Some(sp), Some(dp)) = (r.u16_be(0), r.u16_be(2)) else {
                 d.note = Some("TCP header cut short".into());
                 return;
             };
             d.protocols.push("tcp");
-            let payload = p.get(usize::from(off >> 4) * 4..).unwrap_or(&[]);
+            let (seq, ack, off, flags, win) = (r.u32_be(4), r.u32_be(8), r.u8(12), r.u8(13), r.u16_be(14));
+            let payload = match off.map(|off| usize::from(off >> 4) * 4) {
+                Some(length) if length < 20 => {
+                    d.note = Some("TCP data offset is smaller than its header".into());
+                    &[][..]
+                }
+                Some(length) if length <= p.len() => p.get(length..).unwrap_or(&[]),
+                _ => {
+                    d.note = Some("TCP header cut short".into());
+                    &[][..]
+                }
+            };
             d.transport = Some(Transport {
                 protocol: "tcp",
                 src_port: Some(sp),
                 dst_port: Some(dp),
-                tcp_flags: Some(tcp_flags(flags)),
-                seq: Some(seq),
-                ack: Some(ack),
-                window: Some(win),
+                tcp_flags: flags.map(tcp_flags),
+                seq,
+                ack,
+                window: win,
                 payload_len: payload.len(),
                 ..empty
             });
-            if (sp == 53 || dp == 53) && payload.len() > 2 {
-                dns(payload.get(2..).unwrap_or(&[]), d, "dns");
+            if (sp == 53 || dp == 53) && !payload.is_empty() {
+                let framed = Reader::new(payload);
+                match framed.u16_be(0) {
+                    Some(length) if length < 12 => d.note = Some("DNS over TCP length is smaller than its header".into()),
+                    Some(length) => {
+                        if let Some(message) = framed.slice(2, usize::from(length)) {
+                            dns(message, d, "dns");
+                        } else {
+                            d.note = Some("DNS over TCP message cut short".into());
+                        }
+                    }
+                    None => d.note = Some("DNS over TCP length prefix cut short".into()),
+                }
             } else if !payload.is_empty() {
                 tcp_app(payload, d);
             }
@@ -647,7 +709,19 @@ fn transport(proto: u8, p: &[u8], d: &mut Decoded) {
                 return;
             };
             d.protocols.push("udp");
-            let payload = p.get(8..).unwrap_or(&[]);
+            let length = r.u16_be(4).map(usize::from).unwrap_or(0);
+            let payload = if p.len() < 8 {
+                d.note = Some("UDP header cut short".into());
+                &[][..]
+            } else if length < 8 {
+                d.note = Some("UDP length is smaller than its header".into());
+                &[][..]
+            } else {
+                if length > p.len() {
+                    d.note = Some("UDP datagram cut short".into());
+                }
+                p.get(8..length.min(p.len())).unwrap_or(&[])
+            };
             d.transport = Some(Transport { protocol: "udp", src_port: Some(sp), dst_port: Some(dp), payload_len: payload.len(), ..empty });
             if sp == 53 || dp == 53 {
                 dns(payload, d, "dns");
@@ -763,10 +837,27 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str) {
                 (28, 16) => Ipv6Addr::from(<[u8; 16]>::try_from(rd).unwrap_or([0; 16])).to_string(),
                 (2 | 5 | 12, _) => dns_name(msg, rd_off).map(|(n, _)| n).unwrap_or_default(),
                 (15, _) => dns_name(msg, rd_off + 2).map(|(n, _)| n).unwrap_or_default(),
-                (16, _) => rd
-                    .get(1..)
-                    .map(|t| String::from_utf8_lossy(t.get(..usize::from(rd.first().copied().unwrap_or(0))).unwrap_or(t)).into_owned())
-                    .unwrap_or_default(),
+                (16, _) => {
+                    // RFC 1035 §3.3.14: one TXT RDATA holds any number of
+                    // length-prefixed character strings, and a zero-length
+                    // string does not end the record. Consumers join them all
+                    // (RFC 7208 §3.3), so keep every string instead of the
+                    // first one and skip the rest of the RDATA.
+                    let mut txt = String::new();
+                    let mut pos = 0;
+                    while let Some(&len) = rd.get(pos) {
+                        let len = usize::from(len);
+                        let end = (pos + 1).saturating_add(len).min(rd.len());
+                        match rd.get(pos + 1..end) {
+                            Some(part) => {
+                                txt.push_str(&String::from_utf8_lossy(part));
+                                pos = end;
+                            }
+                            None => break,
+                        }
+                    }
+                    txt
+                }
                 (_, n) => format!("<{n} bytes>"),
             };
             out.answers.push(DnsAnswer { name, rtype: qtype_name(rt), ttl, value });
@@ -825,7 +916,11 @@ fn tls(p: &[u8], d: &mut Decoded) {
         return;
     }
     d.protocols.push("tls");
-    if ct != 22 || r.u8(5) != Some(1) {
+    let Some(record_len) = r.u16_be(3) else { return };
+    let record_end = 5 + usize::from(record_len);
+    let record_end_available = record_end.min(p.len());
+    let record = Reader::new(p.get(..record_end_available).unwrap_or(&[]));
+    if ct != 22 || record.u8(5) != Some(1) {
         return;
     }
     let ver = |v: u16| match v {
@@ -837,70 +932,138 @@ fn tls(p: &[u8], d: &mut Decoded) {
         v if v & 0x0f0f == 0x0a0a => "GREASE".into(),
         v => format!("{v:#06x}"),
     };
-    let mut hello =
-        TlsHello { record_version: ver(u16::from_be_bytes([major, minor])), sni: None, alpn: Vec::new(), supported_versions: Vec::new(), partial: false };
-    // Record header (5) + handshake header (4) + client_version (2) + random (32).
-    let mut off = 5 + 4 + 2 + 32;
-    let skip8 = |off: usize| r.u8(off).map(|n| off + 1 + usize::from(n));
-    let skip16 = |off: usize| r.u16_be(off).map(|n| off + 2 + usize::from(n));
-    let Some(o) = skip8(off).and_then(skip16).and_then(skip8) else {
+    let mut hello = TlsHello {
+        record_version: ver(u16::from_be_bytes([major, minor])),
+        sni: None,
+        alpn: Vec::new(),
+        supported_versions: Vec::new(),
+        partial: record_end > p.len(),
+    };
+    let Some(handshake_header) = record.u32_be(5) else {
         hello.partial = true;
         d.tls = Some(hello);
         return;
     };
-    off = o;
+    let handshake_end = 9 + (handshake_header & 0x00ff_ffff) as usize;
+    hello.partial |= handshake_end > record_end_available;
+    let hello_end = handshake_end.min(record_end_available);
+    let r = Reader::new(p.get(..hello_end).unwrap_or(&[]));
+    // Every variable-length field must fit inside this handshake, not merely the packet.
+    let skip8 = |off: usize| {
+        let n = usize::from(r.u8(off)?);
+        r.slice(off + 1, n)?;
+        Some(off + 1 + n)
+    };
+    let skip16 = |off: usize| {
+        let n = usize::from(r.u16_be(off)?);
+        r.slice(off + 2, n)?;
+        Some(off + 2 + n)
+    };
+    // Record header (5) + handshake header (4) + client_version (2) + random (32).
+    let Some(off) = skip8(5 + 4 + 2 + 32).and_then(skip16).and_then(skip8) else {
+        hello.partial = true;
+        d.tls = Some(hello);
+        return;
+    };
+    // Extensions are optional in a complete ClientHello through TLS 1.2.
+    if off == handshake_end && hello_end == handshake_end {
+        d.tls = Some(hello);
+        return;
+    }
     let Some(ext_len) = r.u16_be(off) else {
         hello.partial = true;
         d.tls = Some(hello);
         return;
     };
-    let end = off + 2 + usize::from(ext_len);
-    hello.partial = end > p.len();
+    let declared_end = off + 2 + usize::from(ext_len);
+    hello.partial |= declared_end != handshake_end;
+    let end = declared_end.min(hello_end);
+    let extensions = Reader::new(p.get(..end).unwrap_or(&[]));
     let mut e = off + 2;
-    while e + 4 <= end.min(p.len()) {
-        let (Some(t), Some(l)) = (r.u16_be(e), r.u16_be(e + 2)) else { break };
+    while e + 4 <= end {
+        let (Some(t), Some(l)) = (extensions.u16_be(e), extensions.u16_be(e + 2)) else { break };
         let body = e + 4;
-        let Some(data) = r.slice(body, usize::from(l)) else {
+        let Some(data) = extensions.slice(body, usize::from(l)) else {
             hello.partial = true;
             break;
         };
         let dr = Reader::new(data);
         match t {
             0 => {
-                if dr.u8(2) == Some(0)
-                    && let Some(n) = dr.u16_be(3).and_then(|n| dr.slice(5, usize::from(n)))
-                {
-                    hello.sni = Some(n.iter().map(|&c| if c.is_ascii_graphic() { char::from(c) } else { '?' }).collect());
+                if let Some(len) = dr.u16_be(0) {
+                    let list_end = 2 + usize::from(len);
+                    hello.partial |= list_end != data.len();
+                    let names = Reader::new(data.get(..list_end.min(data.len())).unwrap_or(&[]));
+                    let mut a = 2;
+                    while a < list_end.min(data.len()) {
+                        let (Some(kind), Some(len)) = (names.u8(a), names.u16_be(a + 1)) else {
+                            hello.partial = true;
+                            break;
+                        };
+                        let Some(name) = names.slice(a + 3, usize::from(len)) else {
+                            hello.partial = true;
+                            break;
+                        };
+                        if kind == 0 {
+                            if name.is_empty() {
+                                hello.partial = true;
+                            } else if hello.sni.is_none() {
+                                hello.sni = Some(name.iter().map(|&c| if c.is_ascii_graphic() { char::from(c) } else { '?' }).collect());
+                            }
+                        }
+                        a += 3 + usize::from(len);
+                    }
+                } else {
+                    hello.partial = true;
                 }
             }
             16 => {
-                let mut a = 2usize;
-                while let Some(n) = dr.u8(a) {
-                    let Some(proto) = dr.slice(a + 1, usize::from(n)) else { break };
-                    hello.alpn.push(String::from_utf8_lossy(proto).into_owned());
-                    a += 1 + usize::from(n);
-                    if hello.alpn.len() >= 16 {
-                        break;
+                if let Some(len) = dr.u16_be(0) {
+                    let list_end = 2 + usize::from(len);
+                    hello.partial |= list_end != data.len();
+                    let protocols = Reader::new(data.get(..list_end.min(data.len())).unwrap_or(&[]));
+                    let mut a = 2usize;
+                    while a < list_end.min(data.len()) && hello.alpn.len() < 16 {
+                        let Some(n) = protocols.u8(a).filter(|&n| n > 0) else {
+                            hello.partial = true;
+                            break;
+                        };
+                        let Some(proto) = protocols.slice(a + 1, usize::from(n)) else {
+                            hello.partial = true;
+                            break;
+                        };
+                        hello.alpn.push(String::from_utf8_lossy(proto).into_owned());
+                        a += 1 + usize::from(n);
                     }
+                } else {
+                    hello.partial = true;
                 }
             }
             43 => {
-                let mut a = 1usize;
-                while let Some(v) = dr.u16_be(a) {
-                    let name = ver(v);
-                    if name != "GREASE" {
-                        hello.supported_versions.push(name);
+                if let Some(len) = dr.u8(0) {
+                    let list_end = 1 + usize::from(len);
+                    hello.partial |= list_end != data.len() || len % 2 != 0;
+                    let versions = Reader::new(data.get(..list_end.min(data.len())).unwrap_or(&[]));
+                    let mut a = 1usize;
+                    while let Some(v) = versions.u16_be(a) {
+                        let name = ver(v);
+                        if name != "GREASE" {
+                            hello.supported_versions.push(name);
+                        }
+                        a += 2;
+                        if hello.supported_versions.len() >= 16 {
+                            break;
+                        }
                     }
-                    a += 2;
-                    if hello.supported_versions.len() >= 16 {
-                        break;
-                    }
+                } else {
+                    hello.partial = true;
                 }
             }
             _ => {}
         }
         e = body + usize::from(l);
     }
+    hello.partial |= e != end;
     d.tls = Some(hello);
 }
 
@@ -961,6 +1124,8 @@ pub struct Flow {
     pub bytes: u64,
     pub packets_a_to_b: u64,
     pub packets_b_to_a: u64,
+    pub bytes_a_to_b: u64,
+    pub bytes_b_to_a: u64,
     pub first_frame: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_ts_ns: Option<u64>,
@@ -997,6 +1162,9 @@ pub struct Summary {
     pub dns_queries: Vec<Count>,
     /// "name TYPE value" from DNS responses.
     pub dns_answers: Vec<Count>,
+    /// "question A|AAAA address" from DNS responses: each address answered, keyed by the response's first
+    /// question (so CNAME chains end at the name that was asked), as Wireshark's fields report them.
+    pub dns_addresses: Vec<Count>,
     /// "METHOD host target" from HTTP/1.x requests.
     pub http_requests: Vec<Count>,
     /// Server names from TLS ClientHellos.
@@ -1045,6 +1213,7 @@ pub fn summarize(data: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Summary, F
     let mut flow_rows: Vec<Flow> = Vec::new();
     let (mut protocols, mut stacks, mut endpoints) = (Tally::default(), Tally::default(), Tally::default());
     let (mut queries, mut answers, mut http, mut sni, mut alpn) = (Tally::default(), Tally::default(), Tally::default(), Tally::default(), Tally::default());
+    let mut addresses = Tally::default();
     for f in cap.by_ref() {
         if f.number % 4096 == 0 && cancelled() {
             return Err(FormatError::Malformed("cancelled".into()));
@@ -1056,8 +1225,10 @@ pub fn summarize(data: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Summary, F
             s.last_ts_ns = Some(s.last_ts_ns.map_or(t, |x| x.max(t)));
         }
         let d = decode(f.link_type, f.data);
-        for p in &d.protocols {
-            protocols.add((*p).to_string());
+        for (i, p) in d.protocols.iter().enumerate() {
+            if !d.protocols[..i].contains(p) {
+                protocols.add((*p).to_string());
+            }
         }
         stacks.add(d.stack());
         let Some(ip) = &d.ip else {
@@ -1081,6 +1252,8 @@ pub fn summarize(data: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Summary, F
                     bytes: 0,
                     packets_a_to_b: 0,
                     packets_b_to_a: 0,
+                    bytes_a_to_b: 0,
+                    bytes_b_to_a: 0,
                     first_frame: f.number,
                     first_ts_ns: f.ts_ns,
                     last_ts_ns: f.ts_ns,
@@ -1092,8 +1265,10 @@ pub fn summarize(data: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Summary, F
                 row.bytes += u64::from(f.original_len);
                 if forward {
                     row.packets_a_to_b += 1;
+                    row.bytes_a_to_b += u64::from(f.original_len);
                 } else {
                     row.packets_b_to_a += 1;
+                    row.bytes_b_to_a += u64::from(f.original_len);
                 }
                 if f.ts_ns.is_some() {
                     row.last_ts_ns = f.ts_ns;
@@ -1111,6 +1286,13 @@ pub fn summarize(data: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Summary, F
             }
             for a in &dns.answers {
                 answers.add(format!("{} {} {}", a.name, a.rtype, a.value));
+            }
+            if dns.response
+                && let Some(q) = dns.questions.first()
+            {
+                for a in dns.answers.iter().filter(|a| matches!(a.rtype.as_str(), "A" | "AAAA") && a.value.parse::<IpAddr>().is_ok()) {
+                    addresses.add(format!("{} {} {}", q.name, a.rtype, a.value));
+                }
             }
         }
         if let Some(h) = &d.http
@@ -1136,6 +1318,7 @@ pub fn summarize(data: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Summary, F
     s.endpoints = endpoints.done("endpoints", &mut capped);
     s.dns_queries = queries.done("dns_queries", &mut capped);
     s.dns_answers = answers.done("dns_answers", &mut capped);
+    s.dns_addresses = addresses.done("dns_addresses", &mut capped);
     s.http_requests = http.done("http_requests", &mut capped);
     s.tls_sni = sni.done("tls_sni", &mut capped);
     s.tls_alpn = alpn.done("tls_alpn", &mut capped);
@@ -1167,7 +1350,157 @@ pub fn iso8601(ns: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use craft_anything_testkit::pcap::{dns_query, pcap, pcapng, sample_frames, udp};
+    use craft_anything_testkit::pcap::{dns_query, eth, ipv4_pkt, pcap, pcapng, sample_frames, udp};
+
+    #[test]
+    fn tcp_cut_inside_header_keeps_ports() {
+        // Ports sit in the first 4 bytes; a cut later in the header must not drop them (as UDP).
+        let mut tcp = Vec::new();
+        tcp.extend(41000u16.to_be_bytes());
+        tcp.extend(9000u16.to_be_bytes());
+        tcp.extend([0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 4, 0, 0, 0, 0, 0]);
+        let mut frame = eth(0x0800, &ipv4_pkt(6, [10, 0, 0, 1], [10, 0, 0, 2], &tcp));
+        frame.truncate(14 + 20 + 11);
+        let d = decode(1, &frame);
+        let t = d.transport.unwrap();
+        assert_eq!((t.src_port, t.dst_port), (Some(41000), Some(9000)));
+        assert_eq!(t.seq, Some(1));
+        assert_eq!(t.ack, None);
+        assert_eq!(t.window, None);
+        assert!(d.protocols.contains(&"tcp"));
+    }
+
+    /// One-answer DNS response for `example.com` with a TXT answer carrying `rdata`.
+    fn txt_response(rdata: &[u8]) -> Vec<u8> {
+        let mut m = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        m.extend(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        m.extend([0xc0, 12, 0, 16, 0, 1, 0, 0, 0x00, 0x3c]);
+        m.extend((rdata.len() as u16).to_be_bytes());
+        m.extend(rdata);
+        m
+    }
+
+    #[test]
+    fn dns_txt_answer_keeps_every_character_string() {
+        // RFC 1035 §3.3.14: one TXT RDATA holds any number of length-prefixed
+        // character strings. Only the first used to survive (issue #330).
+        let rdata = [
+            5, b'f', b'i', b'r', b's', b't', // "first"
+            6, b's', b'e', b'c', b'o', b'n', b'd', // "second"
+        ];
+        let frame = eth(0x0800, &ipv4_pkt(17, [8, 8, 8, 8], [192, 168, 1, 10], &udp(53, 50000, &txt_response(&rdata))));
+        let d = decode(1, &frame);
+        let dns = d.dns.unwrap();
+        assert_eq!(dns.answers.len(), 1);
+        assert_eq!(dns.answers[0].rtype, "TXT");
+        assert_eq!(dns.answers[0].value, "firstsecond");
+        assert!(!dns.incomplete);
+    }
+
+    #[test]
+    fn dns_txt_empty_first_string_keeps_later_content() {
+        // A zero-length character string does not end the record.
+        let rdata = [0, 6, b's', b'e', b'c', b'o', b'n', b'd'];
+        let frame = eth(0x0800, &ipv4_pkt(17, [8, 8, 8, 8], [192, 168, 1, 10], &udp(53, 50000, &txt_response(&rdata))));
+        let d = decode(1, &frame);
+        let dns = d.dns.unwrap();
+        assert_eq!(dns.answers.len(), 1);
+        assert_eq!(dns.answers[0].value, "second");
+        assert!(!dns.incomplete);
+    }
+
+    fn classic_link_word(link_word: u32, le: bool, nanos: bool, trailer: usize) {
+        let link = link_word & 0xffff;
+        let mut frame = sample_frames()[1].clone();
+        if link == 101 {
+            frame.drain(..14);
+        }
+        frame.extend(vec![0xab; trailer]);
+        let word = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let short = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let mut data = word(if nanos { CLASSIC_NS } else { CLASSIC_US }).to_vec();
+        data.extend(short(2));
+        data.extend(short(4));
+        data.extend([0; 8]);
+        data.extend(word(65535));
+        data.extend(word(link_word));
+        data.extend(word(1_700_000_000));
+        data.extend(word(500));
+        data.extend(word(frame.len() as u32));
+        data.extend(word(frame.len() as u32));
+        data.extend(&frame);
+
+        let mut cap = Capture::new(&data).unwrap();
+        assert_eq!(cap.interfaces[0].link_type, link);
+        assert_eq!(cap.interfaces[0].link_name, if link == 1 { "Ethernet" } else { "raw IP" });
+        let packet = cap.next().unwrap();
+        assert_eq!(packet.link_type, link);
+        assert_eq!(packet.data, frame);
+        assert_eq!(packet.ts_ns, Some(1_700_000_000_000_000_000 + if nanos { 500 } else { 500_000 }));
+        let d = decode(packet.link_type, packet.data);
+        assert_eq!(d.stack(), if link == 1 { "eth:ipv4:udp:dns" } else { "raw:ipv4:udp:dns" });
+        let ip = d.ip.unwrap();
+        assert_eq!(ip.src.to_string(), "8.8.8.8");
+        assert_eq!(ip.dst.to_string(), "192.168.1.10");
+        let dns = d.dns.unwrap();
+        assert!(dns.response);
+        assert_eq!(dns.answers[0].value, "93.184.216.34");
+        assert!(cap.next().is_none());
+
+        let s = summarize(&data, &|| false).unwrap();
+        assert_eq!(s.packets, 1);
+        assert_eq!(s.undecoded_frames, 0);
+        assert_eq!(s.dns_answers[0].value, "example.com A 93.184.216.34");
+        assert_eq!(s.flows[0].protocol, "udp");
+        assert!(s.warnings.is_empty());
+    }
+
+    #[test]
+    fn fcs_bits_do_not_change_the_ethernet_link_type() {
+        classic_link_word(0x24000001, true, false, 4);
+    }
+
+    #[test]
+    fn fcs_bits_are_masked_in_big_endian_files() {
+        classic_link_word(0x24000001, false, false, 4);
+    }
+
+    #[test]
+    fn fcs_bits_are_masked_in_nanosecond_files() {
+        classic_link_word(0x24000001, true, true, 4);
+    }
+
+    #[test]
+    fn fcs_bits_are_masked_in_big_endian_nanosecond_files() {
+        classic_link_word(0x24000001, false, true, 4);
+        classic_link_word(1, false, true, 0);
+    }
+
+    #[test]
+    fn fcs_bits_do_not_change_big_endian_nanosecond_raw_ip() {
+        classic_link_word(0x24000065, false, true, 4);
+        classic_link_word(101, false, true, 0);
+    }
+
+    #[test]
+    fn a_one_word_fcs_length_is_masked() {
+        classic_link_word(0x14000001, true, false, 2);
+    }
+
+    #[test]
+    fn fcs_bits_do_not_change_the_raw_ip_link_type() {
+        classic_link_word(0x24000065, true, false, 4);
+    }
+
+    #[test]
+    fn ethernet_without_fcs_bits_still_decodes() {
+        classic_link_word(1, true, false, 0);
+    }
+
+    #[test]
+    fn raw_ip_without_fcs_bits_still_decodes() {
+        classic_link_word(101, true, false, 0);
+    }
 
     #[test]
     fn decodes_dns_tls_http() {
@@ -1220,6 +1553,62 @@ mod tests {
         assert_eq!(summarize(&pcap(&frames), &|| false).unwrap().format, "pcap");
         assert_eq!(iso8601(1_700_000_000_000_000_500), "2023-11-14T22:13:20.000000500Z");
         assert_eq!(iso8601(0), "1970-01-01T00:00:00.000000000Z");
+    }
+
+    #[test]
+    fn qinq_frames_count_vlan_once_per_frame() {
+        let mut payload = vec![0x00, 0x0a, 0x81, 0x00, 0x00, 0x14, 0x08, 0x00];
+        payload.extend(ipv4_pkt(17, [10, 0, 0, 1], [10, 0, 0, 2], &udp(40000, 9999, b"ping")));
+        let frame = eth(0x88a8, &payload);
+        let s = summarize(&pcap(&[frame.clone(), frame.clone(), frame]), &|| false).unwrap();
+        let count = |name: &str| s.protocols.iter().find(|c| c.value == name).map(|c| c.count);
+        assert_eq!(s.stacks[0].value, "eth:vlan:vlan:ipv4:udp");
+        assert_eq!(count("vlan"), Some(3));
+        assert_eq!(count("eth"), Some(3));
+        assert_eq!(count("ipv4"), Some(3));
+    }
+
+    #[test]
+    fn flows_count_bytes_per_direction() {
+        let req = eth(0x0800, &ipv4_pkt(17, [10, 0, 0, 1], [10, 0, 0, 2], &udp(40000, 9999, &[b'q'; 10])));
+        let rep = eth(0x0800, &ipv4_pkt(17, [10, 0, 0, 2], [10, 0, 0, 1], &udp(9999, 40000, &[b'r'; 300])));
+        let s = summarize(&pcap(&[req, rep]), &|| false).unwrap();
+        let flow = serde_json::to_value(&s.flows[0]).unwrap();
+        assert_eq!(flow["bytes"], 394);
+        assert_eq!(flow["bytes_a_to_b"], 52);
+        assert_eq!(flow["bytes_b_to_a"], 342);
+    }
+
+    #[test]
+    fn pcapng_interface_tsoffset_adjusts_timestamps() {
+        let base = pcapng(&sample_frames());
+        for offset_s in [3600i64, -50i64] {
+            let mut data = base[..52].to_vec();
+            data.extend(14u16.to_le_bytes());
+            data.extend(8u16.to_le_bytes());
+            data.extend(offset_s.to_le_bytes());
+            data.extend(&base[52..]);
+            data[32..36].copy_from_slice(&44u32.to_le_bytes());
+            data[68..72].copy_from_slice(&44u32.to_le_bytes());
+            let expected0 = (1_700_000_000_000_000_000i128 + i128::from(offset_s) * 1_000_000_000) as u64;
+            let frames: Vec<_> = Capture::new(&data).unwrap().collect();
+            assert_eq!(frames[0].ts_ns, Some(expected0));
+            let s = summarize(&data, &|| false).unwrap();
+            assert_eq!((s.first_ts_ns, s.last_ts_ns), (Some(expected0), Some(expected0 + 6)));
+            assert_eq!((s.flows[0].first_ts_ns, s.flows[0].last_ts_ns), (Some(expected0), Some(expected0 + 1)));
+        }
+    }
+
+    #[test]
+    fn ipv6_extension_outside_declared_payload_is_ignored() {
+        let mut v6 = vec![0x60, 0, 0, 0];
+        v6.extend(0u16.to_be_bytes());
+        v6.extend([60, 64]);
+        v6.extend([0u8; 32]);
+        v6.extend([17, 0, 0, 0, 0, 0, 0, 0]);
+
+        let d = decode(101, &v6);
+        assert_eq!(d.ip.unwrap().protocol, 60);
     }
 
     #[test]

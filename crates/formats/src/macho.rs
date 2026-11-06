@@ -26,6 +26,7 @@ pub struct FatSlice {
 pub fn cpu_name(cputype: u32, sub: u32) -> String {
     match cputype {
         7 => "i386".into(),
+        0x0100_0007 if sub & 0x00ff_ffff == 8 => "x86_64h".into(),
         0x0100_0007 => "x86_64".into(),
         12 => "arm".into(),
         0x0100_000c => {
@@ -585,6 +586,69 @@ mod tests {
     use super::*;
     use craft_anything_testkit as tk;
 
+    fn executable_with_header_symbol(helper: Option<u8>) -> Vec<u8> {
+        let mut symtab = vec![0u8; 24];
+        symtab[0..4].copy_from_slice(&2u32.to_le_bytes());
+        symtab[4..8].copy_from_slice(&24u32.to_le_bytes());
+        let mut m = tk::apple::macho_min(tk::apple::CPU_ARM64, 2, &[symtab], &[("__text", &[0; 4])]);
+        let symoff = m.len() as u32;
+        let names = b"\0__mh_execute_header\0_internal_helper\0";
+        let count = 1 + u32::from(helper.is_some());
+        for (name, kind, desc) in [(1u32, 0x0fu8, 0x10u16), (21, helper.unwrap_or(0x0e), 0)].into_iter().take(count as usize) {
+            m.extend_from_slice(&name.to_le_bytes());
+            m.extend_from_slice(&[kind, 1]);
+            m.extend_from_slice(&desc.to_le_bytes());
+            m.extend_from_slice(&0x1_0000_0000u64.to_le_bytes());
+        }
+        let stroff = m.len() as u32;
+        m.extend_from_slice(names);
+        let cmd = 32 + 72 + 80;
+        for (off, value) in [(8, symoff), (12, count), (16, stroff), (20, names.len() as u32)] {
+            m[cmd + off..cmd + off + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        m.resize(0x4000, 0);
+        m
+    }
+
+    #[test]
+    fn an_executable_with_only_its_linker_header_is_stripped() {
+        let control = crate::parse_binary(&executable_with_header_symbol(Some(0x0e))).unwrap();
+        assert!(control.symbols.iter().any(|s| s.name == "_internal_helper" && !s.global && s.defined));
+        assert!(!control.mitigations.stripped);
+        // An unstripped executable whose own functions are all external keeps their names.
+        let global = crate::parse_binary(&executable_with_header_symbol(Some(0x0f))).unwrap();
+        assert!(global.symbols.iter().any(|s| s.name == "_internal_helper" && s.global && s.defined));
+        assert!(!global.mitigations.stripped);
+        let b = crate::parse_binary(&executable_with_header_symbol(None)).unwrap();
+        assert_eq!(b.symbols.len(), 1);
+        let s = &b.symbols[0];
+        assert_eq!(s.name, "__mh_execute_header");
+        assert!(s.global && s.defined && !s.dynamic);
+        assert!(b.mitigations.stripped);
+    }
+
+    #[test]
+    fn a_haswell_request_selects_the_haswell_slice() {
+        use crate::macho_deps::{pick_slice, slice_bytes, slices};
+        let mut generic = tk::apple::macho_min(tk::apple::CPU_X86_64, 1, &[], &[("__text", &[0xc3])]);
+        generic[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let mut haswell = generic.clone();
+        haswell[8..12].copy_from_slice(&8u32.to_le_bytes());
+        for order in [vec![generic.clone(), haswell.clone()], vec![haswell.clone(), generic.clone()]] {
+            let fat = tk::macho_fat(&order);
+            let all = slices(&fat).unwrap();
+            let selected = pick_slice(&all, Some("x86_64h")).unwrap();
+            assert_eq!(selected.cpusubtype, 8);
+            assert_eq!(slice_bytes(&fat, &selected).unwrap(), haswell);
+            assert_eq!(pick_slice(&all, Some("x86_64")).unwrap().cpusubtype, 3);
+            assert!(pick_slice(&all, Some("unknown-architecture")).is_none());
+        }
+        assert_eq!(slices(&haswell).unwrap()[0].arch, "x86_64h");
+        assert_eq!(pick_slice(&slices(&generic).unwrap(), Some("x86_64h")).unwrap().cpusubtype, 3);
+        assert_eq!(cpu_name(tk::apple::CPU_X86_64, 0x8000_0008), "x86_64h");
+        assert_eq!(cpu_name(tk::apple::CPU_X86_64, 0x108), "x86_64");
+    }
+
     #[test]
     fn thin_macho_facts() {
         let m = tk::macho64();
@@ -695,5 +759,29 @@ mod tests {
             let _ = fat_slices(&d);
             let _ = crate::parse_binary(&d);
         }
+    }
+
+    #[test]
+    fn read_only_segments_keep_stub_and_unwind_sections_read_only() {
+        let mut m = tk::apple::macho_min(tk::apple::CPU_ARM64, 2, &[], &[("__text", &[0; 4]), ("__stubs", &[0; 12]), ("__unwind_info", &[0; 8])]);
+        m[32 + 72 + 64..32 + 72 + 68].copy_from_slice(&0x8000_0400u32.to_le_bytes());
+        m[32 + 72 + 80 + 64..32 + 72 + 80 + 68].copy_from_slice(&0x8000_0408u32.to_le_bytes());
+        m.resize(0x4000, 0);
+        let b = crate::parse_binary(&m).unwrap();
+        assert_eq!(b.sections.len(), 3);
+        assert!(!b.segments[0].write);
+        for s in &b.sections {
+            assert!(s.read);
+            assert!(!s.write, "{} must inherit its read-only segment", s.name);
+        }
+        assert!(b.sections[0].exec);
+        assert!(b.sections[1].exec);
+        assert!(!b.sections[2].exec);
+        m[32 + 56..32 + 60].copy_from_slice(&7u32.to_le_bytes());
+        m[32 + 60..32 + 64].copy_from_slice(&3u32.to_le_bytes());
+        let writable = crate::parse_binary(&m).unwrap();
+        assert!(writable.sections.iter().all(|s| s.read && s.write));
+        assert!(writable.sections[1].exec);
+        assert!(!writable.sections[2].exec);
     }
 }

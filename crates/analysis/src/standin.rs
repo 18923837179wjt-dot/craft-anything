@@ -501,6 +501,18 @@ impl Scrub {
         (names, kept.join("&"))
     }
 
+    /// Apply current rules to a request or a saved query. Raw requests ignore empty segments,
+    /// but canonical saved queries use empty slots for explicit empty key/value pairs (`=`).
+    fn query_text(&mut self, query: &str, preserve_empty_pairs: bool) -> String {
+        let pairs: Vec<(String, String)> = query
+            .split('&')
+            .filter(|p| preserve_empty_pairs || !p.is_empty())
+            .take(200)
+            .map(|p| p.split_once('=').map_or((p.to_string(), String::new()), |(k, v)| (k.to_string(), v.to_string())))
+            .collect();
+        self.query(&pairs, false).1
+    }
+
     fn note_header(&mut self, name: &str) {
         self.dropped.headers = self.dropped.headers.saturating_add(1);
         let l = name.to_ascii_lowercase();
@@ -838,20 +850,38 @@ pub fn build(har: &Har, opts: &BuildOptions) -> StandIn {
             note_status(route, u16::try_from(s.entry.response.status).unwrap_or(500), s.entry.response.mime.as_deref(), &mut scrub);
             continue;
         }
-        let sample = make_sample(s, opts, &mut scrub, &mut body_bytes);
-        note_status(route, sample.status, sample.content_type.as_deref(), &mut scrub);
+        let mut sample = make_sample(s, opts, &mut scrub);
         // A request polled over and over gives the same answer many times; one is enough.
-        let repeat = route.samples.last().is_some_and(|p| {
-            p.path == sample.path
-                && p.query == sample.query
-                && p.request_key == sample.request_key
-                && p.status == sample.status
-                && p.text == sample.text
-                && p.base64 == sample.base64
-        });
-        if repeat {
-            body_bytes = body_bytes.saturating_sub(sample.text.as_ref().map_or(0, String::len) + sample.base64.as_ref().map_or(0, String::len));
-        } else {
+        let repeats_last = |sample: &Sample| {
+            route.samples.last().is_some_and(|p| {
+                p.path == sample.path
+                    && p.query == sample.query
+                    && p.request_key == sample.request_key
+                    && p.status == sample.status
+                    && p.text == sample.text
+                    && p.base64 == sample.base64
+            })
+        };
+        let mut repeat = repeats_last(&sample);
+        if !repeat {
+            let size = sample.text.as_ref().map_or(0, String::len).saturating_add(sample.base64.as_ref().map_or(0, String::len));
+            if let Some(total) = body_bytes.checked_add(size).filter(|total| *total <= opts.max_total_body_bytes) {
+                body_bytes = total;
+            } else {
+                sample.text = None;
+                sample.base64 = None;
+                sample.body_left_out = Some(BodyLeftOut::FileLimit);
+                // A 304 without its cached body must remain unavailable to a fresh client.
+                if sample.was_not_modified {
+                    sample.status = 304;
+                    sample.was_not_modified = false;
+                }
+                // Leaving a body out can make it identical to the previous omitted answer.
+                repeat = repeats_last(&sample);
+            }
+        }
+        note_status(route, sample.status, sample.content_type.as_deref(), &mut scrub);
+        if !repeat {
             route.samples.push(sample);
         }
     }
@@ -899,7 +929,7 @@ fn note_status(route: &mut StandInRoute, status: u16, mime: Option<&str>, scrub:
     }
 }
 
-fn make_sample(s: &Seen<'_>, opts: &BuildOptions, scrub: &mut Scrub, body_bytes: &mut usize) -> Sample {
+fn make_sample(s: &Seen<'_>, opts: &BuildOptions, scrub: &mut Scrub) -> Sample {
     let r = &s.entry.response;
     let mut sample = Sample {
         path: s.path.clone(),
@@ -954,13 +984,8 @@ fn make_sample(s: &Seen<'_>, opts: &BuildOptions, scrub: &mut Scrub, body_bytes:
     } else {
         (Some(raw.to_string()), None)
     };
-    let size = text.as_ref().map_or(0, String::len) + binary.map_or(0, str::len);
     if text.as_ref().is_some_and(|t| t.len() > opts.max_body_bytes) {
         sample.body_left_out = Some(BodyLeftOut::TooLarge);
-        return sample;
-    }
-    if body_bytes.saturating_add(size) > opts.max_total_body_bytes {
-        sample.body_left_out = Some(BodyLeftOut::FileLimit);
         return sample;
     }
     if let Some(t) = text {
@@ -969,11 +994,14 @@ fn make_sample(s: &Seen<'_>, opts: &BuildOptions, scrub: &mut Scrub, body_bytes:
             sample.body_left_out = Some(BodyLeftOut::HeldSecret);
             return sample;
         }
-        sample.text = Some(clean_text(t, sample.content_type.as_deref(), scrub));
-        *body_bytes = body_bytes.saturating_add(sample.text.as_ref().map_or(0, String::len));
+        let clean = clean_text(t, sample.content_type.as_deref(), scrub);
+        if clean.len() > opts.max_body_bytes {
+            sample.body_left_out = Some(BodyLeftOut::TooLarge);
+            return sample;
+        }
+        sample.text = Some(clean);
     } else {
         sample.base64 = binary.map(String::from);
-        *body_bytes = body_bytes.saturating_add(size);
     }
     // The answer a 304 stands for: the body the browser had cached.
     if sample.status == 304 {
@@ -1035,6 +1063,8 @@ pub enum NoMatchReason {
     MethodNotRecorded,
     /// The URL was recorded, but not this GraphQL operation.
     OperationNotRecorded,
+    /// The matching responses need a cached body that is unavailable in the recording.
+    CachedBodyUnavailable,
 }
 
 /// A route close to what was asked for.
@@ -1113,13 +1143,7 @@ pub fn answer(standin: &StandIn, turns: &mut Turns, method: &str, path: &str, qu
     // A request is brought to the same form as the recording, so a dropped value still compares equal.
     let mut scrub = Scrub::new(&[]);
     let clean_path = scrub.path(path.split(['?', '#']).next().unwrap_or_default(), false);
-    let pairs: Vec<(String, String)> = query
-        .split('&')
-        .take(200)
-        .filter(|p| !p.is_empty())
-        .map(|p| p.split_once('=').map_or((p.to_string(), String::new()), |(k, v)| (k.to_string(), v.to_string())))
-        .collect();
-    let (_, clean_query) = scrub.query(&pairs, false);
+    let clean_query = scrub.query_text(query, false);
     let key = request_key(body);
     let key = key.as_deref();
 
@@ -1139,7 +1163,13 @@ pub fn answer(standin: &StandIn, turns: &mut Turns, method: &str, path: &str, qu
     let same_method = || standin.routes.iter().enumerate().filter(|(_, r)| r.method == look_for);
     let mut picked: Option<(usize, MatchKind, Vec<usize>)> = None;
     for (ri, route) in same_method() {
-        let exact: Vec<usize> = route.samples.iter().enumerate().filter(|(_, s)| s.path == clean_path && s.query == clean_query).map(|(i, _)| i).collect();
+        let exact: Vec<usize> = route
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.path == clean_path && (s.query == clean_query || scrub.query_text(&s.query, true) == clean_query))
+            .map(|(i, _)| i)
+            .collect();
         if let Some(fit) = consider(route, exact) {
             picked = Some((ri, MatchKind::PathAndQuery, fit));
             break;
@@ -1165,7 +1195,7 @@ pub fn answer(standin: &StandIn, turns: &mut Turns, method: &str, path: &str, qu
         }
     }
 
-    let Some((ri, how, fit)) = picked else {
+    let Some((ri, how, mut fit)) = picked else {
         let path_known = standin.routes.iter().any(|r| template_fits(&r.template, &clean_path) || r.samples.iter().any(|s| s.path == clean_path));
         let reason = if operation_missing {
             NoMatchReason::OperationNotRecorded
@@ -1179,6 +1209,13 @@ pub fn answer(standin: &StandIn, turns: &mut Turns, method: &str, path: &str, qu
     let Some(route) = standin.routes.get(ri) else {
         return Answer::NoMatch(NoMatch { reason: NoMatchReason::PathNotRecorded, nearest: Vec::new() });
     };
+    // Usable cached 304 bodies become 200 at build time. Keep unavailable samples in the file
+    // as evidence, but a fresh client cannot use them. Filter only after choosing the best match:
+    // another query, resource or GraphQL operation is not a substitute for its missing body.
+    fit.retain(|i| route.samples.get(*i).is_some_and(|s| s.status != 304));
+    if fit.is_empty() {
+        return Answer::NoMatch(NoMatch { reason: NoMatchReason::CachedBodyUnavailable, nearest: nearest(standin, look_for, &clean_path) });
+    }
     let first = fit.first().copied().unwrap_or(0);
     let counter = turns.0.entry((ri, first, how)).or_insert(0);
     let at = counter.checked_rem(fit.len()).unwrap_or(0);

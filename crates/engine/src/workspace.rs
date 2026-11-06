@@ -26,15 +26,33 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+pub mod progress;
+
 pub const MANIFEST: &str = "craft.json";
 
 /// Folders a copy of a project leaves out: what a build makes again, which can be gigabytes.
-const REBUILT: &[&str] = &["node_modules", "target", ".godot", "Library", "Temp", "obj", ".venv", "__pycache__", ".next", ".turbo"];
+const REBUILT: &[&str] = &["node_modules", "target", ".godot", "Library", "Temp", ".venv", "__pycache__", ".next", ".turbo"];
+/// An `obj` directory is ambiguous: these neighbouring project files identify managed build output.
+const MANAGED_PROJECTS: &[&str] = &["csproj", "fsproj", "vbproj"];
 /// How deep a copy of a project's folders goes.
 const COPY_DEPTH: usize = 64;
 
 pub(crate) fn rebuilt(p: &Path) -> bool {
-    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| REBUILT.contains(&n)) && p.is_dir()
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else { return false };
+    if name != "obj" {
+        return REBUILT.contains(&name) && p.is_dir();
+    }
+    if !p.is_dir() {
+        return false;
+    }
+    // Runtime models commonly live in assets/obj. Without evidence that a folder is compiler
+    // output, keep it; an unreadable or unusually large parent must not cause data to be omitted.
+    p.parent().and_then(|parent| std::fs::read_dir(parent).ok()).is_some_and(|entries| {
+        entries.take(4096).flatten().any(|entry| {
+            entry.path().extension().and_then(|e| e.to_str()).is_some_and(|ext| MANAGED_PROJECTS.iter().any(|project| ext.eq_ignore_ascii_case(project)))
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
+    })
 }
 
 /// Copy a folder's files and folders (links are skipped), leaving out what `skip` says.
@@ -362,6 +380,10 @@ pub struct Manifest {
     /// The coding agent's session, so a later request continues the same conversation.
     #[serde(default)]
     pub agent_session: Option<String>,
+    /// The coding agent that saved `agent_session` (`claude-code`, `codex`…); none: saved before
+    /// this was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_by: Option<String>,
     /// Kinds of agent action the person allowed for this workspace ("bash:npm", "web_fetch"…).
     #[serde(default)]
     pub allowed_actions: Vec<String>,
@@ -395,9 +417,23 @@ pub struct Manifest {
     /// that picks this up only needs to check: nothing is left to build.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub awaiting_check: bool,
+    /// Checks in a row, across runs, that found the build not working (it didn't build or serve).
+    /// A run stops when this reaches the limit; a new request from the person starts it again.
+    /// Kept in the project so "Try again" can't restart the count.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub not_working_checks: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Manifest {
+    /// The person's own project: their files are the app, edited in place, with nothing to recreate.
+    pub fn own_project(&self) -> bool {
+        self.app_in_root && self.target == TargetRef::None
+    }
+
     fn new(name: &str, request: &str, target: TargetRef) -> Manifest {
         let now = now_ms();
         Manifest {
@@ -412,6 +448,7 @@ impl Manifest {
             updated_ms: now,
             checks: Vec::new(),
             agent_session: None,
+            agent_session_by: None,
             allowed_actions: Vec::new(),
             last_reply: String::new(),
             asset_budget_usd: ASSET_BUDGET_USD,
@@ -421,7 +458,14 @@ impl Manifest {
             builder: None,
             questions: None,
             awaiting_check: false,
+            not_working_checks: 0,
         }
+    }
+
+    /// The saved session, if `agent` (`claude-code`, `codex`…) saved it: another agent can't
+    /// continue it (#469). One saved before the agent was kept counts.
+    pub fn agent_session_for(&self, agent: &str) -> Option<&str> {
+        self.agent_session.as_deref().filter(|_| self.agent_session_by.as_deref().is_none_or(|a| a == agent))
     }
 
     /// Take the fields the person owns from `other` (what's on disk).
@@ -782,7 +826,9 @@ impl Workspace {
     /// the person's pictures…), which the builder never changes, even when the app is the
     /// project folder itself. checks/ isn't one: the builder keeps its notes there.
     pub fn is_own_record(&self, p: &Path) -> bool {
-        OWN_NAMES.iter().filter(|n| **n != "checks").any(|n| inside(&self.root.join(n), p))
+        let own = |root: &Path, p: &Path| OWN_NAMES.iter().filter(|n| **n != "checks").any(|n| inside(&root.join(n), p));
+        // Also where a link would really take it.
+        own(&self.root, p) || matches!((real_path(&self.root), real_path(p)), (Some(root), Some(p)) if own(&root, &p))
     }
     /// Separate from capture/, which a website study replaces.
     pub fn reference_dir(&self) -> PathBuf {
@@ -795,7 +841,8 @@ impl Workspace {
     }
 
     /// Copy pictures of the original into reference/ as picture-N.ext. Returns how many were
-    /// added; files that aren't PNG, JPEG, WebP or GIF, or are over 20 MB, are skipped.
+    /// added; files that aren't PNG, JPEG, WebP or GIF are skipped, and a picture over 20 MB
+    /// refuses the whole call before anything is copied.
     pub fn add_references(&self, files: &[PathBuf]) -> Result<usize, ToolError> {
         copy_pictures(&self.reference_dir(), files).map(|v| v.len())
     }
@@ -844,15 +891,21 @@ impl Workspace {
     pub fn inbox_dir(&self) -> PathBuf {
         self.root.join("inbox")
     }
-    /// The API builder's conversation, kept so a follow-up continues it (`ai::context`).
     /// A builder has worked on this project and its conversation was kept, so a later run carries
     /// it on instead of starting over.
     pub fn builder_started(&self) -> bool {
         self.manifest.agent_session.is_some() || self.transcript_path().is_file()
     }
 
+    /// The API builder's conversation, kept so a follow-up continues it (`ai::context`).
     pub fn transcript_path(&self) -> PathBuf {
         self.root.join("transcript.json")
+    }
+
+    /// A copy of the coding agent's own session (Claude Code's), kept after every turn so the
+    /// conversation travels with the project folder to another computer.
+    pub fn agent_session_path(&self) -> PathBuf {
+        self.root.join(AGENT_SESSION_FILE)
     }
 
     /// Every workspace under `projects_dir`, most recently updated first. Folders without a
@@ -881,6 +934,9 @@ impl Workspace {
     }
 }
 
+/// The coding agent's session, copied into the project ([`Workspace::agent_session_path`]).
+pub const AGENT_SESSION_FILE: &str = "agent-session.jsonl";
+
 /// The names Craft Anything keeps in a project folder beside app/. A folder the person picks
 /// mustn't already have any of them.
 pub const OWN_NAMES: &[&str] = &[
@@ -893,6 +949,7 @@ pub const OWN_NAMES: &[&str] = &[
     ASSETS,
     "transcript.json",
     "extract-transcript.json",
+    AGENT_SESSION_FILE,
     "inbox",
     "checks",
     "capture",
@@ -910,6 +967,40 @@ pub fn inside(dir: &Path, p: &Path) -> bool {
     } else {
         p.starts_with(dir)
     }
+}
+
+/// Where `p` really is: its deepest part that exists, with every link in it followed, then the
+/// rest as written (parts that don't exist yet can't be links). `None` when an existing part
+/// can't be followed, such as a link to nothing, since writing there would follow it.
+pub fn real_path(p: &Path) -> Option<PathBuf> {
+    let mut existing = p;
+    let mut missing = Vec::new();
+    while existing.symlink_metadata().is_err() {
+        missing.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
+    let mut real = std::fs::canonicalize(existing).ok()?;
+    real.extend(missing.iter().rev());
+    Some(real)
+}
+
+/// [`inside`], after following links: `p` is inside `dir` where the file system really puts
+/// them both, so a link inside `dir` can't lead out of it. Only the real paths are compared: `p`
+/// may already be partly resolved (`..` after a link) while `dir` is as written, and a `dir`
+/// that sits behind a link (macOS's `/var` → `/private/var`) is still the same folder.
+pub fn really_inside(dir: &Path, p: &Path) -> bool {
+    matches!((real_path(dir), real_path(p)), (Some(d), Some(p)) if inside(&d, &p))
+}
+
+/// The other side of [`really_inside`], for places that must be kept out of: `p` may land in
+/// `dir` as written, once links are followed (also links in `dir`'s own path, such as macOS's
+/// `/etc` → `/private/etc`), or because a link in `p` can't be followed to tell.
+pub fn may_reach(dir: &Path, p: &Path) -> bool {
+    inside(dir, p)
+        || match real_path(p) {
+            Some(real) => inside(dir, &real) || real_path(dir).is_some_and(|d| inside(&d, &real)),
+            None => true,
+        }
 }
 
 /// How many of a picked folder's names are kept for the builder.
@@ -986,14 +1077,22 @@ fn pictures_in(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Copy pictures into `dir` as picture-N.ext, numbering on from what's there. Files that aren't
-/// PNG, JPEG, WebP or GIF, or are over 20 MB, are skipped.
+/// PNG, JPEG, WebP or GIF are skipped; a picture over 20 MB is refused before anything is copied.
 fn copy_pictures(dir: &Path, files: &[PathBuf]) -> Result<Vec<PathBuf>, ToolError> {
-    const MAX: u64 = 20 * 1024 * 1024;
+    // Check the whole list first: a mixed add must not leave the valid pictures half-copied when
+    // one is too large.
+    for f in files {
+        if picture_too_large(f) {
+            let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| f.display().to_string());
+            return Err(ToolError::new(ErrorCode::OverLimit, format!("{name} can't be attached: a message takes pictures up to 20 MB."))
+                .with_remediation("Attach a smaller picture, or save it as a JPEG."));
+        }
+    }
     std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
     let mut next = pictures_in(dir).iter().map(|p| picture_number(p)).max().unwrap_or(0);
     let mut added = Vec::new();
     for f in files {
-        if !is_picture(f) || f.metadata().map_or(true, |m| m.len() > MAX) {
+        if !attachable_picture(f) {
             continue;
         }
         next += 1;
@@ -1010,6 +1109,98 @@ fn picture_number(p: &Path) -> u32 {
     p.file_stem().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix("picture-")).and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
+/// The most pixels a pasted picture may have (a 16K screen): more is refused before encoding.
+const MAX_PASTED_PIXELS: u64 = 15360 * 8640;
+
+/// The largest picture a message sends ([`copy_pictures`] refuses bigger files).
+const MAX_PICTURE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Whether the file starts the way a PNG, JPEG, GIF or WebP picture does, whatever its name says.
+/// Reads its first bytes, so not while drawing.
+pub fn picture_content(p: &Path) -> bool {
+    use std::io::Read as _;
+    let mut head = Vec::with_capacity(12);
+    if std::fs::File::open(p).and_then(|f| f.take(12).read_to_end(&mut head)).is_err() {
+        return false;
+    }
+    head.starts_with(b"\x89PNG\r\n\x1a\n")
+        || head.starts_with(&[0xFF, 0xD8, 0xFF])
+        || head.starts_with(b"GIF87a")
+        || head.starts_with(b"GIF89a")
+        || (head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP".as_slice()))
+}
+
+/// Whether `p` is a picture larger than a message can take. Reads its size, so not while drawing.
+pub fn picture_too_large(p: &Path) -> bool {
+    is_picture(p) && p.metadata().is_ok_and(|m| m.is_file() && m.len() > MAX_PICTURE_BYTES)
+}
+
+/// A picture file a message can take: a picture ([`is_picture`]) of at most 20 MB. Reads its
+/// size, so not while drawing.
+pub fn attachable_picture(p: &Path) -> bool {
+    is_picture(p) && p.metadata().is_ok_and(|m| m.is_file() && m.len() <= MAX_PICTURE_BYTES)
+}
+
+/// Where pictures pasted from the clipboard wait until their message is sent: this person's own
+/// cache folder (never a temp folder other users can read).
+pub fn pasted_dir() -> PathBuf {
+    dirs::cache_dir().or_else(|| dirs::home_dir().map(|h| h.join(".cache"))).unwrap_or_else(std::env::temp_dir).join("Craft Anything").join("pasted")
+}
+
+/// Save a picture pasted from the clipboard (8-bit RGBA, `width`×`height`) as `pasted-<time>.png`
+/// in `dir`, readable only by this person, where it waits until its message is sent (which
+/// copies it into the project). Pastes from earlier days are cleared out first, except those in
+/// `keep` (still attached to a draft or a message).
+pub fn save_pasted_picture(dir: &Path, width: u32, height: u32, rgba: Vec<u8>, keep: &[PathBuf]) -> Result<PathBuf, ToolError> {
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels == 0 || pixels > MAX_PASTED_PIXELS {
+        return Err(ToolError::new(ErrorCode::OverLimit, format!("the pasted picture is {width}×{height}; at most a 16K screen fits")));
+    }
+    if pixels.checked_mul(4) != Some(rgba.len() as u64) {
+        return Err(ToolError::invalid("the pasted picture's pixels don't match its size"));
+    }
+    // Encoded against the limit, so a picture that won't fit never takes a second copy's memory.
+    let image = crate::tools::web_common::Image { width, height, rgba };
+    let max = usize::try_from(MAX_PICTURE_BYTES).unwrap_or(usize::MAX);
+    let Some(png) = crate::tools::web_common::encode_png_within(&image, max)? else {
+        return Err(ToolError::new(ErrorCode::OverLimit, "the pasted picture is over 20 MB as a PNG; a message takes pictures up to 20 MB")
+            .with_remediation("Paste a smaller part of the screen, or save it as a JPEG and attach the file."));
+    };
+    std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    forget_old_pastes(dir, keep);
+    // The name is taken with create_new, so two pastes (or two copies of the app) never share one.
+    let ms = now_ms();
+    let mut n = 1u32;
+    let path = loop {
+        let path = if n == 1 { dir.join(format!("pasted-{ms}.png")) } else { dir.join(format!("pasted-{ms}-{n}.png")) };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => break path,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => n = n.saturating_add(1),
+            Err(e) => return Err(ToolError::io(path.display(), e)),
+        }
+    };
+    craft_anything_platform::fs::write_atomic_private(&path, &png)?;
+    Ok(path)
+}
+
+/// Remove pastes over a day old from `dir` (only ours: `pasted-….png`), except those in `keep`.
+fn forget_old_pastes(dir: &Path, keep: &[PathBuf]) {
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        let ours = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("pasted-") && n.ends_with(".png"));
+        let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age > day);
+        if ours && old && !keep.contains(&p) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// The default projects folder: `Documents/Craft Anything`, else `~/Craft Anything`.
 pub fn default_projects_dir() -> PathBuf {
     dirs::document_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("Craft Anything")
@@ -1018,6 +1209,100 @@ pub fn default_projects_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_takes_picture_files_up_to_20_mb() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small.png");
+        std::fs::write(&small, b"png").unwrap();
+        let big = dir.path().join("big.PNG");
+        std::fs::File::create(&big).unwrap().set_len(MAX_PICTURE_BYTES + 1).unwrap();
+        let exact = dir.path().join("exact.png");
+        std::fs::File::create(&exact).unwrap().set_len(MAX_PICTURE_BYTES).unwrap();
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, b"hi").unwrap();
+        let folder = dir.path().join("folder.png");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(attachable_picture(&small));
+        for no in [&big, &text, &folder, &dir.path().join("gone.png")] {
+            assert!(!attachable_picture(no), "{}", no.display());
+        }
+        assert!(picture_too_large(&big));
+        assert!(attachable_picture(&exact));
+        assert!(!picture_too_large(&exact), "exactly 20 MB is allowed");
+        assert!(!picture_too_large(&small));
+        let attachments = dir.path().join("attachments");
+        let err = copy_pictures(&attachments, &[small, big]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::OverLimit, "{err:?}");
+        assert!(!attachments.join("picture-1.png").exists(), "nothing is copied before the refusal");
+    }
+
+    #[test]
+    fn an_oversized_picture_is_refused_by_references_and_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(dir.path(), "Game", "Copy it", TargetRef::None).unwrap();
+        let small = dir.path().join("small.png");
+        std::fs::write(&small, b"png").unwrap();
+        let big = dir.path().join("big.png");
+        std::fs::File::create(&big).unwrap().set_len(MAX_PICTURE_BYTES + 1).unwrap();
+
+        let err = ws.add_references(&[small, big.clone()]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::OverLimit, "{err:?}");
+        assert!(ws.references().is_empty(), "nothing is copied before the refusal");
+
+        let err = ws.add_attachments(&[big]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::OverLimit, "{err:?}");
+        assert!(!ws.attachments_dir().join("picture-1.png").exists());
+    }
+
+    #[test]
+    fn a_picture_is_told_by_its_first_bytes_not_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, bytes: &[u8]| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        for yes in [
+            file("a.png", b"\x89PNG\r\n\x1a\n...."),
+            file("b.jpg", &[0xFF, 0xD8, 0xFF, 0xE0]),
+            file("c.gif", b"GIF89a.."),
+            file("d.webp", b"RIFF\x10\0\0\0WEBPVP8 "),
+            file("e.png", &[0xFF, 0xD8, 0xFF, 0xDB]),
+        ] {
+            assert!(picture_content(&yes), "{}", yes.display());
+        }
+        for no in [file("f.png", b"png"), file("g.webp", b"RIFF\0\0\0\0WAVE"), file("h.png", b""), dir.path().join("gone.png")] {
+            assert!(!picture_content(&no), "{}", no.display());
+        }
+    }
+
+    #[test]
+    fn a_pasted_picture_is_saved_as_a_png_and_bad_sizes_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = save_pasted_picture(dir.path(), 2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255], &[]).unwrap();
+        assert!(is_picture(&p));
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(crate::tools::web_common::png_dimensions(&bytes).unwrap(), (2, 1));
+        let second = save_pasted_picture(dir.path(), 2, 1, vec![0; 8], &[]).unwrap();
+        assert_ne!(p, second, "two pastes in one millisecond don't overwrite each other");
+        assert!(save_pasted_picture(dir.path(), 2, 2, vec![0; 8], &[]).is_err(), "pixels that don't match the size");
+        assert!(save_pasted_picture(dir.path(), 0, 0, Vec::new(), &[]).is_err());
+        assert!(save_pasted_picture(dir.path(), u32::MAX, u32::MAX, Vec::new(), &[]).is_err());
+        assert_eq!(pictures_in(dir.path()).len(), 2, "fresh pastes are kept");
+        // A day later, a paste clears out old ones, but not one still attached somewhere.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+        for f in [&p, &second] {
+            std::fs::File::options().write(true).open(f).unwrap().set_modified(old).unwrap();
+        }
+        let third = save_pasted_picture(dir.path(), 2, 1, vec![0; 8], std::slice::from_ref(&second)).unwrap();
+        // In the same millisecond as the first, the third takes the name its removal freed.
+        assert!((third == p || !p.exists()) && second.exists() && third.exists());
+        assert_ne!(std::fs::read(&third).ok(), Some(bytes), "the first paste is gone");
+        let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "no temp files left behind: {names:?}");
+    }
 
     #[test]
     fn a_projects_usage_adds_up_across_runs_and_a_newer_file_is_left_alone() {
@@ -1117,6 +1402,23 @@ mod tests {
         assert_eq!(a2.manifest.request, "Clone it");
         std::fs::create_dir(dir.path().join("junk")).unwrap();
         assert_eq!(Workspace::list(dir.path()).len(), 2, "folders without a manifest are skipped");
+    }
+
+    #[test]
+    fn project_copies_keep_runtime_obj_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(dir.path(), "Models", "a model viewer", TargetRef::None).unwrap();
+        let app = ws.app_dir();
+        std::fs::create_dir_all(app.join("assets/obj")).unwrap();
+        std::fs::write(app.join("assets/obj/hero.obj"), "v 0 0 0\n").unwrap();
+        std::fs::create_dir_all(app.join("managed/obj")).unwrap();
+        std::fs::write(app.join("managed/Viewer.csproj"), "<Project />").unwrap();
+        std::fs::write(app.join("managed/obj/intermediate.bin"), [7; 256]).unwrap();
+        let copy = ws.duplicate("Models copy").unwrap().app_dir();
+        assert!(copy.join("assets/obj/hero.obj").is_file(), "a project copy keeps its runtime model");
+        assert_eq!(std::fs::read_to_string(copy.join("assets/obj/hero.obj")).unwrap(), "v 0 0 0\n");
+        assert!(copy.join("managed/Viewer.csproj").is_file());
+        assert!(!copy.join("managed/obj").exists());
     }
 
     #[test]
@@ -1344,6 +1646,22 @@ mod tests {
         }
     }
 
+    /// #469: a saved session is only for the agent that saved it.
+    #[test]
+    fn a_session_is_only_for_the_agent_that_saved_it() {
+        let mut m = Manifest::new("x", "A thing", TargetRef::None);
+        assert_eq!(m.agent_session_for("codex"), None);
+        m.agent_session = Some("s1".into());
+        assert_eq!(m.agent_session_for("codex"), Some("s1"), "one saved before the agent was kept counts");
+        m.agent_session_by = Some("claude-code".into());
+        assert_eq!(m.agent_session_for("claude-code"), Some("s1"));
+        assert_eq!(m.agent_session_for("codex"), None);
+        let text = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<Manifest>(&text).unwrap().agent_session_by.as_deref(), Some("claude-code"));
+    }
+
+    /// A rename survives a stale save, a copy takes the build but not the conversation (nor its
+    /// kept session), and a delete leaves the person's own files.
     #[test]
     fn a_project_is_renamed_duplicated_and_deleted_without_touching_the_persons_files() {
         let d = tempfile::tempdir().unwrap();
@@ -1356,6 +1674,7 @@ mod tests {
         std::fs::write(ws.reference_dir().join("picture-1.png"), "x").unwrap();
         ws.manifest.agent_session = Some("old".into());
         ws.save().unwrap();
+        std::fs::write(ws.agent_session_path(), "{}\n").unwrap();
 
         ws.rename("  Snake II ").unwrap();
         assert_eq!(Workspace::open(&ws.root).unwrap().manifest.name, "Snake II");
@@ -1372,6 +1691,7 @@ mod tests {
         assert!(copy.reference_dir().join("picture-1.png").is_file());
         assert!(!copy.app_dir().join("target").exists(), "compiler output is made again, not copied");
         assert!(copy.manifest.agent_session.is_none(), "a copy has its own conversation");
+        assert!(!copy.agent_session_path().exists(), "and doesn't carry the original's");
 
         ws.delete().unwrap();
         assert!(!d.path().join("snake").exists(), "a project of its own goes with its folder");
@@ -1382,11 +1702,12 @@ mod tests {
         std::fs::write(mine.join("index.html"), "<p>hi</p>").unwrap();
         let ws = Workspace::create_at(&mine, "Site", "x", TargetRef::None, Some(ExistingFiles::Edit)).unwrap();
         std::fs::create_dir_all(ws.inbox_dir()).unwrap();
+        std::fs::write(ws.agent_session_path(), "{}\n").unwrap();
         let copy = ws.duplicate("Site copy").unwrap();
         assert!(copy.app_dir().join("index.html").is_file() && !copy.manifest.app_in_root, "the copy's app is in its app/");
         assert!(!copy.app_dir().join(MANIFEST).exists(), "without the original's records");
         ws.delete().unwrap();
         assert_eq!(std::fs::read_to_string(mine.join("index.html")).unwrap(), "<p>hi</p>");
-        assert!(!mine.join(MANIFEST).exists() && !mine.join("inbox").exists());
+        assert!(!mine.join(MANIFEST).exists() && !mine.join("inbox").exists() && !mine.join(AGENT_SESSION_FILE).exists());
     }
 }

@@ -9,6 +9,8 @@
 //! kind = "anthropic"
 //! model = "claude-opus-5-5"
 //! effort = "high"
+//! # Conversation trimming budget; does not set the server's context window.
+//! context_tokens = 120000
 //!
 //! [ai.roles]
 //! lead = "Claude"
@@ -25,12 +27,50 @@ use craft_anything_engine::Settings;
 use craft_anything_evidence::{ErrorCode, ToolError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
+
+/// Read settings strictly before a model-selection save; only a missing file uses the current session.
+/// Malformed files and I/O errors are returned rather than replaced by default settings.
+fn settings_for_selection(path: &Path, current: &Settings) -> Result<Settings, ToolError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => craft_anything_engine::settings::read_settings(&text).map_err(|e| {
+            ToolError::new(ErrorCode::BadSettings, format!("The settings couldn't be read: {e}"))
+                .with_remediation("Fix config.toml before changing the AI's model.")
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(current.clone()),
+        Err(e) => Err(ToolError::io(path.display(), e)),
+    }
+}
+
+/// Commit validated options through one path for hub and tool callers, which already hold the session.
+/// Preserve unrelated disk changes, reject a changed backend or project, and update memory only after saving.
+pub(crate) fn save_agent_selection(
+    session: &mut craft_anything_engine::Session,
+    path: &Path,
+    context: &crate::ModelContext,
+    options: BackendOptions,
+) -> Result<bool, ToolError> {
+    let current = AiConfig::from_table(&session.settings.ai)?;
+    let name = &context.backend.config.name;
+    let mut next = settings_for_selection(path, &session.settings)?;
+    let mut config = AiConfig::from_table(&next.ai)?;
+    let Some(entry) = config.backends.iter_mut().find(|e| &e.config.name == name) else { return Ok(false) };
+    if current.get(name) != Some(&context.backend) || *entry != context.backend || session.project.as_ref().map(|p| p.root.clone()) != context.directory {
+        return Err(ToolError::invalid("The AI settings changed while its models were loading. Reload the models and try again."));
+    }
+    entry.options = options;
+    next.ai = config.to_table()?;
+    next.save_to(path)?;
+    session.settings = next;
+    Ok(true)
+}
 
 /// Per-backend options beyond [`BackendConfig`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BackendOptions {
-    /// Thinking depth for investigations (`low`/`medium`/`high`); quick explanations use `low`.
+    /// Thinking depth (`low`/`medium`/`high`/`xhigh`/`max`) for the Claude API and Claude Code;
+    /// `high` unless set. A model without the level gets the nearest one below it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
     /// Anthropic server-side fallbacks (default on).
@@ -42,6 +82,10 @@ pub struct BackendOptions {
     /// Most model turns per user message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
+    /// Input tokens before trimming and summarising the conversation. Omitted or zero uses the
+    /// local/cloud default; this does not change the model server's own context window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
     /// Agent CLIs: the program to run instead of the default for `model`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -51,14 +95,99 @@ pub struct BackendOptions {
     /// Agent CLIs: the model to ask the CLI for (passed with its model flag when it has one).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_model: Option<String>,
+    /// OpenCode's model variant. Absent means the model's own default thinking depth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_thinking: Option<Effort>,
+    /// Copilot's context tier. Unset keeps the CLI's own choice; token limits depend on the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_context: Option<CliContext>,
+    /// Copilot's full named reasoning range. Unset falls back to `effort` or the CLI default;
+    /// `none` is an explicit choice, not the absence of an override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_reasoning_effort: Option<CliReasoningEffort>,
     /// Wall-clock limit in seconds for one agent CLI turn (default: 24 hours for a builder, which may
     /// analyse and build a big game; 30 minutes for questions).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Agent CLIs that speak ACP (`cli_agents::acp::ACP_AGENTS`): chat over it, one agent process
-    /// per conversation (off unless set).
+    /// per conversation (on for Copilot, off for other agents unless set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp: Option<bool>,
+    /// Agent CLIs that keep their sign-in, settings and sessions in a folder of their own (Claude
+    /// Code's `CLAUDE_CONFIG_DIR`): the folder to use instead of their usual one, so each AI can be
+    /// another account. `~/` is the home folder; over SSH it's a folder on that computer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
+}
+
+impl BackendOptions {
+    /// [`config_dir`](BackendOptions::config_dir) as written, if any (for another computer).
+    pub fn config_dir_text(&self) -> Option<&str> {
+        self.config_dir.as_deref().map(str::trim).filter(|d| !d.is_empty())
+    }
+
+    /// [`config_dir`](BackendOptions::config_dir) on this computer, with `~` as the home folder.
+    pub fn config_dir_here(&self) -> Option<std::path::PathBuf> {
+        config_dir_in(self.config_dir_text()?, dirs::home_dir())
+    }
+}
+
+/// `dir` with a leading `~` as `home`; `None` when it needs a home folder there isn't.
+pub(crate) fn config_dir_in(dir: &str, home: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    if dir == "~" {
+        return home;
+    }
+    match dir.strip_prefix("~/").or_else(|| dir.strip_prefix("~\\")) {
+        Some(rest) => home.map(|h| h.join(rest)),
+        None => Some(std::path::PathBuf::from(dir)),
+    }
+}
+
+/// A provider's context tier, not a guessed token count. Copilot reports each model's limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum CliContext {
+    #[serde(rename = "default")]
+    Standard,
+    #[serde(rename = "long_context")]
+    Long,
+}
+
+impl CliContext {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "default",
+            Self::Long => "long_context",
+        }
+    }
+}
+
+/// The CLI's named reasoning levels; these are not numeric thinking-token budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CliReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl CliReasoningEffort {
+    pub const ALL: &'static [Self] = &[Self::None, Self::Minimal, Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
 }
 
 /// One configured backend.
@@ -71,6 +200,16 @@ pub struct BackendEntry {
 }
 
 impl BackendEntry {
+    /// Older configurations can put OpenCode's variant directly in its model reference.
+    fn thinking_from_model(&mut self) {
+        if self.config.kind != BackendKind::AgentCli || self.config.model != "opencode" {
+            return;
+        }
+        let Some((model, variant)) = self.options.cli_model.as_deref().and_then(|m| m.rsplit_once('#')) else { return };
+        let Some(depth) = Effort::parse(variant) else { return };
+        self.options.cli_thinking.get_or_insert(depth);
+        self.options.cli_model = Some(model.to_string());
+    }
     /// An agent CLI's `model` names the agent (`opencode`), and the model it should use goes in
     /// `cli_model`. People also write the agent's program in `command` and the model in `model`
     /// (`command = "opencode"`, `model = "deepseek/deepseek-flash"`); that ran the plain adapter
@@ -117,6 +256,10 @@ pub struct AiConfig {
     pub fallback_chain: Vec<String>,
     /// Price overrides by model id.
     pub prices: BTreeMap<String, Price>,
+    /// This installation's OpenCode Go session id, made on first use and kept with the settings so
+    /// prompt caching survives restarts (and tests stay inside their own settings file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_id: Option<String>,
 }
 
 pub fn role_key(r: Role) -> &'static str {
@@ -136,7 +279,10 @@ impl AiConfig {
             ToolError::new(ErrorCode::BadSettings, format!("The [ai] settings couldn't be read: {e}"))
                 .with_remediation("Fix or remove the [ai] section in config.toml.")
         })?;
-        c.backends.iter_mut().for_each(BackendEntry::model_from_command);
+        for backend in &mut c.backends {
+            backend.model_from_command();
+            backend.thinking_from_model();
+        }
         Ok(c)
     }
 
@@ -207,6 +353,23 @@ impl AiConfig {
 
 #[cfg(test)]
 mod tests {
+    /// Legacy embedded variants migrate to separate model/depth settings and survive serialization.
+    #[test]
+    fn opencode_embedded_variants_migrate_and_every_depth_round_trips() {
+        for depth in crate::Effort::ALL {
+            let table: toml::Table = toml::from_str(&format!(
+                "[[backends]]\nname = 'OpenCode'\nkind = 'agent_cli'\nmodel = 'opencode'\ncli_model = 'test/model#{}'\n",
+                depth.as_str()
+            ))
+            .unwrap();
+            let config = super::AiConfig::from_table(&table).unwrap();
+            let entry = config.get("OpenCode").unwrap();
+            assert_eq!(entry.options.cli_model.as_deref(), Some("test/model"));
+            assert_eq!(entry.options.cli_thinking, Some(depth));
+            assert_eq!(super::AiConfig::from_table(&config.to_table().unwrap()).unwrap(), config);
+        }
+    }
+
     #[test]
     fn the_default_builder_is_the_same_from_the_list_as_from_the_config() {
         use crate::{BackendConfig, BackendKind, Role, default_builder};
@@ -247,6 +410,7 @@ mod tests {
         let mut a = entry("Claude", BackendKind::Anthropic);
         a.options.effort = Some(Effort::High);
         a.options.fallbacks_enabled = Some(false);
+        a.options.context_tokens = Some(120_000);
         c.upsert(a);
         c.upsert(entry("Local", BackendKind::OpenaiCompatible));
         c.roles.insert("reviewer".into(), "Local".into());
@@ -259,6 +423,27 @@ mod tests {
         assert_eq!(back, c);
         assert!(text.contains("[[ai.backends]]"), "{text}");
         assert!(text.contains("effort = \"high\""), "{text}");
+        assert!(text.contains("context_tokens = 120000"), "{text}");
+    }
+
+    #[test]
+    fn backend_context_budget_is_optional_and_validated() {
+        let table = |line: &str| -> toml::Table {
+            toml::from_str(&format!("[[backends]]\nname = \"Local\"\nkind = \"openai_compatible\"\nmodel = \"qwen3:8b\"\n{line}")).unwrap()
+        };
+        for (line, expected) in [
+            ("", None),
+            ("context_tokens = 0", Some(0)),
+            ("context_tokens = 8000", Some(8000)),
+            ("context_tokens = 9223372036854775807", Some(i64::MAX as u64)),
+        ] {
+            let config = AiConfig::from_table(&table(line)).unwrap();
+            assert_eq!(config.backends[0].options.context_tokens, expected);
+            assert_eq!(AiConfig::from_table(&config.to_table().unwrap()).unwrap(), config);
+        }
+        for line in ["context_tokens = -1", "context_tokens = \"8000\"", "context_tokens = 8.5"] {
+            assert_eq!(AiConfig::from_table(&table(line)).unwrap_err().code, ErrorCode::BadSettings);
+        }
     }
 
     #[test]
@@ -306,5 +491,7 @@ mod tests {
         assert_eq!(one("model = \"x/y\"\ncommand = \"opencode\"\ncli_model = \"z\""), ("opencode".into(), Some("z".into())));
         assert_eq!(one("model = \"my-agent\"\ncommand = \"my-agent-cli\""), ("my-agent".into(), None));
         assert_eq!(one("model = \"claude-code\""), ("claude-code".into(), None));
+        // Maki named by its program runs Maki's own adapter, not `maki <prompt>` (its terminal interface).
+        assert_eq!(one("model = \"anthropic/claude-sonnet-4-6\"\ncommand = \"maki\""), ("maki".into(), Some("anthropic/claude-sonnet-4-6".into())));
     }
 }

@@ -30,6 +30,43 @@ integration does, why it is shaped this way, and what remains to confirm.
 - Before a build starts, `claude auth status` is checked. If Claude Code isn't signed in, the run
   stops with: "Sign in to Claude Code: open a terminal and run `claude auth login`".
 
+## Chats and questions in Clean room
+
+Outside a build there is no approval tool, so Clean room's rule that nothing inside the original is
+read can't rest on it. It isn't left to Claude Code's defaults either (they let it read in its own
+folder, and a release or an allow rule added later could change them) (#564):
+
+- A **chat** in Clean room starts Claude Code with `--disallowedTools` naming its own file tools
+  (`Read`, `Glob`, `Grep`, `LS`, `NotebookRead`) and its changing and web tools. A deny rule beats
+  any allow, so it works only through our tool server, which keeps the original out of reach
+  (`clean_room.rs`). In Deep mode a chat is unchanged.
+- A **question** about a build in Clean room refuses the same file tools (it already offered none).
+- A chat over **ACP** in Clean room refuses the agent's own read, write, command and fetch
+  requests instead of showing them as a card the person could allow with one click; its other
+  requests (planning, our tools) are allowed.
+- Other agents (Codex, Gemini CLI, OpenCode, Antigravity, Hermes, Maki) are not held to this in a
+  chat: they keep whatever sandbox they have, if any. See the roadmap's R2.2.
+
+Not yet checked live against Claude Code or an ACP agent (the tests cover the flags and the
+approver).
+
+## Under Flatpak
+
+The Flatpak build can read the home folder but not write to it, so Claude Code can't save its
+conversations in `~/.claude`: the first turn ran, and `--resume` then said "No conversation found
+with session ID" (#506). When the app runs in a Flatpak and `CLAUDE_CONFIG_DIR` isn't set, it starts
+Claude Code with `CLAUDE_CONFIG_DIR` pointing at `craft-anything/claude` in the app's own data
+folder (`~/.var/app/ai.storyteller.craft-anything/data/`), which is writable. Two consequences:
+
+- Claude Code there is signed in separately from the one on the host. The sign-in message gives the
+  command that does it through the sandbox:
+  `flatpak run --command=sh ai.storyteller.craft-anything -c 'CLAUDE_CONFIG_DIR="$XDG_DATA_HOME/craft-anything/claude" "$HOME/.local/bin/claude" auth login'`
+  (Craft Anything never reads Claude Code's credentials, so they aren't copied over.)
+- Setting `CLAUDE_CONFIG_DIR` yourself, for example with `flatpak override --user --env=…`, wins.
+  Builds on another computer over SSH are not changed.
+
+Not yet checked in a real Flatpak (the tests cover the choice of folder and the message).
+
 ## Why this is within Anthropic's terms (as published, October 2026)
 
 From Claude Code's *Legal and compliance* page:

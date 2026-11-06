@@ -205,8 +205,13 @@ fn core_target_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
         Some("dos-com") => target.kind = TargetKind::DosCom,
         Some(other) => return Err(ToolError::invalid(format!("unknown format {other}; use raw-binary or dos-com"))),
     }
-    // Opening the same content twice keeps one target per sha256.
-    let existing = ctx.session.targets().find(|t| t.target.sha256 == target.sha256 && t.target.kind == target.kind).map(|t| t.target.id.clone());
+    // Opening the same content twice keeps one target per sha256; new raw-binary settings replace
+    // it (and what was worked out with the old ones), rather than being dropped (#305).
+    let existing = ctx
+        .session
+        .targets()
+        .find(|t| t.target.sha256 == target.sha256 && t.target.kind == target.kind && t.target.raw == target.raw)
+        .map(|t| t.target.id.clone());
     if let Some(existing) = existing {
         ctx.session.set_active(&existing)?;
     } else {
@@ -634,6 +639,25 @@ mod tests {
         assert_eq!(st["result"]["open"], false);
     }
 
+    /// #305: reopening the same raw bytes with another architecture or address kept the first.
+    #[test]
+    fn reopening_raw_bytes_with_new_settings_uses_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("code.bin");
+        std::fs::write(&f, [0xc0, 0x03, 0x5f, 0xd6]).unwrap(); // arm64 `ret`
+        let e = Engine::new(crate::testing::session());
+        let call = |id: &str, p: serde_json::Value| e.call(id, p, CallOptions::new(Caller::Mcp)).unwrap().to_json();
+        let open = |arch: &str, at: &str| call("core_target_open", json!({"path": f, "format": "raw-binary", "architecture": arch, "entry_point": at}));
+        assert_eq!(open("x86", "0x1000")["result"]["raw"], json!({"architecture": "x86", "entry_point": 0x1000}));
+        call("native_instruction_show", json!({"address": "0x1000"}));
+        let again = open("arm64", "0x8000");
+        assert_eq!(again["result"]["raw"], json!({"architecture": "arm64", "entry_point": 0x8000}));
+        let insn = call("native_instruction_show", json!({"address": "0x8000"}));
+        assert!(insn["result"].to_string().contains("ret"), "{insn}");
+        assert_eq!(open("arm64", "0x8000")["result"]["raw"]["entry_point"], 0x8000, "the same settings reuse the target");
+        assert_eq!(call("core_session_show", json!({}))["result"]["targets"].as_array().map(Vec::len), Some(1), "still one target");
+    }
+
     #[test]
     fn relative_paths_and_bad_params_are_errors() {
         let e = Engine::new(crate::testing::session());
@@ -663,6 +687,21 @@ mod tests {
         assert_eq!(stale.code, craft_anything_evidence::ErrorCode::StaleRevision);
         let v = e.call("core_unknown_verify", json!({"unknown_id": id}), CallOptions::new(Caller::Agent)).unwrap().to_json();
         assert_eq!(v["result"]["valid"], false, "cites no evidence");
+    }
+
+    /// #498: the bad field must be identifiable, and rejected input must not create an unknown.
+    #[test]
+    fn an_unknown_can_be_recorded_after_correcting_its_parameter_type() {
+        let e = Engine::new(crate::testing::session());
+        for caller in [Caller::Agent, Caller::Mcp, Caller::Cli] {
+            let error = e.call("core_unknown_add", json!({"question": ["Where is the loop?"]}), CallOptions::new(caller)).unwrap_err();
+            assert_eq!(error.code, craft_anything_evidence::ErrorCode::BadInput);
+            assert_eq!(error.details.as_ref().unwrap()["parameter_path"], "/question");
+            assert!(error.message.contains("expected a string"));
+            assert_eq!(e.session().unknowns().count(), 0);
+        }
+        e.call("core_unknown_add", json!({"question": "Where is the loop?"}), CallOptions::new(Caller::Agent)).unwrap();
+        assert_eq!(e.session().unknowns().count(), 1);
     }
 
     #[test]

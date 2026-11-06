@@ -28,7 +28,8 @@ pub enum ZipError {
 /// One central-directory entry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ZipEntry {
-    /// Entry name as stored (forward slashes). Decoded lossily when not valid UTF-8.
+    /// Entry name as stored (forward slashes). Bit 11 selects lossy UTF-8; otherwise
+    /// valid UTF-8 is preserved and remaining names are decoded as CP437.
     pub name: String,
     pub method: u16,
     pub flags: u16,
@@ -39,9 +40,24 @@ pub struct ZipEntry {
     pub local_header_offset: u64,
     pub is_dir: bool,
     pub encrypted: bool,
+    /// Unix mode from the external attributes (only when the entry was made on a Unix host).
+    #[serde(skip)]
+    pub unix_mode: Option<u32>,
 }
 
 impl ZipEntry {
+    /// Why this entry is not a regular file or directory (symlink, device, FIFO, socket), if so.
+    pub fn special_kind(&self) -> Option<&'static str> {
+        match self.unix_mode? & 0o170000 {
+            0o120000 => Some("symlink"),
+            0o020000 => Some("character device"),
+            0o060000 => Some("block device"),
+            0o010000 => Some("FIFO"),
+            0o140000 => Some("socket"),
+            _ => None,
+        }
+    }
+
     /// Human name of the compression method.
     pub fn method_name(&self) -> &'static str {
         match self.method {
@@ -129,38 +145,44 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
         let name_len = usize::from(r.u16_le(pos + 28).ok_or(ZipError::Truncated("directory entry"))?);
         let extra_len = usize::from(r.u16_le(pos + 30).ok_or(ZipError::Truncated("directory entry"))?);
         let comment_len = usize::from(r.u16_le(pos + 32).ok_or(ZipError::Truncated("directory entry"))?);
+        let host = r.slice(pos + 5, 1).and_then(|b| b.first().copied()).unwrap_or(0);
+        let unix_mode = if host == 3 { r.u32_le(pos + 38).map(|a| a >> 16) } else { None };
         let mut local = u64::from(r.u32_le(pos + 42).ok_or(ZipError::Truncated("directory entry"))?);
         let name_bytes = r.slice(pos + 46, name_len).ok_or(ZipError::Truncated("entry name"))?;
-        let extra = r.slice(pos + 46 + name_len, extra_len).unwrap_or(&[]);
-        // ZIP64 extended information extra field.
+        let extra = r.slice(pos + 46 + name_len, extra_len).ok_or(ZipError::Truncated("entry extra fields"))?;
+        // Each extra field owns its payload: ZIP64 values cannot borrow a following field's bytes.
+        let needs_zip64 = usize_ == 0xffff_ffff || csize == 0xffff_ffff || local == 0xffff_ffff;
+        let mut found_zip64 = false;
         let mut x = 0usize;
         let er = Reader::new(extra);
-        while let (Some(id), Some(len)) = (er.u16_le(x), er.u16_le(x + 2)) {
+        while x < extra.len() {
+            let id = er.u16_le(x).ok_or(ZipError::Truncated("extra field header"))?;
+            let len = usize::from(er.u16_le(x + 2).ok_or(ZipError::Truncated("extra field header"))?);
             let body = x + 4;
+            let field = er.slice(body, len).ok_or(ZipError::Truncated("extra field payload"))?;
             if id == 0x0001 {
-                let mut f = body;
-                if usize_ == 0xffff_ffff
-                    && let Some(v) = er.u64_le(f)
-                {
-                    usize_ = v;
+                let values = Reader::new(field);
+                let mut f = 0;
+                if usize_ == 0xffff_ffff {
+                    usize_ = values.u64_le(f).ok_or(ZipError::Truncated("zip64 uncompressed size"))?;
                     f += 8;
                 }
-                if csize == 0xffff_ffff
-                    && let Some(v) = er.u64_le(f)
-                {
-                    csize = v;
+                if csize == 0xffff_ffff {
+                    csize = values.u64_le(f).ok_or(ZipError::Truncated("zip64 compressed size"))?;
                     f += 8;
                 }
-                if local == 0xffff_ffff
-                    && let Some(v) = er.u64_le(f)
-                {
-                    local = v;
+                if local == 0xffff_ffff {
+                    local = values.u64_le(f).ok_or(ZipError::Truncated("zip64 local header offset"))?;
                 }
+                found_zip64 = true;
                 break;
             }
-            x = body + usize::from(len);
+            x = body + len;
         }
-        let name = String::from_utf8_lossy(name_bytes).replace('\\', "/");
+        if needs_zip64 && !found_zip64 {
+            return Err(ZipError::Corrupt("missing ZIP64 extended information".into()));
+        }
+        let name = decode_name(name_bytes, flags).replace('\\', "/");
         entries.push(ZipEntry {
             is_dir: name.ends_with('/'),
             name,
@@ -171,11 +193,29 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
             uncompressed_size: usize_,
             local_header_offset: local.saturating_add(prefix),
             encrypted: flags & 1 != 0,
+            unix_mode,
         });
         seen += 1;
         pos = pos.checked_add(46 + name_len + extra_len + comment_len).ok_or_else(|| ZipError::Corrupt("directory overflow".into()))?;
     }
     Ok(ZipArchive { entries, declared_entries: total, truncated, zip64, prefix_bytes: prefix })
+}
+
+fn decode_name(bytes: &[u8], flags: u16) -> String {
+    if flags & 0x0800 != 0 || bytes.is_ascii() {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    if let Ok(name) = std::str::from_utf8(bytes) {
+        return name.to_owned();
+    }
+    const CP437: [char; 128] = [
+        'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', 'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥',
+        '₧', 'ƒ', 'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»', '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗',
+        '╝', '╜', '╛', '┐', '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧', '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘',
+        '┌', '█', '▄', '▌', '▐', '▀', 'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈',
+        '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{00a0}',
+    ];
+    bytes.iter().map(|&byte| if byte.is_ascii() { char::from(byte) } else { CP437.get(usize::from(byte - 0x80)).copied().unwrap_or('\u{fffd}') }).collect()
 }
 
 fn find_eocd(data: &[u8]) -> Option<usize> {
@@ -186,12 +226,19 @@ fn find_eocd(data: &[u8]) -> Option<usize> {
     let tail = data.get(from..)?;
     // Search backwards so a stray signature in the comment can't shadow the real record.
     let mut i = tail.len().checked_sub(22)?;
+    let mut found = None;
+    let mut last_signature = None;
     loop {
         if tail.get(i..i + 4) == Some(b"PK\x05\x06") {
-            return Some(from + i);
+            last_signature.get_or_insert(from + i);
+            if let Some(comment_len) = tail.get(i + 20..i + 22).and_then(|bytes| <[u8; 2]>::try_from(bytes).ok()).map(u16::from_le_bytes)
+                && i + 22 + usize::from(comment_len) == tail.len()
+            {
+                found = Some(from + i);
+            }
         }
         if i == 0 {
-            return None;
+            return found.or(last_signature);
         }
         i -= 1;
     }
@@ -213,6 +260,16 @@ pub fn raw_entry_data<'a>(data: &'a [u8], e: &ZipEntry) -> Result<&'a [u8], ZipE
 
 /// Read and decompress one entry, refusing to produce more than `max_bytes`.
 pub fn read_entry(data: &[u8], e: &ZipEntry, max_bytes: u64) -> Result<Vec<u8>, ZipError> {
+    let out = read_entry_unverified(data, e, max_bytes)?;
+    let found = crc32(&out);
+    if found != e.crc32 {
+        return Err(ZipError::CrcMismatch { expected: e.crc32, found });
+    }
+    Ok(out)
+}
+
+/// Like [`read_entry`] but without comparing the stored CRC-32, so a caller that accepts a mismatch can still get the bytes.
+pub fn read_entry_unverified(data: &[u8], e: &ZipEntry, max_bytes: u64) -> Result<Vec<u8>, ZipError> {
     if e.encrypted {
         return Err(ZipError::Unsupported(format!("{} is encrypted", e.name)));
     }
@@ -222,6 +279,7 @@ pub fn read_entry(data: &[u8], e: &ZipEntry, max_bytes: u64) -> Result<Vec<u8>, 
     let raw = raw_entry_data(data, e)?;
     let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
     let out = match e.method {
+        0 if raw.len() as u64 > max_bytes => return Err(ZipError::TooLarge(max_bytes)),
         0 => raw.to_vec(),
         8 => miniz_oxide::inflate::decompress_to_vec_with_limit(raw, cap).map_err(|err| match err.status {
             miniz_oxide::inflate::TINFLStatus::HasMoreOutput => ZipError::TooLarge(max_bytes),
@@ -230,9 +288,8 @@ pub fn read_entry(data: &[u8], e: &ZipEntry, max_bytes: u64) -> Result<Vec<u8>, 
         93 => crate::decompress::zstd(raw, max_bytes).map_err(|err| ZipError::Corrupt(format!("zstd stream for {} is damaged: {err}", e.name)))?,
         m => return Err(ZipError::Unsupported(format!("compression method {m} ({}) for {}", e.method_name(), e.name))),
     };
-    let found = crc32(&out);
-    if found != e.crc32 {
-        return Err(ZipError::CrcMismatch { expected: e.crc32, found });
+    if out.len() as u64 != e.uncompressed_size {
+        return Err(ZipError::Corrupt(format!("decoded size for {} is {}, but its directory entry declares {}", e.name, out.len(), e.uncompressed_size)));
     }
     Ok(out)
 }
@@ -291,6 +348,65 @@ mod tests {
         out
     }
 
+    fn build_named_entry(name: &[u8], flags: u16) -> Vec<u8> {
+        let mut zip = build(&[(&"x".repeat(name.len()), b"")]);
+        let central = 30 + name.len();
+        zip[6..8].copy_from_slice(&flags.to_le_bytes());
+        zip[30..central].copy_from_slice(name);
+        zip[central + 8..central + 10].copy_from_slice(&flags.to_le_bytes());
+        zip[central + 46..central + 46 + name.len()].copy_from_slice(name);
+        zip
+    }
+
+    #[test]
+    fn a_cp437_name_without_the_utf8_flag_is_decoded() {
+        let zip = build_named_entry(b"caf\x82.txt", 0);
+        assert_eq!(parse(&zip, 10).unwrap().entries[0].name, "café.txt");
+    }
+
+    #[test]
+    fn a_cp437_box_drawing_name_without_the_utf8_flag_is_decoded() {
+        let zip = build_named_entry(b"\xc9.txt", 0);
+        assert_eq!(parse(&zip, 10).unwrap().entries[0].name, "╔.txt");
+    }
+
+    #[test]
+    fn a_utf8_name_with_the_utf8_flag_is_preserved() {
+        let zip = build_named_entry("한글/é.txt".as_bytes(), 0x0800);
+        assert_eq!(parse(&zip, 10).unwrap().entries[0].name, "한글/é.txt");
+    }
+
+    #[test]
+    fn a_valid_utf8_name_without_the_utf8_flag_is_preserved() {
+        let zip = build_named_entry("é.txt".as_bytes(), 0);
+        assert_eq!(parse(&zip, 10).unwrap().entries[0].name, "é.txt");
+    }
+
+    #[test]
+    fn an_ascii_name_is_preserved() {
+        let zip = build_named_entry(b"dir/file.txt", 0);
+        assert_eq!(parse(&zip, 10).unwrap().entries[0].name, "dir/file.txt");
+    }
+
+    #[test]
+    fn valid_entry_survives_eocd_signature_in_comment() {
+        let mut zip = build(&[("a.txt", b"hello")]);
+        let comment = b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let eocd = zip.len() - 22;
+        zip[eocd + 20..eocd + 22].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+        zip.extend_from_slice(comment);
+
+        assert_eq!(parse(&zip, 10).unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn valid_entry_survives_bytes_after_eocd_comment() {
+        let mut zip = build(&[("a.txt", b"hello")]);
+        zip.extend_from_slice(b"tail");
+
+        assert_eq!(parse(&zip, 10).unwrap().entries.len(), 1);
+    }
+
     #[test]
     fn lists_and_reads_stored_entries() {
         let z = build(&[("a.txt", b"hello"), ("dir/b.js", b"console.log(1)")]);
@@ -322,6 +438,7 @@ mod tests {
             local_header_offset: 0,
             is_dir: false,
             encrypted: false,
+            unix_mode: None,
         };
         assert_eq!(read_entry(&file, &e, 100).unwrap(), body);
         assert!(matches!(read_entry(&file, &e, 3), Err(ZipError::TooLarge(3))));
@@ -343,6 +460,7 @@ mod tests {
             local_header_offset: 0,
             is_dir: false,
             encrypted: false,
+            unix_mode: None,
         };
         let mut z = b"PK\x03\x04".to_vec();
         z.extend_from_slice(&[0; 26]);

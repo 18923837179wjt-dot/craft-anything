@@ -860,16 +860,55 @@ fn decode_a32(mode: Mode, bytes: &[u8], addr: u64, fmt: bool) -> Option<Insn> {
     let mut writes = Vec::new();
     let mut pops_pc = false;
     let mut reg_ops: Vec<u8> = Vec::new();
+    // A memory operand no C statement says whole (write-back, a subtracted or shifted index): the
+    // lifter shows the instruction as written rather than a wrong expression (#277).
+    let mut exact = true;
+    let size = if matches!(inst.opcode, Opcode::LDR | Opcode::STR) { 4 } else { 0 };
+    let mem = |base: u8, index: Option<u8>, disp: i64| {
+        // A literal load reads from the word-aligned PC.
+        let pc = (base == 15).then(|| (addr.wrapping_add(pc_bias) & !3).wrapping_add(disp as u64));
+        let (base, disp) = if pc.is_some() { (None, 0) } else { (Some(format!("r{base}")), disp) };
+        Op::Mem(MemOp { base, index: index.map(|i| format!("r{i}")), scale: 1, disp, size, addr: pc, seg: None })
+    };
     for o in inst.operands.iter() {
         match *o {
             Operand::Nothing => break,
+            Operand::RegDerefPreindexOffset(r, off, add, false) => {
+                ops.push(mem(r.number(), None, if add { i64::from(off) } else { -i64::from(off) }));
+                if r.number() != 15 {
+                    push_unique(&mut reads, format!("r{}", r.number()));
+                }
+            }
+            Operand::RegDerefPreindexReg(r, m, true, false) if r.number() != 15 => {
+                ops.push(mem(r.number(), Some(m.number()), 0));
+                push_unique(&mut reads, format!("r{}", r.number()));
+                push_unique(&mut reads, format!("r{}", m.number()));
+            }
+            Operand::RegDerefPreindexOffset(r, ..)
+            | Operand::RegDerefPostindexOffset(r, ..)
+            | Operand::RegDerefPreindexReg(r, ..)
+            | Operand::RegDerefPostindexReg(r, ..)
+            | Operand::RegDerefPreindexRegShift(r, ..)
+            | Operand::RegDerefPostindexRegShift(r, ..) => {
+                exact = false;
+                ops.push(mem(r.number(), None, 0));
+                push_unique(&mut reads, format!("r{}", r.number()));
+            }
             Operand::BranchOffset(off) => {
                 let t = (addr.wrapping_add(pc_bias - 8)).wrapping_add((i64::from(off) * 4) as u64);
                 target = Some(t);
                 ops.push(Op::Addr(t));
             }
             Operand::BranchThumbOffset(off) => {
-                let t = (addr.wrapping_add(pc_bias - 4)).wrapping_add((i64::from(off) * 2) as u64);
+                // The PC reads as the instruction address plus 4 (Thumb) or 8 (A32).
+                // yaxpeax already counts one halfword into CBZ/CBNZ and 16-bit conditional B offsets.
+                let counted = matches!(inst.opcode, Opcode::CBZ | Opcode::CBNZ) || (inst.opcode == Opcode::B && len == 2 && inst.condition != C::AL);
+                let mut pc = addr.wrapping_add(pc_bias).wrapping_sub(if counted { 2 } else { 0 });
+                // Thumb BLX switches to A32 and branches from the word-aligned PC.
+                if mode == Mode::T32 && inst.opcode == Opcode::BLX {
+                    pc &= !3;
+                }
+                let t = pc.wrapping_add((i64::from(off) * 2) as u64);
                 target = Some(t);
                 ops.push(Op::Addr(t));
             }
@@ -900,6 +939,7 @@ fn decode_a32(mode: Mode, bytes: &[u8], addr: u64, fmt: bool) -> Option<Insn> {
             (Some(t), false) => Flow::Jump { target: t },
             _ => Flow::IndirectJump { slot: None },
         },
+        Opcode::CBZ | Opcode::CBNZ => target.map_or(Flow::Next, |t| Flow::Cond { target: t }),
         Opcode::BL | Opcode::BLX => match target {
             Some(t) => Flow::Call { target: t },
             None => Flow::IndirectCall { slot: None },
@@ -934,7 +974,7 @@ fn decode_a32(mode: Mode, bytes: &[u8], addr: u64, fmt: bool) -> Option<Insn> {
         Opcode::POP => Kind::Pop,
         Opcode::LDR => Kind::Load,
         Opcode::STR => Kind::Store,
-        Opcode::B | Opcode::BX => Kind::Branch,
+        Opcode::B | Opcode::BX | Opcode::CBZ | Opcode::CBNZ => Kind::Branch,
         Opcode::BL | Opcode::BLX => Kind::Call,
         _ => Kind::Other,
     };
@@ -946,7 +986,9 @@ fn decode_a32(mode: Mode, bytes: &[u8], addr: u64, fmt: bool) -> Option<Insn> {
             push_unique(&mut reads, n);
         }
     }
-    let cond = if matches!(flow, Flow::Cond { .. }) {
+    let kind = if exact { kind } else { Kind::Other };
+    let conditional_call = conditional && matches!(flow, Flow::Call { .. } | Flow::IndirectCall { .. });
+    let cond = if conditional_call || matches!(flow, Flow::Cond { .. }) {
         Some(match inst.condition {
             C::EQ => Cond::Eq,
             C::NE => Cond::Ne,
@@ -1156,6 +1198,68 @@ mod tests {
         c.apply(&mut b);
         assert_eq!(b.refs, vec![0x2010]);
         assert_eq!(c.value("x0"), Some(0x2010));
+    }
+
+    #[test]
+    fn a_thumb_bl_call_targets_its_destination() {
+        for fmt in [false, true] {
+            let i = decode(Mode::T32, &[0x00, 0xf0, 0x05, 0xf8], 0x1002, fmt).unwrap();
+            assert_eq!(i.flow, Flow::Call { target: 0x1010 });
+            assert_eq!(i.ops, vec![Op::Addr(0x1010)]);
+            let i = decode(Mode::T32, &[0xff, 0xf7, 0xf7, 0xff], 0x1010, fmt).unwrap();
+            assert_eq!(i.flow, Flow::Call { target: 0x1002 });
+        }
+    }
+
+    #[test]
+    fn arm_and_thumb_branches_target_what_llvm_objdump_reports() {
+        // Bytes and targets from clang-assembled code disassembled by llvm-objdump.
+        let cases: &[(Mode, &str, &[u8], u64, u64)] = &[
+            (Mode::T32, "b", &[0x14, 0xe0], 0x1000, 0x102c),
+            (Mode::T32, "beq", &[0x13, 0xd0], 0x1002, 0x102c),
+            (Mode::T32, "b.w", &[0x00, 0xf0, 0x12, 0xb8], 0x1004, 0x102c),
+            (Mode::T32, "beq.w", &[0x00, 0xf0, 0x10, 0x80], 0x1008, 0x102c),
+            (Mode::T32, "bl", &[0x00, 0xf0, 0x0e, 0xf8], 0x100c, 0x102c),
+            (Mode::T32, "cbz", &[0x60, 0xb1], 0x1010, 0x102c),
+            (Mode::T32, "cbnz", &[0x59, 0xb9], 0x1012, 0x102c),
+            (Mode::T32, "blx", &[0xff, 0xf7, 0xfe, 0xef], 0x1016, 0x1014),
+            (Mode::T32, "bne.w", &[0x40, 0xf0, 0x06, 0x80], 0x1024, 0x1034),
+            (Mode::T32, "bne", &[0x03, 0xd1], 0x102a, 0x1034),
+            (Mode::A32, "b", &[0x04, 0x00, 0x00, 0xea], 0x1000, 0x1018),
+            (Mode::A32, "beq", &[0x03, 0x00, 0x00, 0x0a], 0x1004, 0x1018),
+            (Mode::A32, "bl", &[0xfe, 0xff, 0xff, 0xeb], 0x1008, 0x1008),
+            (Mode::A32, "blx", &[0xfe, 0xff, 0xff, 0xfa], 0x100c, 0x100c),
+            (Mode::A32, "b back", &[0xfa, 0xff, 0xff, 0xea], 0x1010, 0x1000),
+        ];
+        for (mode, name, bytes, at, want) in cases {
+            let i = decode(*mode, bytes, *at, false).unwrap();
+            let got = match i.flow {
+                Flow::Call { target } | Flow::Jump { target } | Flow::Cond { target } => target,
+                other => panic!("{mode:?} {name}: {other:?}"),
+            };
+            assert_eq!(got, *want, "{mode:?} {name}");
+        }
+        let cbz = decode(Mode::T32, &[0x60, 0xb1], 0x1010, false).unwrap();
+        assert_eq!(cbz.reads, vec!["r0".to_string()]);
+        assert!(cbz.writes.is_empty());
+    }
+
+    #[test]
+    fn a_thumb_bl_discovers_the_callee_instead_of_padding() {
+        use crate::{Image, Limits, NoControl, Program};
+        use craft_anything_formats::{Arch, Binary};
+        use std::sync::Arc;
+
+        let bytes = [0x10, 0xb5, 0x00, 0xf0, 0x05, 0xf8, 0x10, 0xbd, 0, 0, 0, 0, 0, 0, 0, 0, 0x70, 0x47];
+        let mut bin = Binary::raw(Arch::Arm, 0x1000, bytes.len() as u64, 0);
+        bin.entry = Some(0x1001);
+        let img = Image::from_binary(Arc::from(bytes), bin);
+        assert_eq!(img.mode, Some(Mode::T32));
+        let p = Program::analyze(&img, &Limits::default(), &NoControl).unwrap();
+        let caller = p.functions.get(&0x1000).unwrap();
+        assert_eq!(caller.calls.first().unwrap().target, Some(0x1010));
+        assert!(p.functions.contains_key(&0x1010));
+        assert!(!p.functions.contains_key(&0x100c));
     }
 
     #[test]

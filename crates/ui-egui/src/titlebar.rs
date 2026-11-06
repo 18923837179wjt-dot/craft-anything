@@ -135,7 +135,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
         }
         if let Some((name, kind)) = target {
             icons::show(ui, crate::kind_icon(kind), 14.0, t.icon);
-            ui.add(egui::Label::new(RichText::new(name).font(theme::mono(11.5)).color(t.text)).truncate()).on_hover_text(tr(kind.plain()));
+            ui.add(egui::Label::new(RichText::new(name).font(theme::mono(theme::CAPTION)).color(t.text)).truncate()).on_hover_text(tr(kind.plain()));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -186,7 +186,8 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
             usage_pill(app, ui);
             if app.jobs.busy() {
                 let n = app.jobs.running().filter(|j| j.visible).count();
-                ui.add(egui::Spinner::new().size(14.0).color(t.accent)).on_hover_text(crate::i18n::trf("{n} job(s) running", &[("n", &n.to_string())]));
+                ui.add(crate::widgets::Spinner::new().size(14.0).color(t.accent))
+                    .on_hover_text(crate::i18n::trf("{n} job(s) running", &[("n", &n.to_string())]));
             }
         });
     });

@@ -9,7 +9,7 @@ use craft_anything_engine::{Consent, Mode};
 use egui::{Margin, RichText, Vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppCommand {
+pub(crate) enum AppCommand {
     OpenFile,
     OpenFolder,
     ToggleMode,
@@ -101,6 +101,9 @@ pub fn show(app: &mut CraftApp, ctx: &egui::Context) {
         p.selected = p.selected.saturating_sub(1);
     }
     p.selected = p.selected.min(n.saturating_sub(1));
+    // The list follows the selection only when the keys or typing moved it: every frame would pull
+    // the wheel's scroll back to it (#584).
+    let mut follow = down || up;
     let mut chosen: Option<usize> = None;
     let screen = ctx.content_rect();
     let width = 620.0_f32.min(screen.width() - 40.0);
@@ -128,6 +131,7 @@ pub fn show(app: &mut CraftApp, ctx: &egui::Context) {
                     r.request_focus();
                     if r.changed() {
                         app.state.palette.selected = 0;
+                        follow = true;
                     }
                 });
                 ui.add_space(6.0);
@@ -142,7 +146,7 @@ pub fn show(app: &mut CraftApp, ctx: &egui::Context) {
                         if on || r.hovered() {
                             ui.painter().rect_filled(rect, t.radius_sm, if on { t.accent_soft } else { t.hover });
                         }
-                        if on {
+                        if on && follow {
                             r.scroll_to_me(None);
                         }
                         let (icon, title, sub, tag) = match e {
@@ -203,7 +207,18 @@ pub fn show(app: &mut CraftApp, ctx: &egui::Context) {
     }
 }
 
-fn run_app_command(app: &mut CraftApp, c: AppCommand) {
+/// Opens or closes the palette (Ctrl/⌘ K), once first run is done.
+pub(crate) fn toggle(app: &mut CraftApp) {
+    if app.settings.first_run_done {
+        app.state.palette.open = !app.state.palette.open;
+        app.state.palette.query.clear();
+        app.state.palette.selected = 0;
+        app.state.palette.form_tool = None;
+    }
+}
+
+/// Runs one of the app's own commands, from the palette or the macOS menu bar.
+pub(crate) fn run_app_command(app: &mut CraftApp, c: AppCommand) {
     match c {
         AppCommand::OpenFile => app.pick(Pick::OpenFile),
         AppCommand::OpenFolder => app.pick(Pick::OpenFolder),
@@ -248,7 +263,7 @@ fn form(app: &mut CraftApp, ctx: &egui::Context, tool: &str) {
         .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 80.0))
         .show(ctx, |ui| {
             ui.label(RichText::new(spec.summary).color(t.text_dim));
-            ui.label(RichText::new(spec.id).font(theme::mono(11.5)).color(t.text_faint));
+            ui.label(RichText::new(spec.id).font(theme::mono(theme::CAPTION)).color(t.text_faint));
             if spec.effects.needs_consent() {
                 ui.horizontal(|ui| {
                     icons::show(ui, "shield", 14.0, t.warning);

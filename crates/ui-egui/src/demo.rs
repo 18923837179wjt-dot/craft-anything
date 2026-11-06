@@ -229,6 +229,7 @@ fn workspace(slug: &str, name: &str, request: &str, target: TargetRef, status: S
             updated_ms: at,
             checks: Vec::new(),
             agent_session: None,
+            agent_session_by: None,
             allowed_actions: Vec::new(),
             last_reply: String::new(),
             asset_budget_usd: craft_anything_engine::workspace::ASSET_BUDGET_USD,
@@ -238,6 +239,7 @@ fn workspace(slug: &str, name: &str, request: &str, target: TargetRef, status: S
             builder: None,
             questions: None,
             awaiting_check: false,
+            not_working_checks: 0,
         },
     }
 }
@@ -263,7 +265,7 @@ pub fn fill_projects(app: &mut CraftApp) {
 
 /// A project mid-build: steps, the agent's words, collapsed tool work, a question and a check.
 pub fn fill_project(app: &mut CraftApp) {
-    use crate::state::FeedItem;
+    use crate::state::{FeedItem, UserItem};
     use craft_anything_ai::rebuild::Step;
     use craft_anything_engine::inbox::{Request, RequestKind};
     let mut ws = workspace("example-com", "example.com", "Recreate this website", TargetRef::Website { url: "https://example.com".into() }, Status::Ready, 2);
@@ -289,7 +291,7 @@ pub fn fill_project(app: &mut CraftApp) {
         enabled: true,
     }];
     app.state.feed = vec![
-        FeedItem::User("Recreate this website".into()),
+        FeedItem::User(UserItem::Text("Recreate this website".into())),
         FeedItem::Step { step: Step::Study, text: "Opening https://example.com in a private browser…".into() },
         FeedItem::Step { step: Step::Study, text: "Photographing the page and reading its layout…".into() },
         FeedItem::Step { step: Step::Build, text: "Building the first version…".into() },

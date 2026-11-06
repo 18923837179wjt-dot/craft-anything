@@ -1,5 +1,19 @@
 # zh-hant: original Chinese UI translations. Licensed MIT OR Apache-2.0.
 # UTF-8: English source<TAB>translation. Keep placeholders and escapes intact.
+OpenCode default	OpenCode 預設設定
+Model default	模型預設設定
+Thinking depth	思考深度
+OpenCode model	OpenCode 模型
+Remote program	遠端程式
+Reload models	重新載入模型
+Apply	套用
+No chat models are visible in {agent}. Check its setup, then reload.	{agent} 中沒有可見的聊天模型。請檢查其設定，然後重新載入。
+The saved model is no longer visible. Choose another model or the {agent} default.	已儲存的模型不再可見。請選擇其他模型或使用 {agent} 預設設定。
+OpenCode has no visible chat models. Connect a provider in OpenCode, then reload.	OpenCode 中沒有可見的聊天模型。請在 OpenCode 中連線至服務供應商，然後重新載入。
+The saved model is no longer visible. Choose another model or the OpenCode default.	已儲存的模型不再可見。請選擇其他模型或使用 OpenCode 預設設定。
+The saved thinking depth is unavailable for this model. Choose its default or an offered depth.	此模型不支援已儲存的思考深度。請選擇預設設定或可用的深度。
+List an agent's models	列出代理程式的模型
+Choose an agent's model and thinking	選擇代理程式的模型與思考深度
  GB	 GB
  and {n} more	，另有 {n} 項
  {ascii}	 {ascii}
@@ -85,6 +99,8 @@ Add a folder…	新增資料夾…
 Add a plugin	新增外掛
 Add an AI brain and I'll read this evidence for you, answer follow-up questions and point at the proof.	新增 AI 助手後，我就能為你解讀這些證據、回答後續問題，並指出依據。
 Add an AI by its address	依位址新增 AI
+Add another	再新增一個
+Add it again, to choose another account's folder for it.	再新增一次，以便為它選擇另一個帳號的資料夾。
 Add more info. The builder reads it at its next step.	補充更多資訊。建置助手會在下一步讀取。
 Add pictures	新增圖片
 Add pictures of the original	新增原作圖片
@@ -129,6 +145,7 @@ Answers come from {brain}. To build, set up a coding agent in Settings → AI.	�
 App	應用程式
 App details on device	裝置上的應用程式詳細資訊
 Apple apps	Apple 應用程式
+Apply model options	套用模型選項
 Approve an agent action	核准代理操作
 Apps and games: keep refining until they look this alike to your pictures. Off, the likeness is only reported.	應用程式和遊戲：持續改進，直到與參考圖片達到此相似度。關閉後僅回報相似度。
 Architectures	架構
@@ -160,7 +177,7 @@ Asking for its models…	正在取得可用模型…
 Asset catalog	資源目錄
 At most this many rounds of fixes after the first build.	首次建置後，最多進行這麼多輪修正。
 Attach pictures	附上圖片
-Attach pictures (or drop them here)	附加圖片 (或拖到這裡)
+Attach pictures (or drop or paste them here)	附加圖片 (或拖到這裡、貼到這裡)
 Auto mode	自動模式
 Automatic	自動
 Automatic ({name})	自動 ({name})
@@ -204,6 +221,7 @@ Capture menus, dialogs and tabs	擷取選單、對話方塊和分頁
 Change	變更
 Change a setting	變更設定
 Change an AI's model	變更 AI 的模型
+Change how hard an AI thinks	變更 AI 的思考力度
 Change it	變更
 Change…	變更…
 Check	檢查
@@ -229,6 +247,7 @@ Choose what the builder's questions get	選擇如何處理建置助手的問題
 Choose what to recreate, say what you want, then press Start.	選擇要重現的對象，描述你的需求，然後點選開始。
 Choose…	選擇…
 Classes	類別
+Claude Code folder (CLAUDE_CONFIG_DIR)	Claude Code 資料夾 (CLAUDE_CONFIG_DIR)
 Clean room	淨室
 Clean room / Deep	淨室 / 深度
 Clean room never reads the original's code, files or page source. Deep mode reads them with every tool Craft Anything has.	淨室模式從不讀取原作的程式碼、檔案或網頁原始碼。深度模式會使用 Craft Anything 的全部工具讀取它們。
@@ -249,6 +268,7 @@ Code reconstructed from a program that looks like the C language. Close to what 
 Code signature	程式碼簽章
 Coding agent app	程式設計代理應用程式
 Command palette (Ctrl/⌘ K)	命令面板 (Ctrl/⌘ K)
+Commands:	指令：
 Compare WebAssembly interfaces	比較 WebAssembly 介面
 Compare module exports	比較模組匯出
 Compare two .NET builds	比較兩個 .NET 建置
@@ -267,6 +287,7 @@ Connect to a browser	連線至瀏覽器
 Connect {name}	連線至 {name}
 Connected devices	已連線的裝置
 Connected phone	已連線的手機
+Context window	上下文視窗
 Continue	繼續
 Contradicted	存在矛盾
 Control-flow graph: a map of every path a function can take, like a flowchart.	控制流程圖：像流程圖一樣，展示函式可能執行的每一條路徑。
@@ -316,6 +337,7 @@ Deep	深度
 Deep mode now decompiles with Ghidra. The first look at a large program can take several minutes.	深度模式現在會使用 Ghidra 反編譯。首次分析大型程式可能需要幾分鐘。
 Deep mode on	深度模式已開啟
 Deep: we read its code, files and page source with every tool we have, and with Ghidra when it's installed. Click to switch.	深度：使用所有可用工具讀取其程式碼、檔案和網頁原始碼；已安裝 Ghidra 時也會使用它。按一下切換。
+Default	預設
 Delete a project	刪除專案
 Delete it	刪除
 Delete the project	刪除專案
@@ -364,6 +386,7 @@ Duplicate the project	建立專案副本
 Each answer says how sure we are: Seen it, Worked it out or Best guess.	每個回答都會說明可信程度：已觀察、已推導或推測。
 Edit a project file	編輯專案檔案
 Edit them in place	直接編輯
+Effort:	思考力度：
 Electron and JavaScript	Electron 與 JavaScript
 Electron fuses	Electron 功能開關
 Engines	引擎
@@ -387,6 +410,7 @@ Export a report (Markdown)	匯出報告 (Markdown)
 Export captured scripts	匯出擷取的指令碼
 Export evidence	匯出證據
 Export report	匯出報告
+Extended	延伸
 Extract an archive	解壓縮封存檔
 Extract firmware	擷取韌體
 Extract with this	用此工具擷取
@@ -551,6 +575,7 @@ It's mine, or I'm allowed to look	這是我的，或我已獲准查看
 Its copy is deleted, with anything it saved there. The project itself stays as it is.	將刪除此副本及其儲存的所有內容。專案本身保持不變。
 Its folder is deleted with everything in it: what was built, the checks and the conversation.	將刪除其資料夾及其中的全部內容：建置成果、檢查結果和對話。
 Its own code	本身的程式碼
+Its own sign-in, settings and conversations: another folder is another account. Empty: its usual folder.	它自己的登入資訊、設定和對話：換一個資料夾就是換一個帳號。留空：使用預設資料夾。
 Java archive overview	Java 封存檔概觀
 Java class	Java 類別
 Java method bytecode and pseudo-Java	Java 方法位元組碼與虛擬 Java 程式碼
@@ -563,6 +588,15 @@ Jobs ({n})	工作（{n}）
 Just a question: nothing was changed. Answered by	僅回答問題，未作任何修改。回答者：
 Just ask	只提問
 Just look inside	只檢視內部
+Work on my project	繼續做自己的專案
+Work on a project you already have	繼續做你已有的專案
+Pick its folder, say what you want, then press Start.	選擇它的資料夾，描述你的需求，然後點選開始。
+Where is your project?	你的專案在哪裡？
+Choose your project's folder…	選擇你的專案資料夾…
+For example: add a dark mode	例如：加上深色模式
+Pick your project's folder first.	請先選擇你的專案資料夾。
+Pick your project's folder	選擇你的專案資料夾
+That folder is empty. Pick the folder your project's files are in.	該資料夾是空的。請選擇存放你專案檔案的資料夾。
 Keep going without asking	繼續執行，無須詢問
 Keep it	保留
 Keep it in the sidebar to open any time, whatever later builds change.	將其保留在側邊欄中，隨時開啟，不受後續建置變更的影響。
@@ -613,7 +647,9 @@ List segments	列出區段
 List shared Cutter sessions	列出共用的 Cutter 工作階段
 List strings	列出字串
 Live: the project's latest build	目前：專案的最新建置
+Load a picture	載入圖片
 Load a screenshot	載入螢幕擷取畫面
+Load model options	載入模型選項
 Loading…	正在載入…
 Log	記錄
 Look again	重新尋找
@@ -661,6 +697,7 @@ Memory for Ghidra	Ghidra 記憶體用量
 Minimise	最小化
 Mode	模式
 Model	模型
+Model options	模型選項
 Model: {model}	模型：{model}
 Modules	模組
 More detail	更多詳細資訊
@@ -704,7 +741,7 @@ Not now	暫時不要
 Nothing allowed yet.	尚未允許任何操作。
 Nothing can build yet: install Claude Code (and sign in to it once), or add an AI with an API key below.	尚無可用的建置助手：請安裝 Claude Code (並先登入一次)，或在下方新增設定了 API 金鑰的 AI。
 Nothing found	未找到內容
-Nothing found yet. We look for API keys, local model servers (Ollama, LM Studio) and agent apps you already have.	尚未找到。我們會尋找你已有的 API 金鑰、本機模型伺服器 (Ollama、LM Studio) 和代理程式應用程式。
+Nothing found yet. We look for API keys, local model servers (Ollama, LM Studio) and agent apps you already have. One on another port or computer can be added by its address below.	尚未找到。我們會尋找你已有的 API 金鑰、本機模型伺服器 (Ollama、LM Studio) 和代理程式應用程式。其他連接埠或其他電腦上的伺服器可以在下方依位址新增。
 Nothing inside it is read.	不會讀取其內部內容。
 Nothing inside it is read; Craft Anything works from what you can see. Your version gets its own art.	不會讀取其內部內容；Craft Anything 僅依據你能看到的內容工作。你的版本會使用自己的美術素材。
 Nothing inside the original is read: not its code, files or page source. Craft Anything works from what you can see: pictures, the page as a visitor sees it, and watching it run.	不會讀取原作的內部內容，包括程式碼、檔案和網頁原始碼。Craft Anything 僅根據可見內容工作：圖片、訪客所見的網頁以及執行時的表現。
@@ -784,10 +821,12 @@ Page through evidence	分頁瀏覽證據
 Part of the app got stuck, so it was stopped and the rest carried on. Your work is kept.	應用程式的某個部分卡住，已將其停止，其他部分繼續執行。你的工作已保留。
 Part of the app is stuck. Restarting clears it, and your work is kept.	應用程式的某個部分卡住了。重新啟動即可恢復，你的工作會保留。
 Part of this screen hit a bug and was skipped. Your work is safe.	此畫面的一部分發生錯誤，已略過。你的工作內容是安全的。
+Paste pictures	貼上圖片
 Paste your API key (kept in your system keychain)	貼上 API 金鑰 (儲存在系統鑰匙圈中)
 Paste your {name} key	貼上你的 {name} 金鑰
 Path	路徑
 Pause	暫停
+Pausing…	正在暫停…
 Pause the build first, then delete the project.	請先暫停建置，再刪除專案。
 Pause the build first.	請先暫停建置。
 Paused	已暫停
@@ -867,6 +906,7 @@ Read the project	讀取專案
 Reading what's inside…	正在讀取內部內容…
 Ready	就緒
 Ready: {what} is on this computer.	已就緒：此電腦上已有 {what}。
+Reasoning	推理
 Rebuild status	重建狀態
 Record a finding	記錄發現
 Record a hypothesis	記錄假設
@@ -970,19 +1010,24 @@ Send now	立即傳送
 Server address	伺服器位址
 Session status	工作階段狀態
 Set a project's asset budget	設定專案素材預算
+Set an AI's folder	設定 AI 的資料夾
 Set an AI's program	設定 AI 的程式
+Set model options	設定模型選項
 Set one up	設定一個
 Set up a brain…	設定 AI 助手…
 Set up a builder	設定建置助手
 Settings	設定
 Show a build's activity	顯示建置活動
 Show a project	顯示專案
+Show folder	顯示資料夾
 Show me everything	顯示全部內容
 Show me the proof	檢視證據
+Show model options	顯示模型選項
 Show pinned builds	顯示釘選的建置
 Show settings	顯示設定
 Show the answer	顯示回答
 Show the console	顯示主控台
+Show the folder	顯示該資料夾
 Show the ones that are met	顯示已滿足的要求
 Show the sidebar	顯示側邊欄
 Show the welcome again	再次顯示歡迎畫面
@@ -1001,6 +1046,7 @@ Some plugins couldn't be read:	部分外掛無法讀取：
 Something a program borrows from the operating system or a library, like "open a file".	程式從作業系統或程式庫呼叫的功能，例如「開啟檔案」。
 Something a program or library offers for other programs to use.	程式或程式庫提供給其他程式使用的功能。
 Source	原始碼
+Standard	標準
 Start	開始
 Start a Frida session	啟動 Frida 工作階段
 Start a GDB session	啟動 GDB 工作階段
@@ -1059,6 +1105,7 @@ The builder's questions	建置助手的問題
 The builder's questions come to you as cards, and it waits for your answer.	建置助手的問題會以卡片形式交給你，並等待你的回答。
 The builder's questions will come to you.	建置助手的問題會交給你回答。
 The built-in engines still show you everything they find.	內建引擎仍會顯示它們發現的所有內容。
+The clipboard can't be read:	無法讀取剪貼簿:
 The code	程式碼
 The code format Android apps use.	Android 應用程式使用的程式碼格式。
 The coding agent's estimate at API prices, not your bill. A subscription isn't charged this.	這是程式設計代理程式依 API 價格估算的費用，並非你的實際帳單；訂閱不會依此金額收費。
@@ -1069,6 +1116,8 @@ The installer is open. Follow its steps, then come back here.	安裝程式已開
 The lowest-level human-readable form of machine code: one small instruction per line.	機器碼最底層的可讀形式，每行一條簡短指令。
 The names were removed from the program before it was shipped, so we have to work them out.	程式發佈前移除了這些名稱，因此需要推導它們。
 The packed contents of an Electron app (a website inside a desktop app)	Electron 應用程式的打包內容 (桌面應用程式中的網站)
+The pasted picture wasn't attached: another screen was opened meanwhile.	貼上的圖片沒有附加:期間開啟了另一個頁面。
+The picture on the clipboard is too large.	剪貼簿中的圖片太大。
 The program's machine code written out as one tiny instruction per line.	將程式的機器碼寫成每行一條簡單指令的形式。
 The project's name and round	專案名稱與輪次
 The raw result	原始結果
@@ -1079,6 +1128,7 @@ The {} view isn't available yet in this build.	此版本暫不提供 {} 檢視�
 Theme	佈景主題
 There's no /{name} command. You can use {commands}.	沒有 /{name} 命令。你可以使用 {commands}。
 There's no AI brain set up yet, so here's what the built-in engines found:	尚未設定 AI 助手，以下是內建引擎的發現：
+There's no picture on the clipboard to paste.	剪貼簿中沒有可貼上的圖片。
 They're my app: edit them in place	這些就是我的應用程式：就地編輯
 Things a program borrows from the operating system or libraries, like "open a file" or "draw a window".	程式借用作業系統或函式庫提供的功能，例如「開啟檔案」或「繪製視窗」。
 Things a program or library offers for other programs to use.	程式或程式庫提供給其他程式使用的功能。
@@ -1128,6 +1178,7 @@ Unreal IoStore	Unreal IoStore
 Unreal builds games with Apple's Xcode, free in the App Store.	Unreal 使用 Apple 的 Xcode 建置遊戲，可從 App Store 免費取得。
 Unreal is here, but it also needs Visual Studio's C++ tools.	已安裝 Unreal，但還需要 Visual Studio 的 C++ 工具。
 Unreal pak	Unreal pak
+Update a finding	更新發現
 Update a hypothesis	更新假設
 Update an open question	更新待解答的問題
 Update the checklist	更新檢查清單
@@ -1312,6 +1363,8 @@ your files there are the app, edited in place	該位置的檔案就是應用程�
 {mb} MB	{mb} MB
 {name} builds what you make.	由 {name} 建置你的作品。
 {name} builds what you make; answers come from {brain}.	由 {name} 負責建置，{brain} 負責回答。
+{name} can't be attached: a message takes pictures up to 20 MB.	無法附加 {name}:訊息中的圖片最大為 20 MB。
+{name} can't be attached: it isn't a PNG, JPEG, GIF or WebP picture.	無法附加 {name}:它不是 PNG、JPEG、GIF 或 WebP 圖片。
 {name} is ready	{name} 已就緒
 {name} is ready.	{name} 已就緒。
 {name} isn't available yet in this build.	此版本尚未提供{name}。
@@ -1360,3 +1413,34 @@ your files there are the app, edited in place	該位置的檔案就是應用程�
 … {} older	… 還有 {} 則較早內容
 ← Back	← 返回
 ↑↓ to move · Enter to run · Esc to close	↑↓ 選擇 · Enter 執行 · Esc 關閉
+Providers	供應商
+Harnesses	代理
+Nothing of this kind was found.	沒有找到這類項目。
+Another model	其他模型
+Fold a project's plan	摺疊專案的計畫
+Fold the plan	摺疊計畫
+The Claude desktop app is installed, but building needs Claude Code, its separate command-line tool. Install Claude Code, sign in to it once in a terminal, then look again.	已安裝 Claude 桌面應用程式，但建置需要 Claude Code，也就是它獨立的命令列工具。請安裝 Claude Code，在終端機中登入一次，然後重新尋找。
+Unreal is here, but its bundled Clang C++ toolchain wasn't found.	Unreal 已安裝，但找不到其內建的 Clang C++ 工具鏈。
+Add Unreal's Linux C++ toolchain	新增 Unreal 的 Linux C++ 工具鏈
+Run Engine/Build/BatchFiles/Linux/SetupToolchain.sh in the engine folder to install its bundled Clang toolchain. If you built Unreal from source, Setup.sh downloads the native toolchain instead. A system Clang may not match the engine's version.	在引擎資料夾中執行 Engine/Build/BatchFiles/Linux/SetupToolchain.sh，安裝其內建的 Clang 工具鏈。如果是原始碼建置，Setup.sh 會改為下載原生工具鏈。系統 Clang 可能與引擎版本不相符。
+Unreal is here, but it also needs Xcode.	已安裝 Unreal，但還需要 Xcode。
+About 60 GB, an Epic Games account, and Xcode.	約 60 GB，需要 Epic Games 帳戶和 Xcode。
+File	檔案
+View	顯示方式
+Window	視窗
+Help	輔助說明
+Command palette	命令面板
+Craft Anything on GitHub	GitHub 上的 Craft Anything
+Report a problem…	回報問題…
+Quit Craft Anything	結束 Craft Anything
+About Craft Anything	關於 Craft Anything
+Services	服務
+Hide Craft Anything	隱藏 Craft Anything
+Hide others	隱藏其他
+Show all	顯示全部
+Close window	關閉視窗
+Full screen	全螢幕
+Zoom	縮放
+Bring all to front	將全部視窗移至最前
+Drag to give the plan more or less room; double-click to reset	拖曳以調整計畫佔用的空間；按兩下恢復預設
+Copy the message	複製這則訊息

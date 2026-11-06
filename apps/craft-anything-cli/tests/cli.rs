@@ -8,6 +8,31 @@ fn cli(args: &[&str], config: &std::path::Path) -> Output {
     Process::new(env!("CARGO_BIN_EXE_craft-anything-cli")).args(args).env("CRAFT_ANYTHING_CONFIG_DIR", config).timeout(Duration::from_secs(60)).run().unwrap()
 }
 
+/// The CLI lists installation-specific depths and refuses unsupported selections using an isolated agent fixture.
+#[cfg(unix)]
+#[test]
+fn opencode_cli_lists_supported_depths_and_rejects_unsupported_choices() {
+    use std::os::unix::fs::PermissionsExt;
+    let cfg = tempfile::tempdir().unwrap();
+    let program = cfg.path().join("agent");
+    let response = json!({"data":[{"id":"model","providerID":"test","name":"Test model","enabled":true,"type":"chat","variants":[{"id":"low"},{"id":"max"}]}]});
+    std::fs::write(&program, format!("#!/bin/sh\ncat <<'MODELS'\n{response}\nMODELS\n")).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(cli(&["ai", "add", "OpenCode", "--kind", "agent_cli", "--model", "opencode"], cfg.path()).success);
+    assert!(cli(&["ai", "program", "OpenCode", program.to_str().unwrap()], cfg.path()).success);
+    let listing = cli(&["ai", "model", "OpenCode", "--format", "json"], cfg.path());
+    let list: Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(list["models"][0]["thinking"], json!(["low", "max"]));
+    assert!(cli(&["ai", "model", "OpenCode", "test/model", "--thinking", "max"], cfg.path()).success);
+    assert!(!cli(&["ai", "model", "OpenCode", "--thinking", "xhigh"], cfg.path()).success);
+    let saved = std::fs::read_to_string(cfg.path().join("config.toml")).unwrap();
+    assert!(saved.contains("cli_thinking = \"max\""), "invalid choices must not replace the saved choice");
+    assert!(cli(&["ai", "model", "OpenCode", "--default"], cfg.path()).success);
+    let saved = std::fs::read_to_string(cfg.path().join("config.toml")).unwrap();
+    assert!(!saved.contains("cli_model") && !saved.contains("cli_thinking"));
+    assert_eq!(cli(&["ai", "model", "OpenCode", "test/model", "--default"], cfg.path()).code, Some(2));
+}
+
 #[test]
 fn commands_and_exit_codes() {
     let cfg = tempfile::tempdir().unwrap();
@@ -113,6 +138,31 @@ fn mcp_over_stdio() {
     assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "craft-anything");
     assert!(by_id(2)["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "core_session_show"));
     assert_eq!(by_id(3)["result"]["isError"], false);
+}
+
+#[test]
+fn mcp_restores_the_desktop_target_before_listing_tools() {
+    use craft_anything_engine::target::{Target, TargetContext};
+    let config = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("shared.bin");
+    std::fs::write(&file, b"shared-target").unwrap();
+    let target = Target::load(&file).unwrap();
+    let context = serde_json::to_string(&TargetContext::from_target(&target)).unwrap();
+    let input = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"core_targets_list","arguments":{}}}),
+    ].iter().map(|message| format!("{message}\n")).collect::<String>();
+    for mode in ["--deep", "--clean-room"] {
+        let output = cli_with_stdin(&["mcp", mode, "--target", &context], config.path(), input.as_bytes());
+        assert!(output.success, "{}", output.stderr_text());
+        let messages: Vec<Value> = output.stdout_text().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let response = messages.iter().find(|message| message["id"] == 2).unwrap();
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let value: Value = serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(value["result"]["targets"][0]["target_id"], target.id, "{value}");
+    }
 }
 
 #[test]

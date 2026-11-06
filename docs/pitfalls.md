@@ -6,6 +6,11 @@ Keep entries short: what happened, then the rule.
 
 ## Git and pull requests
 
+**Work began before its roadmap claim, on a branch without the required prefix.** Renaming the
+branch and recording the claim during PR preparation fixes coordination going forward, not the
+missed order. Create and publish the claim on a correctly named branch before implementation;
+never describe a late claim as compliance with the claim-before-work rule.
+
 **A commit landed on `main` without a PR.** `git switch main && git pull` was run with uncommitted
 changes: the switch succeeded, the pull refused, and the failure was read as "still on my branch".
 The next commit and `git push --force-with-lease` went to `main`.
@@ -37,6 +42,12 @@ added an app the new rule rejected; both were green on their own branch.
 - It happened again with translations: #117 added UI strings and #115, merged right after it,
   added a check that every string has a Chinese translation, so `cargo xtask ci` failed on
   `main`. A PR that adds a check, or adds what a check covers, is tested on top of the other.
+  And again with a new catalog: #555 added "Pausing…" to every catalog there was, and #486 (Russian)
+  merged after it without it. A new language and a new UI string merged together need the string
+  in the new catalog too.
+  And with a layout change: #687 moved coding agents onto their own tab of what Detect found, and
+  #664, merged next, tested a button on that list without picking the tab. Checking that two PRs
+  merge cleanly isn't checking that their tests pass together: run the UI tests on the merge.
 
 **A dependency change merged without its lockfile.** Changes were staged with
 `git add -A crates apps docs`, which leaves out the root `Cargo.lock`, so a new dependency reached
@@ -46,6 +57,17 @@ whenever a `Cargo.toml` changed.
 **A superseded PR on someone else's branch.** Rebasing it means force-pushing their branch. Replay it
 on a new branch, open a new PR that says it supersedes the old one, and comment on the old one.
 Don't close or rewrite other people's work without asking.
+
+**Review fixes pushed to a PR that had already merged.** #686 was merged hours before its review
+comments were acted on; the fixes went to its branch and the threads were answered "Fixed", while
+`main` had the code without them. Read `gh pr view --json state,headRefOid` before pushing to a PR's
+branch, and land anything late in a new PR from `main`.
+
+**A report checked against main, not the release it ran.** #736 (a build looping on an empty `app/`)
+was read against main, where the stop after two unchanged turns already existed, so it looked fixed.
+The reporter ran v0.3.0, which had neither that stop (#557) nor the empty-folder note (#749); both
+merged the day after it shipped. Before calling a report fixed or still open, find the release it
+names (`git merge-base --is-ancestor <fix> <release tag>`), and check the message text it quotes.
 
 ## Tests
 
@@ -71,6 +93,10 @@ before running anything, and run new tests on a machine without the program.
 It happened again when Clean room began refusing tools before their program is looked for: a
 "missing adb" test returned early on a machine with adb and failed in CI without it. A test of
 what happens without a program builds its session in the mode the tool runs in.
+It happened a third time with Ghidra: the test session's engine store was empty, but the lookup
+still searched PATH, `~/.local/bin` and `/opt/ghidra`, so two Deep-mode tests got Ghidra's answer
+on a machine that had it. `testing::session()` now sets `engines.only_configured`, so it finds only
+the engines its settings or store name.
 
 **A failing crate hid the next crate's tests.** `cargo test -p a -p b` stopped after a failure in
 `a`, so `b`'s tests never ran; the rerun was filtered to the failing test, and a broken engine id
@@ -84,11 +110,33 @@ CI the banner moved the layout under another test running beside it, and its cli
 same temp directory, and game detection walked up and found the game. Give each case its own
 `tempfile::tempdir()`.
 
+**A script written and run at once.** Tests that write a stand-in program and start it failed now
+and then on Linux with "Text file busy": another test thread was starting a child at that moment,
+and the child still held the new file open for writing. Starting a program goes through
+`process::spawn_retrying`, which tries a busy file again for a moment; don't add a sleep to a test
+instead.
+
 **Proving a refactor changed nothing.** Unit tests that check substrings can miss changed prompts.
 For a refactor that must keep output identical, dump the outputs for every combination before and
 after and compare them byte for byte (done for every brief across 162 combinations in R1.1).
 
+**A Windows-only test that no check ran.** #748 added a second Antigravity folder to the search
+path; the Windows test that counts those folders wasn't updated, and `main` stayed green because CI
+runs on Ubuntu, where `cfg(windows)` tests don't compile. When a change touches a list a
+`cfg(windows)` (or macOS) test checks, grep for it and run it on that system, or say in the PR that
+you couldn't.
+
+**A step moved to a worker, its test still counting frames.** #720 moved the picture size check
+off the UI thread; a UI test that added pictures, ran three frames and then looked kept passing on
+fast machines and failed in CI on unrelated PRs. When work moves to a worker, grep the tests that
+call it and make them `wait` for the result, not `run_steps(n)`.
+
 ## Building and running
+
+**A model catalogue queried in the wrong project.** OpenCode V2's raw `api get /api/model` does
+not reliably select the invoking CLI's directory. Use the `model.list` operation with an explicit
+`location[directory]` parameter, and test that the returned Location matches it. Over SSH,
+expand the remote shell's working directory, never send a local project path.
 
 **Rebuilding a binary that is running fails on Windows** ("Access is denied"), and the next command
 silently used the old binary. Long-running binaries (live rebuilds, servers) get their own
@@ -119,6 +167,11 @@ browser outlived the CLI (the job isn't killed when closed) and held the shell's
 the command hung and old browsers piled up. Start programs that hand off with `.hands_off()`, and
 after a live run check that the command returned and nothing it started is still running.
 
+**A separate config folder hides the agent's own settings.** To keep a live run from touching the
+real `config.toml`, `XDG_CONFIG_HOME` was pointed at a scratch folder; the agent CLI we start reads
+the same variable, lost its own provider settings, and failed with "unsupported provider". Back up
+`config.toml` and restore it after the run instead, and leave the agent's environment as it is.
+
 **A renamed CLI can't start the builder's tools.** To keep a live run's binary from being locked, it
 was copied as `cli-r25.exe`; the CLI finds itself by name (`craft-anything-cli`) to start the
 builder's MCP server, so Claude Code saw no tools and stopped. Copy it under its own name into a
@@ -138,6 +191,11 @@ external tool a live test that checks it really produced output, not just that i
 It happened again with Explorer: project folders are kept as `D:/Projects/…\name`, and "Open
 folder" opened Documents. Paths for the system's programs go through `platform::native_path`.
 
+**A message on the command line.** Claude Code was handed the whole task as `-p <message>`; a
+34,641-character brief passed Windows' 32,767-character command-line limit, so the build never
+started ("The filename or extension is too long", os error 206, #402). Give a program anything
+that can grow (messages, briefs, lists of files) on stdin or in a file, never in argv.
+
 **Console windows popping up over the app.** Only the detached launcher hid the console; the
 supervised runner didn't, so Ghidra's `.bat` and PowerShell each opened a console window during a
 real Deep-mode run (the CLI never shows it: it already has a console). Every child started from
@@ -148,6 +206,82 @@ program.
 adapter, but eframe starts every backend first, and starting GL loaded an old Intel OpenGL driver
 that crashed the app before any window or error box (#196). Ranking can't protect you from a
 backend that's started at all: start only the backends the app may use.
+It happened again with Vulkan on Windows (#394): starting Vulkan loaded an Intel Vulkan driver
+(`igvk64.dll`) that crashed with `0xc0000005` on startup. Windows now starts DX12 only by default
+(which includes WARP); `WGPU_BACKEND` still allows choosing other backends.
+
+**A shader compiler picked by a default that looks around the computer.** wgpu's DX12 `Auto`
+compiler takes a `dxcompiler.dll` it finds on the PATH; one without `dxil.dll` makes unsigned
+shaders, and on an RTX 5060 Ti the device was lost as the window opened ("Parent device is
+lost", #522). Where a library chooses a program or DLL by searching, name the one that ships
+with the system (FXC), and keep the environment variable (`WGPU_DX12_COMPILER`) as the way to
+another. A window that can't start now says how to draw without the graphics card
+(`CRAFT_ANYTHING_RENDERER=software`). Not run on the reporter's machine or on Windows here.
+
+**"Not installed" for a program that was there.** The system answers "not found" both for a missing
+program and for a file whose interpreter is missing (an npm script with no `node`), and we turned
+every one into "isn't installed or isn't on your PATH": #95, #130 and #152 reinstalled what they
+had. When a spawn says not found, look the program up yourself; if it's there, name the file and
+what it needs (`spawn_error_for`). Not run on Windows here.
+
+**An answer with two parts, read as one.** An approval card has "Allow once" and "Always for this
+project": the answer carries `allow` and `always`. The consent card our MCP server shows for a tool
+that runs code read only `allow`, so "Always" was dropped and the same tool (a scripted web session)
+was asked about every time (#563). When a card offers a choice, whoever reads the answer handles
+every field of it, and a test answers it each way and asks again.
+
+**A loop that only ends at its step cap.** A builder on an API backend may take 400 steps in one
+step of the run, and each step sends the whole conversation again: one stage spent 9.4M tokens on
+code that never compiled (#399). A failed build command is an `Ok` tool result (`succeeded: false`),
+so counting tool errors misses it. Cap a loop on what it is stuck on (build commands failing in a
+row, read from the typed `succeeded` field), not only on its total steps.
+
+**A router that picks the provider for you.** OpenRouter sends each request to one of several
+upstream providers, and a provider without tool calling answered 400 "Provider returned error"
+(#369), which said nothing the person could act on. For a service that routes, say in the request
+what the provider must support (`provider.require_parameters` for tools), and show the provider's
+own reason when it still fails (#542).
+
+**A crash that no code can report.** Three Windows tickets (#33, #104, #74) said the app "does
+nothing": a graphics driver crashed natively as the window opened, so no dialog, panic hook or log
+line ever ran, and each fix only covered the driver already seen. When a failure can't be caught,
+leave a mark before the risky step and clear it after (`start_guard.rs`); a mark found at the next
+start is the report, and that start takes the safer path (WARP). Not run on Windows here.
+
+**A spinner that kept the window drawing at full speed.** egui's `Spinner` asks to be redrawn at
+once, every frame, while it's on screen. A build or a page capture can run for an hour, so the
+window was redrawn at the display's rate the whole time (a core busy, or every core when drawing in
+software), and a person reported "my CPU is fully used" (#579). Animations ask for their next frame
+at their own pace (`widgets::animate`, `widgets::Spinner`); check a library widget for
+`request_repaint` before using it for something long. Not measured on Windows here.
+
+**Every tool offered to a model that can only use a few.** The builder on an API backend was sent
+all 33-41 Core and Build tools, about 23,000-30,000 characters of descriptions. A local 14B model
+(#417) called the study tools (`core_session_show`, `core_journal_read`) 35 times and never
+`build_file_write`, and Ollama's default context is smaller than the list. Offer a model the tools
+the job needs (`LOCAL_BUILDER_CORE`), measure the list's size with the real registry, and run a
+small local model before saying it works. Not run live here.
+
+**A debugger failure reported as an observation.** `apple_calls_observe` built a Python callback
+with `\n` between statements in a Rust string, so lldb rejected it and exited 1 before launching
+anything; the tool ignored the exit status and returned "Observed 0 call(s)" with confidence
+observed (#251). A run that never started the thing it observes is a failure, not a count of zero:
+check the exit status before building evidence, and compile generated code (here, with Python)
+before trusting it. lldb itself was not run here.
+
+**A graphics default that drew on the other card.** egui-wgpu picks the discrete GPU unless told
+otherwise; on a Linux laptop whose integrated GPU drives the panel, every frame was copied across
+to it, the window took 20 s to open and the whole desktop lagged (#571). Forcing the low-power GPU
+instead breaks desktops whose monitors are on the discrete card. Draw on the GPU that drives the
+screen, read from the connected displays, and keep wgpu's environment variables as the override;
+when a window is slow to open, check which adapter `desktop.log` says it drew with.
+
+**A Metal version taken from the OS, not from the compiler.** wgpu-hal picks the Metal shading
+language from the macOS version alone; on a 2012 iMac under OpenCore Legacy Patcher, macOS 15 asked
+for `metal3.2`, the compiler stopped at 3.1, every shader failed and the window never opened (#742,
+upstream #10687). Our `[patch]` of wgpu-hal probes the compiler (`vendor/wgpu-hal/CRAFT_ANYTHING.md`).
+The advice on a lost device named `CRAFT_ANYTHING_RENDERER`, which only Windows reads: check that
+advice names only settings the platform actually reads. Not run on the reporter's Mac.
 
 **A Mac app that couldn't find Claude Code, and offered a GitHub key instead.** An app opened from
 the Dock gets the system's short `PATH`, not the shell's, so `claude` in `~/.local/bin` wasn't
@@ -175,6 +309,21 @@ Compile the `.java` against Ghidra's jars (`javac -proc:none -cp <Ghidra/**/lib/
 live run. Ghidra also rejects project paths with a folder starting with a dot, as
 `tempfile::tempdir()`'s do: give live-test temp folders a plain prefix.
 
+**A check that read another worktree.** A PR was tested in a worktree that shared the main
+`target/`; `xtask` finds the repository through `CARGO_MANIFEST_DIR`, fixed when it's built, so
+afterwards `cargo xtask` in the main tree reused that binary and read the worktree's files. Once the
+worktree was removed it said "can't read docs/ROADMAP.md"; while it existed, every check that
+reads files itself (`pending`, `secrets`, `layers`, `locks`, `tools --check`…) would have looked
+at the wrong tree (the cargo commands `ci` runs use the folder they're started in). Give every
+worktree its own `CARGO_TARGET_DIR`, and rebuild `xtask` (or delete it from `target/`) after
+sharing one.
+
+**A helper stopped only by a destructor.** The keep-awake helper was stopped when its guard was
+dropped; closing the desktop app during a build ended the process without dropping it, and the
+PowerShell loop kept the computer awake (its time limit was a week). A helper that outlives a
+crash is a leak: have it watch the process it serves and end by itself (`caffeinate -w`, a loop
+that checks the PID), and test by killing the owner, not by dropping the guard.
+
 **Stopping a long run leaves children behind** unless every program goes through
 `craft_anything_platform::process`. After stopping one, check that its child processes are gone.
 
@@ -201,6 +350,29 @@ so #53 merged with a long line rustfmt rewraps. Run `cargo fmt --all --check` la
 edit, right before committing.
 
 ## Design
+
+**An early error without a terminal event.** Model validation returned after reporting an error,
+but headless chat waits for `TurnDone`, not just an idle worker. Preflight failures and cancellation
+must finish the event sequence too; regression tests check both the error/status and the terminal event.
+Worker-thread creation failures need the same terminal event even though no worker ever started.
+
+**A conditional call erased the skipped path's value.** The ARM decoder discarded conditions on
+calls, and value flow replaced the earlier register definitions as if every call executed. Keep
+the call's condition and merge its possible writes with the skipped path in both block transfer
+and edge construction. A known non-returning target stops only an unconditional call; after a
+conditional one, only the skipped path contributes values. Test both kinds within one block and
+across blocks, with unconditional calls as controls.
+
+**A candidate cap discarded a real dependency.** The esbuild module reader kept the first 4096
+resolved zero-argument calls, then filtered for known wrappers; ordinary local calls could fill
+the buffer before a real dependency appeared. Discover wrapper bindings first and count only
+recognised dependencies against their limit. Keep the buffer bounded, and test unrelated calls,
+forward declarations and more actual dependencies than the limit permits.
+
+**An occurrence label was also a binding name.** The second `obj.x` window and the first
+`obj["x[2]"]` window both appeared as `obj.x[2]`. Reserve literal labels and use a separate
+disambiguator for collisions; never change the occurrence index to make a label unique. Include
+unchanged windows when reserving labels so a different set of changes cannot rename a window.
 
 **Reading literals and skipping the rest.** The Electron window reader skipped a spread inside
 `webPreferences`, so a window whose preferences came partly from another object was reported as
@@ -233,6 +405,20 @@ And again inside one process: the engine had its own `write_atomic` whose temp f
 by process only, so two threads saving `craft.json` wrote the same temp file and one rename found
 it gone (#273). There is one atomic writer, `craft_anything_platform::fs::write_atomic`; don't
 write another.
+The UI settings worker also released the session guard after cloning settings, letting that stale
+snapshot overwrite a later model-selection save. Keep the guard through the worker's disk write
+so session-based writers cannot overtake each other between reading and saving.
+The exit-time save must merge the session's latest AI table before writing the app's pending settings;
+the UI's AI snapshot may predate a selection already committed by the hub. But waiting for that guard
+can hold shutdown behind a tool for hours. Try it once; if busy, durably defer only non-AI settings
+and recover them at startup against the latest committed AI table, rather than racing a live writer.
+After a successful full exit save, discard an older deferred snapshot so startup cannot replay it
+over the newer app settings.
+
+**Preflight checked a different transport.** An explicit OpenCode selection bypassed ACP, but
+builder preflight still checked ACP's helper and the native adapter never supplied the MCP server.
+Share transport selection between preflight and execution; reject unsupported native options
+before running a process rather than starting an agent without the tools its task requires.
 
 **Keywords that only some code paths honour.** "…in Rust" picked Rust for apps but not for games, so
 a headless game rebuild stopped at once for want of Unity. It was found only by a live run. Run the
@@ -315,6 +501,9 @@ the screen shows the last result.
 `try_session().unwrap_or_default()` at startup, so a busy engine meant Clean room and no AI, and
 the next settings change saved those defaults over theirs. Seen once in a live run. A fallback
 must never stand in for data that gets saved back: wait (it's startup), or keep what's on disk.
+The model picker later captured a busy session as "no project", queried in the wrong directory,
+and rejected the save as a settings change. Capture settings and project under one guard; report
+contention, preserve the draft and matching background results, and check again when available.
 
 **A save that changed memory first.** Adding an AI in the app put it in the session's settings,
 then the file write failed (on Windows, likely a virus scan holding config.toml), so the app showed
@@ -334,6 +523,11 @@ and run `cargo xtask secrets` before every commit (the `.githooks/pre-commit` ho
 
 **An empty float sum is `-0.0`.** `iter().map(..).sum::<f64>()` over nothing gives `-0.0`, which
 `{:.2}` shows as "$-0.00". Sum money with `fold(0.0, ..)`.
+
+**A per-run budget that a retry resets.** The build's refinement cap (`max_rounds`) counted from zero on every
+run, while the round numbers carried over, so "Try again" bought six more checks each press and a build that never
+worked reached check 40 and 49 (#736). A limit that must hold across runs is a count saved with the project, and
+it's reset only by a new request. Test it with several runs in a row, not one.
 
 **Docs that drift.** `STATUS.md` described a branch 25 commits old and the tool count was stale.
 Update STATUS, the roadmap and generated docs (`cargo xtask tools`, `cargo xtask schemas`) in the
@@ -359,6 +553,26 @@ the final check failed a finished build; Try again then studied the original aga
 builder the first brief. A run decides what's left from what the project records, not from which
 button started it, and a check that couldn't look says nothing about the build.
 
+**A stopped tool call broke the next request.** Retaining a stopped assistant reply kept its
+tool calls without matching results. The next model request then carried unpaired calls.
+Every retained call needs a matching result, including an explicit non-execution result.
+Test the next serialized request as well as whether a tool ran.
+
+**A deferred request reset lost on failure.** Moving consumed-note bookkeeping out of the live
+builder loop saved the reset only after a successful turn. A failed or cancelled turn had already
+removed the note, so reopening kept the old unchanged-turn count. Persist deferred request state
+on terminal errors too, outside provider retries; keep the original outcome if that save also fails.
+
+**Lower-casing a command, then comparing its paths.** Auto mode lower-cased a shell command to
+match keywords, then checked its paths against the project folder with that same text; Windows
+compares paths without case, so only a Mac showed it: deleting `/Users/…/app/Build` in the
+person's own project was refused. Match keywords on a lower-cased copy and compare paths as
+written; test a path rule with capitals and a folder outside the temp directory.
+The same check split the command at every space, quotes included, so `"…/MyGame Backup/x"`
+began with the project's path and went through; it had been noted as "only refuses too much"
+without trying a folder named like the project. Read arguments as the shell does, and test a
+path rule with the folder beside the target, not only the target.
+
 **A filter written for one kind of text, run on another.** The stand-in's secret scan was written for
 API answers, then also ran on recorded scripts: `this.token=t` became `[dropped]` and the scripts
 broke, and "Basic Membership" lost a word. It also tested whole tokens, so a secret inside a URL or
@@ -371,7 +585,64 @@ wrote its own pak reader in Python for a large archive. Tools an AI drives make 
 can (folders), take whole sets in one call, and every brief says to fix the call rather than
 replace the tool. Read an AI run's transcript for tools it gave up on.
 
+**Two engines, two address spaces.** Ghidra loads a position-independent ELF (lowest segment at
+0) at 0x100000, while the built-in engine reads it where its headers say. Handing Ghidra our
+address found nothing there, and Deep mode quietly fell back to the built-in decompiler for every
+PIE program and shared library. Whenever an address crosses between engines, move it by their
+image bases (`ghidra::Rebase`, from the base the bridge reports) and say in the evidence which
+space each address is in.
+
+**An id that only means something on one computer, kept in a folder that travels.** The project
+saved Claude Code's session id, but the session itself lives in `~/.claude/projects/` on the
+computer (and under the folder) that started it; a project synced to another computer stopped at
+"No conversation found" (#452), and the retry for a cut-off turn asked for the same missing session
+three more times. Anything a project keeps must still work where the folder goes: keep what the id
+points to as well (`agent-session.jsonl`), tell "not here" apart from a failure by a typed signal
+(`Conversation::session_lost`), and never retry what can't succeed.
+
+**An installer that downloaded what was already there.** Ghidra was found only on PATH and at two
+Linux folders, so an unzipped copy in Downloads, Program Files or a Homebrew cask was missed, and
+the install then downloaded the same release again (#740). Install folders are a search, not a
+list: scan the folders people keep such things in (`KnownRoot`, by folder name, a set number of
+levels down), and make an install use a copy already found outside our store. Test each layout
+(unzipped, cask, capitalised name) with temp folders, not the machine the test runs on.
+
 ## Agent tooling
+
+**Shared CLI efforts reached Claude unchanged.** Keep CLI-only levels available for agents, but
+normalize at the provider boundary; test serialized requests for known and unknown model families.
+
+**A sender could exceed its MCP receiver's target limit.** Bound the handoff to the receiver's
+accepted count and retain the active target; test the boundary, truncation order and remote mode.
+
+**A finding correction reset omitted confidence to inferred.** Edit defaults must preserve existing
+values unless explicitly changed; test omitted fields and every supplied confidence level.
+
+**Atomic replacements still lost concurrent investigation updates.** A process-local mutex and
+rename protect neither a cross-process revision check nor the whole read/modify/write sequence.
+Hold one OS file lock from load through every rendered write, use it for all writers, bound and
+cancel the wait, and test with separate processes. Never treat malformed state as an empty update.
+
+**An optional view refresh could fail the builder's turn.** Log cache-refresh errors and continue
+relaying agent events; only failures of the actual build belong on its fatal path.
+
+**Generic ACP errors named Copilot for every adapter.** Use the current agent's display name and
+the adapter's sign-in guidance; test an ACP-only adapter with and without that guidance.
+
+**An agent's findings existed only in its own session.** A separate MCP process started without
+the desktop's targets or a saved project, so its `fnd_*` records never reached the app. Local
+agent chats now attach a shared investigation, hand over target metadata and refresh snapshots
+after tool results. Test the child process's targets and the UI's finding ids, not only tool calls.
+
+**A headless egui check reached rendering and then failed in teardown.** The app's named fonts
+must be installed, and a test without a renderer must explicitly clear `output.textures_delta`.
+Use the repository's `run_ui` API and its font setup instead of assuming an older egui harness.
+
+**An ACP handshake passed while the tools were missing, and an empty tool list enabled them all.**
+Copilot CLI 1.0.105 initialized successfully but did not expose a server supplied only through
+ACP's `session/new`; explicit `--additional-mcp-config` made it available. An empty
+`--available-tools=` restored native tools instead of disabling them. Verify the tools actually
+sent to a fake local model, including the no-tools case, before trusting startup or argument tests.
 
 **Shell quoting breaks generated edits.** Heredocs carrying Python with quotes, `'''` or `\n` were
 mangled by the shell several times. Write multi-line edit scripts to a file and run the file.
@@ -379,6 +650,11 @@ mangled by the shell several times. Write multi-line edit scripts to a file and 
 **A Python edit that turned every line into CRLF.** `Path.write_text` on Windows writes CRLF
 line endings, so a scripted size change rewrote 19 LF files with CRLF (git only warned). Write
 with `write_bytes(s.encode())` and check `git ls-files --eol -m` after scripted edits.
+
+**A process search that found itself.** Looking for a helper by a word in its command line, with
+that word in the search's own command, listed the search: "a helper is left behind" after every
+run, with a new pid each time. The new pid was the clue. Build the pattern from parts
+(`'Set' + 'Thread'`), and don't stop processes by pattern on a machine where real builds may run.
 
 **A command that waits for a terminal.** `git stash show -p` opened a pager and an empty
 `python - <<'EOF'` heredoc opened the interactive interpreter; both sat waiting for input until
@@ -433,3 +709,41 @@ naming a tool.
 branch; `git stash` keeps only tracked files, so a new file stayed in the tree and `git add -A`
 put it into the other PR. Use `git stash -u` (or commit the work in progress on its own branch),
 and read `git status` before `git add -A`.
+
+**Fence checks that disagreed about tool calls.** Suffix checks accepted malformed closing text,
+while requiring exactly three closing backticks rejected valid longer fences. Share one boundary
+parser between JSON recovery and ReAct: count the opener, require a standalone closing line at
+least that long, and reject an earlier matching close followed by more text. Shorter backtick
+lines inside a longer fence are content. Test both paths and the next HTTP request, including
+malformed suffixes and non-call JSON examples whose strings contain protocol markers.
+
+**A view that asked to be scrolled on every frame.** The command palette called `scroll_to_me` on
+the selected row each frame, so the wheel's scroll was pulled back to it at once and the list
+kept jumping to the top (#584). Scroll something into view on the frame it changed (a key, a new
+query), never as a standing request.
+
+**A test wrote into the real config folder.** A helper that keeps one id per installation created
+opencode-session under settings::config_dir() when the first request was made, so running the
+tests left a file on the developer's machine and two runs could collide. Anything we persist goes
+through the hub's stores (AiHub::with_stores, Session::isolated), which tests point at a temp
+folder; production code never writes under the real config folder by hand.
+
+**A per-probe walk repeated expensive work on the same bytes.** CRC cpio verification was bounded
+inside one archive, but a firmware scan could rediscover overlapping, trailerless archives and
+sum the same payload repeatedly. Count checksum byte visits across the whole scan, poll its
+cancellation callback inside long sums, and distinguish skipped verification from a mismatch.
+Test overlapping candidates with correct checksums and a complete nested archive so a structural
+trailer cannot turn unchecked data into a high-confidence result.
+
+**A line cap that cut a JSON-RPC answer in pieces.** MCP over stdio answers one message per line,
+and a server with many richly described tools answers `tools/list` as several megabytes on that
+one line. The process reader capped a partial line at 1 MiB and delivered it anyway, so the answer
+arrived as fragments that never parsed and the plugin failed as a `tools/list` timeout — while the
+same server answered a direct probe in under a second. A cap protects memory, but a JSON-RPC line
+must arrive whole to parse at all: keep the cap at the size the MCP client already allows, and test
+with a multi-megabyte line, not a short one.
+
+**A capture budget checked before deduplication changed the replay.** Redaction expanded a repeated
+body, so its second copy was rejected before it could be discarded as a duplicate. Apply aggregate
+budgets only to distinct bodies actually retained. When a budget removes a body, preserve unavailable
+cached 304 responses and deduplicate identical omitted samples.
