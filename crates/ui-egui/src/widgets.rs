@@ -275,6 +275,16 @@ pub fn segmented_scaled(ui: &mut Ui, options: &[&str], selected: usize, height: 
     picked
 }
 
+fn segment_width(label: f32, text: f32) -> f32 {
+    label + text * 2.0 + 2.0
+}
+
+/// How wide [`segmented`] draws `options`, for a row that needs to know before drawing them.
+pub fn segmented_width(ui: &Ui, options: &[&str]) -> f32 {
+    let t = Tokens::get(ui.ctx());
+    options.iter().map(|o| segment_width(label_galley(ui, &tr(o), 12.0, t.text).size().x, 12.0)).sum::<f32>() + 4.0
+}
+
 /// A small status label on a tint.
 pub fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> Response {
     pill_sized(ui, text, fg, bg, 11.0)
