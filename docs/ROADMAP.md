@@ -855,6 +855,10 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-zip-multidisk-20261105
 - [x] Check Unity bundle blocks against their declared output lengths.
       — claimed: Afloat16, branch bugfix/r3.12-unity-bundle-decompressed-length-20261105
+- [x] Locate Unity bundle metadata within the declared bundle size.
+      — claimed: Afloat16, branch bugfix/r3.12-unity-bundle-declared-size-20261105
+- [ ] Check that Unity bundle compressed blocks end before the trailing block table, or the declared
+      bundle end for front-positioned tables, so bytes outside the data region cannot supply block contents.
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
       area and reject unrepresentable widths, base64 (plists, source maps) refuses damaged tails
       and incomplete quanta through one shared decoder, OIDs must be minimally encoded, and string

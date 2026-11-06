@@ -101,13 +101,20 @@ pub fn header(data: &[u8], file_len: u64) -> Result<Header, FormatError> {
     if format_version >= 7 {
         at = at.div_ceil(16) * 16;
     }
-    let (table_offset, mut data_offset) =
-        if flags & 0x80 != 0 { (file_len.saturating_sub(u64::from(table_size)), at) } else { (at, at + u64::from(table_size)) };
-    if flags & 0x200 != 0 {
-        data_offset = data_offset.div_ceil(16) * 16;
+    let bad_extent = || FormatError::Malformed("the bundle size or block table doesn't fit the file".into());
+    if size < at || size > file_len || table_uncompressed_size > MAX_TABLE {
+        return Err(bad_extent());
     }
-    if table_offset + u64::from(table_size) > file_len || table_uncompressed_size > MAX_TABLE {
-        return Err(FormatError::Malformed("the block table doesn't fit the file".into()));
+    let table_at_end = flags & 0x80 != 0;
+    let table_offset = if table_at_end { size.checked_sub(u64::from(table_size)).ok_or_else(bad_extent)? } else { at };
+    let table_end = table_offset.checked_add(u64::from(table_size)).ok_or_else(bad_extent)?;
+    let mut data_offset = if table_at_end { at } else { table_end };
+    if flags & 0x200 != 0 {
+        data_offset = data_offset.checked_next_multiple_of(16).ok_or_else(bad_extent)?;
+    }
+    let data_end = if table_at_end { table_offset } else { size };
+    if table_offset < at || table_end > size || data_offset > data_end {
+        return Err(bad_extent());
     }
     Ok(Header { format_version, unity_version, unity_revision, size, flags, table_offset, table_size, table_uncompressed_size, data_offset })
 }
