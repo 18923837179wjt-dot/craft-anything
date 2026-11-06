@@ -14,6 +14,9 @@ const CD_HEADER_LEN: usize = 46;
 const MAX_DIRECTORY_BOUNDARIES: usize = EOCD_SEARCH + u16::MAX as usize;
 const MAX_PAIRS: usize = 256;
 const MAX_ITEMS: usize = 64;
+// One block has at most MAX_PAIRS * (1 + MAX_ITEMS) probe records. Bound both record
+// maps together, independently of file size and the number of candidate block extents.
+const MAX_PROBE_RECORDS: usize = EOCD_SEARCH;
 /// Most certificate bytes kept per certificate.
 const MAX_CERT: usize = 64 * 1024;
 
@@ -214,6 +217,7 @@ fn find_eocd_with_budget(data: &[u8], mut records_left: usize) -> Option<EocdCan
     let mut found: Option<EocdCandidate> = None;
     let mut ambiguous = false;
     let mut directories = DirectoryCache::new();
+    let mut probes = ProbeCache::new();
     loop {
         if let Some(end) = r.slice(i, 22).map(Reader::new)
             && end.slice(0, 4) == Some(b"PK\x05\x06")
@@ -225,7 +229,7 @@ fn find_eocd_with_budget(data: &[u8], mut records_left: usize) -> Option<EocdCan
             && let Some(count) = end.u16_le(10)
             && directories.framed(&r, cd, size, count, &mut records_left)?
         {
-            let has_signer = has_readable_signer(&r, start, cd, &mut records_left)?;
+            let has_signer = probes.has_readable_signer(&r, start, cd, &mut records_left)?;
             if let Some(previous) = &found {
                 ambiguous |= previous.has_signer && has_signer && previous.directory != cd;
             }
@@ -271,44 +275,121 @@ impl<'a> Lp<'a> {
     }
 }
 
-/// Match the parser's signer admission without allocating or requiring undamaged later fields.
-/// None means the shared record budget ran out; malformed framing only ends its current sequence.
-fn has_readable_signer(r: &Reader<'_>, start: usize, cd: usize, records_left: &mut usize) -> Option<bool> {
-    let Some(pairs_end) = cd.checked_sub(24) else { return Some(false) };
-    let Some(mut pos) = start.checked_add(8) else { return Some(false) };
-    for _ in 0..MAX_PAIRS {
-        if pos >= pairs_end {
-            break;
+#[derive(Clone, Copy)]
+struct PairProbe {
+    end: usize,
+    // A recognized pair is unprobed until its complete value fits a candidate's extent.
+    readable: Option<bool>,
+}
+
+impl PairProbe {
+    fn read(r: &Reader<'_>, pos: usize) -> Option<Self> {
+        let len = usize::try_from(r.u64_le(pos)?).ok()?;
+        let body = pos.checked_add(8)?;
+        if len < 4 || r.slice(body, len).is_none() {
+            return None;
         }
-        *records_left = records_left.checked_sub(1)?;
-        let Some(len) = r.u64_le(pos).and_then(|len| usize::try_from(len).ok()) else { break };
-        let Some(next) = pos.checked_add(8).and_then(|pos| pos.checked_add(len)) else { break };
-        if len < 4 || next > pairs_end {
-            break;
-        }
-        let Some(value_at) = pos.checked_add(12) else { break };
-        if matches!(r.u32_le(value_at - 4), Some(V2_ID | V3_ID | V31_ID))
-            && let Some(value) = r.slice(value_at, len - 4)
-            && let Some((signers, _)) = (Lp { data: value }).at(0)
-        {
-            let sequence = Lp { data: signers };
-            let mut signer_pos = 0;
-            for _ in 0..MAX_ITEMS {
-                if signer_pos >= signers.len() {
-                    break;
-                }
-                *records_left = records_left.checked_sub(1)?;
-                let Some((signer, next_signer)) = sequence.at(signer_pos) else { break };
-                // parse_signer only requires the signed-data LP; all later fields are optional.
-                if (Lp { data: signer }).at(0).is_some() {
-                    return Some(true);
-                }
-                signer_pos = next_signer;
-            }
-        }
-        pos = next;
+        let readable = if matches!(r.u32_le(body)?, V2_ID | V3_ID | V31_ID) { None } else { Some(false) };
+        Some(Self { end: body.checked_add(len)?, readable })
     }
-    Some(false)
+}
+
+#[derive(Clone, Copy)]
+struct SignerProbe {
+    end: usize,
+    readable: bool,
+}
+
+impl SignerProbe {
+    fn read(r: &Reader<'_>, pos: usize) -> Option<Self> {
+        let len = usize::try_from(r.u32_le(pos)?).ok()?;
+        let body = pos.checked_add(4)?;
+        let item = Lp { data: r.slice(body, len)? };
+        // parse_signer requires only the signed-data LP; all later fields are optional.
+        Some(Self { end: body.checked_add(len)?, readable: item.at(0).is_some() })
+    }
+}
+
+struct ProbeCache {
+    pairs: BTreeMap<usize, Option<PairProbe>>,
+    items: BTreeMap<usize, Option<SignerProbe>>,
+    slots_left: usize,
+}
+
+impl ProbeCache {
+    fn new() -> Self {
+        Self { pairs: BTreeMap::new(), items: BTreeMap::new(), slots_left: MAX_PROBE_RECORDS }
+    }
+
+    fn spend(&mut self, records_left: &mut usize) -> Option<()> {
+        let remaining = records_left.checked_sub(1)?;
+        self.slots_left = self.slots_left.checked_sub(1)?;
+        *records_left = remaining;
+        Some(())
+    }
+
+    /// Cache physical records, not candidate decisions. Several block starts may reach the
+    /// same pair, and different pairs' signer sequences may reach the same length prefix.
+    fn sequence_has_signer(&mut self, r: &Reader<'_>, mut pos: usize, end: usize, records_left: &mut usize) -> Option<bool> {
+        for _ in 0..MAX_ITEMS {
+            if pos >= end {
+                break;
+            }
+            let step = if let Some(step) = self.items.get(&pos) {
+                *step
+            } else {
+                self.spend(records_left)?;
+                let step = SignerProbe::read(r, pos);
+                self.items.insert(pos, step);
+                step
+            };
+            let Some(step) = step.filter(|step| step.end <= end) else { break };
+            if step.readable {
+                return Some(true);
+            }
+            pos = step.end;
+        }
+        Some(false)
+    }
+
+    /// None means the shared work or cache limit ran out, never that an unprobed signer is absent.
+    fn has_readable_signer(&mut self, r: &Reader<'_>, start: usize, cd: usize, records_left: &mut usize) -> Option<bool> {
+        let Some(pairs_end) = cd.checked_sub(24) else { return Some(false) };
+        let Some(mut pos) = start.checked_add(8) else { return Some(false) };
+        for _ in 0..MAX_PAIRS {
+            if pos >= pairs_end {
+                break;
+            }
+            let step = if let Some(step) = self.pairs.get(&pos) {
+                *step
+            } else {
+                self.spend(records_left)?;
+                let step = PairProbe::read(r, pos);
+                self.pairs.insert(pos, step);
+                step
+            };
+            let Some(step) = step.filter(|step| step.end <= pairs_end) else { break };
+            let readable = if let Some(readable) = step.readable {
+                readable
+            } else {
+                let value_at = pos.checked_add(12)?;
+                let value = r.slice(value_at, step.end.checked_sub(value_at)?)?;
+                let readable = if let Some((signers, _)) = (Lp { data: value }).at(0) {
+                    let first = value_at.checked_add(4)?;
+                    self.sequence_has_signer(r, first, first.checked_add(signers.len())?, records_left)?
+                } else {
+                    false
+                };
+                self.pairs.insert(pos, Some(PairProbe { end: step.end, readable: Some(readable) }));
+                readable
+            };
+            if readable {
+                return Some(true);
+            }
+            pos = step.end;
+        }
+        Some(false)
+    }
 }
 
 fn hex(b: &[u8]) -> String {
@@ -539,21 +620,60 @@ mod tests {
     fn assert_probe_matches_parser(pairs: &[(u32, Vec<u8>)], expected: bool) {
         let apk = probe_fixture(pairs);
         let mut records_left = EOCD_SEARCH;
-        assert_eq!(has_readable_signer(&Reader::new(&apk), 0, apk.len() - 22, &mut records_left), Some(expected));
+        assert_eq!(ProbeCache::new().has_readable_signer(&Reader::new(&apk), 0, apk.len() - 22, &mut records_left), Some(expected));
         assert_eq!(!parse(&apk).unwrap().signers.is_empty(), expected);
     }
 
     #[test]
-    fn signer_probes_share_the_record_budget() {
+    fn signer_probe_reuses_records_across_candidate_extents() {
         let apk = fx::notes_apk();
         let r = Reader::new(&apk);
         let cd = r.u32_le(apk.len() - 6).unwrap() as usize;
         let (start, _) = signing_block_extent(&r, cd).unwrap();
-        let mut records_left = 3;
-        assert_eq!(has_readable_signer(&r, start, cd, &mut records_left), Some(true));
-        assert_eq!(records_left, 1);
-        assert_eq!(has_readable_signer(&r, start, cd, &mut records_left), None);
-        assert_eq!(records_left, 0);
+        let first = start + 8;
+        let full = first + 8 + usize::try_from(r.u64_le(first).unwrap()).unwrap() + 24;
+        let mut cache = ProbeCache::new();
+        let mut remaining = 2;
+        assert_eq!(cache.has_readable_signer(&r, start, full - 1, &mut remaining), Some(false));
+        assert_eq!(remaining, 1);
+        assert_eq!(cache.has_readable_signer(&r, start, full, &mut remaining), Some(true));
+        assert_eq!(remaining, 0);
+        for _ in 0..300 {
+            assert_eq!(cache.has_readable_signer(&r, start, full - 1, &mut remaining), Some(false));
+            assert_eq!(cache.has_readable_signer(&r, start, cd, &mut remaining), Some(true));
+        }
+        assert_eq!((cache.pairs.len(), cache.items.len()), (1, 1));
+    }
+
+    #[test]
+    fn cached_signer_items_respect_each_sequence_end() {
+        let bytes = lp(&lp(&[]));
+        let r = Reader::new(&bytes);
+        let mut cache = ProbeCache::new();
+        let mut remaining = 1;
+        assert_eq!(cache.sequence_has_signer(&r, 0, bytes.len() - 1, &mut remaining), Some(false));
+        assert_eq!(remaining, 0);
+        assert_eq!(cache.sequence_has_signer(&r, 0, bytes.len(), &mut remaining), Some(true));
+        assert_eq!(cache.sequence_has_signer(&r, 0, bytes.len() - 1, &mut remaining), Some(false));
+        assert_eq!(cache.items.len(), 1);
+    }
+
+    #[test]
+    fn an_unprobed_pair_is_not_marked_unreadable_when_resources_run_out() {
+        let apk = fx::notes_apk();
+        let r = Reader::new(&apk);
+        let cd = r.u32_le(apk.len() - 6).unwrap() as usize;
+        let (start, _) = signing_block_extent(&r, cd).unwrap();
+        let mut cache = ProbeCache::new();
+        cache.slots_left = 1;
+        let mut remaining = 2;
+        assert_eq!(cache.has_readable_signer(&r, start, cd, &mut remaining), None);
+        assert_eq!(remaining, 1);
+        assert_eq!((cache.pairs.len(), cache.items.len()), (1, 0));
+        cache.slots_left = 1;
+        assert_eq!(cache.has_readable_signer(&r, start, cd, &mut remaining), Some(true));
+        assert_eq!(remaining, 0);
+        assert_eq!(cache.slots_left, 0);
     }
 
     #[test]
@@ -578,6 +698,17 @@ mod tests {
         let mut pairs = vec![(0x1357_2468, Vec::new()); MAX_PAIRS];
         pairs.push((V2_ID, lp(&lp(&lp(&[])))));
         assert_probe_matches_parser(&pairs, false);
+
+        // Reuse the ordinary limit fixture for many independent probe requests.
+        let apk = probe_fixture(&pairs);
+        let reader = Reader::new(&apk);
+        let mut cache = ProbeCache::new();
+        let mut remaining = MAX_PAIRS;
+        for _ in 0..300 {
+            assert_eq!(cache.has_readable_signer(&reader, 0, apk.len() - 22, &mut remaining), Some(false));
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(cache.pairs.len(), MAX_PAIRS);
     }
 
     #[test]
