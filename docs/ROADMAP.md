@@ -875,6 +875,8 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-pixel-rgba-output-overflow-20261105
 - [x] Count empty tensor shapes consistently across axis orders.
       — claimed: Afloat16, branch bugfix/r3.12-tensor-zero-dimension-product-20261105
+- [x] Find APK signatures through valid ZIP comments and framed central directories.
+      — claimed: Afloat16, branch bugfix/r3.12-apk-sign-eocd-comment-boundary-20261105
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
       area and reject unrepresentable widths, base64 (plists, source maps) refuses damaged tails
       and incomplete quanta through one shared decoder, OIDs must be minimally encoded, and string
