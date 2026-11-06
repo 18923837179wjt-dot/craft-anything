@@ -108,7 +108,12 @@ fn native_window_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
             }
             craft_anything_platform::window::capture_window(pid, None)
         },
-    );
+    )
+    // A launcher hands over to a program that isn't its child: last, its name finds the window.
+    .or_else(|e| match e.code {
+        ErrorCode::NotFound => craft_anything_platform::window::capture_window(running.pid(), name.as_deref()).map(|shot| (running.pid(), shot)),
+        _ => Err(e),
+    });
     // Read while it still runs; a tree that can't be read is only left out.
     let tree = shot.as_ref().ok().and_then(|(pid, _)| p.ui_tree.as_ref().map(|_| super::apple_runtime::ui_tree(ctx, *pid, UI_TREE_NODES)));
     // Always closed again, picture or not, and confirmed before we return (a caller such as the

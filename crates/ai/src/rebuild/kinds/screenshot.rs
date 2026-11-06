@@ -384,6 +384,11 @@ mod tests {
     use super::*;
     use craft_anything_engine::tools::web_common::encode_png;
 
+    /// `path` with its own separators, as a resolved path has them.
+    fn native(path: PathBuf) -> PathBuf {
+        path.components().collect()
+    }
+
     /// Relative placements produce the absolute paths required by native_window_capture,
     /// without looking up a project-local interpreter or resolving away its virtualenv path.
     #[test]
@@ -394,10 +399,10 @@ mod tests {
         let dir = Path::new("projects with spaces/sample.cany/checks/round-1");
         let args = vec!["main.py".to_string()];
         let request = capture_request(app, &interpreter, &args, dir, true, |_| panic!("a selected filesystem path must not use PATH lookup")).unwrap();
-        assert_eq!(request.params["working_directory"], json!(cwd.join(app)));
-        assert_eq!(request.params["program"], json!(cwd.join(interpreter)));
-        assert_eq!(request.params["output"], json!(cwd.join(dir).join("window.png")));
-        assert_eq!(request.params["ui_tree"], json!(cwd.join(dir).join("ui-tree.json")));
+        assert_eq!(request.params["working_directory"], json!(native(cwd.join(app))));
+        assert_eq!(request.params["program"], json!(native(cwd.join(interpreter))));
+        assert_eq!(request.params["output"], json!(native(cwd.join(dir).join("window.png"))));
+        assert_eq!(request.params["ui_tree"], json!(native(cwd.join(dir).join("ui-tree.json"))));
         assert_eq!(request.params["args"], json!(args));
         assert_eq!(request.shot, cwd.join(dir).join("window.png"));
         assert_eq!(request.tree, cwd.join(dir).join("ui-tree.json"));
@@ -415,11 +420,11 @@ mod tests {
             Some(PathBuf::from("relative tools/python3"))
         })
         .unwrap();
-        assert_eq!(request.params["program"], json!(cwd.join("relative tools/python3")));
-        assert_eq!(request.params["working_directory"], json!(app));
+        assert_eq!(request.params["program"], json!(native(cwd.join("relative tools/python3"))));
+        assert_eq!(request.params["working_directory"], json!(native(app.clone())));
         assert!(request.params.get("ui_tree").is_none());
         assert!(capture_request(&app, Path::new("missing-runner"), &[], &dir, false, |_| None).is_none());
-        let program = app.join(".venv/bin/python");
+        let program = native(app.join(".venv/bin/python"));
         let request = capture_request(&app, &program, &[], &dir, false, |_| panic!("an absolute executable must not use PATH lookup")).unwrap();
         assert_eq!(request.params["program"], json!(program));
     }
