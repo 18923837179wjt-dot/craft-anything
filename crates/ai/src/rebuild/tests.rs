@@ -113,6 +113,25 @@ fn german_requests_keep_their_project_kind() {
 }
 
 #[test]
+/// A request written in Spanish keeps the project kind its English equivalent would get, which is
+/// what the German and Chinese cases assert for their own words.
+fn spanish_requests_keep_their_project_kind() {
+    for request in ["Un juego de serpiente sencillo", "El mismo juego, con una tabla de récords"] {
+        assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
+    }
+    for request in ["Un sitio web para mi panadería", "Recrea este sitio web", "Una página web de mi taller"] {
+        assert_eq!(choose(request, &TargetRef::None), ("website", stacks::BUILDERS_CHOICE), "{request}");
+    }
+    assert_eq!(choose("La misma app, pero más simple", &TargetRef::None).0, "app");
+    // "juego" also names a set: a tool set is not a game.
+    assert_eq!(choose("Una app para llevar el inventario de mi juego de herramientas", &TargetRef::None).0, "app");
+    // "web" alone says nothing: a web app is built as an app, not as a website.
+    for request in ["Una aplicación web de notas", "A web app in Rust"] {
+        assert_eq!(choose(request, &TargetRef::None).0, "app", "{request}");
+    }
+}
+
+#[test]
 fn chinese_requests_keep_their_project_kind() {
     for request in ["一个简单的贪吃蛇游戏", "簡單的貪食蛇遊戲", "复刻它的玩法"] {
         assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
