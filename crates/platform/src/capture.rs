@@ -331,6 +331,18 @@ pub fn capture(_spec: Spec, _cancel: Cancel) -> Result<Capture, ToolError> {
 /// Run a program that crashes without a real console (it asks the console for its size, which
 /// fails on [`crate::process`]'s pipes) and return what it drew and its exit code. The deadline
 /// and `cancel` still end it; nothing writes to its input.
+/// Ends the process `$Root` and what it started, and nothing else. Windows keeps a dead parent's
+/// number on its children and reuses numbers, so `taskkill /T` can end a stranger whose parent's
+/// number `$Root` took: here a process counts only if it started after its parent.
+#[cfg(windows)]
+const END_TREE: &str = "$all = Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate; $tree = @{}; \
+    foreach ($p in $all) { if ($p.ProcessId -eq $Root) { $tree[$Root] = $p.CreationDate } }; if ($tree.Count -eq 0) { exit 0 }; \
+    do { $more = $false; foreach ($p in $all) { $id = [int]$p.ProcessId; $parent = [int]$p.ParentProcessId; \
+    if (-not $tree.ContainsKey($id) -and $tree.ContainsKey($parent) -and $p.CreationDate -ge $tree[$parent]) { $tree[$id] = $p.CreationDate; $more = $true } } } while ($more); \
+    Stop-Process -Id @($tree.Keys) -Force -ErrorAction SilentlyContinue; \
+    $left = @($tree.Keys | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }); \
+    if ($left.Count -gt 0) { Write-Output ('still running: ' + ($left -join ', ')); exit 1 }";
+
 #[cfg(windows)]
 pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Duration, cancel: Option<Cancel>) -> Result<(String, Option<i32>), ToolError> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -390,12 +402,15 @@ pub fn console_text(program: &std::path::Path, args: &[OsString], timeout: Durat
         // Windows Server 2022's console host can hang closing a console that programs are still
         // attached to, and they then keep running: end everything the program started first.
         if let Some(pid) = child.process_id() {
-            let taskkill =
-                std::env::var_os("SystemRoot").map_or_else(|| "taskkill".into(), |r| std::path::PathBuf::from(r).join("System32").join("taskkill.exe"));
-            match crate::process::Process::new(taskkill).args(["/T", "/F", "/PID", &pid.to_string()]).timeout(Duration::from_secs(10)).run() {
+            let script = format!("$Root = {pid}; {END_TREE}");
+            match crate::process::Process::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+                .timeout(Duration::from_secs(10))
+                .run()
+            {
                 Ok(out) if out.success => {}
-                Ok(out) => log::warn!("taskkill didn't end everything {} started: {}", program.display(), out.stderr_text().trim()),
-                Err(e) => log::warn!("couldn't run taskkill to end what {} started: {}", program.display(), e.message),
+                Ok(out) => log::warn!("couldn't end everything {} started: {}", program.display(), out.stdout_text().trim()),
+                Err(e) => log::warn!("couldn't end what {} started: {}", program.display(), e.message),
             }
         }
         let _ = child.kill();
