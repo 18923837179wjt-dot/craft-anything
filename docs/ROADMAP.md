@@ -173,10 +173,16 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
 - [ ] **decision** Replies don't reach people who file through the ticket relay (each such ticket
       says so), yet the bot asks them for details. About half the open issues came that way. Get
       replies back to them, or stop asking
-- [ ] `which::tests::usual_windows_dirs_come_after_path` (platform) fails on a Windows machine
-      whose environment adds a folder (10 found, 9 expected, "nothing twice"), on `main` too; and
-      `capture::console_tests::reads_what_the_program_drew_and_stops_at_the_deadline` failed once
-      with the whole platform suite running and passes alone. Find what each depends on
+- [x] `which::tests::usual_windows_dirs_come_after_path` (platform) failed on Windows (10 found, 9
+      expected, "nothing twice"): it didn't count Antigravity's second folder, fixed by #770
+- [ ] `capture::console_tests::reads_what_the_program_drew_and_stops_at_the_deadline` failed once
+      with the whole platform suite running and passes alone (passed 3 whole-suite runs on Windows 11
+      on 2026-11-04). Find what it depends on
+- [x] `process::launch_tests::a_launcher_that_hands_off_keeps_its_group_until_stopped` failed on a
+      busy Windows machine: it killed the run 500 ms after the start, and a `cmd` that hadn't exited
+      by then made a cancelled run, not a hand-off. The test now waits for the launcher's mark, and
+      a kill that finds the program already exited reports its exit, not a cancel
+      — claimed: 00xJS, branch test/r5.2-hand-off-race
 - [ ] `a_helper_is_judged_by_whether_it_runs` (ai crate) sometimes fails when several crates'
       tests run at once and passes alone: it writes a script and runs it straight away, which a
       busy machine can refuse while another test's child still holds the file open
@@ -200,6 +206,18 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
 - [x] `remote_discovery_uses_the_remote_program_and_connection_context` fails on a computer with
       OpenCode installed: its made-up path is missing, so `program_of` falls back to `opencode`
       — claimed: justinjohn0306, branch test/remote-discovery-without-opencode
+- [x] Idle CPU on an AMD Radeon, measured (2026-11-04, `main` at `869eb85`, release build, Windows 11
+      build 26300, RX 6900 XT, driver 32.0.21045.16010, Ryzen 5 2600X; the window open on a fresh
+      profile, nothing changing). DX12 on the card: one core at ~100% for as long as the window is
+      open; Vulkan: the same; GL: 0%; WARP: ~280% for the first 5 s after start, then 0%. The busy
+      thread isn't the app's: on DX12 it starts in `amdxc64.dll`, on Vulkan in `amdvlk64.dll`, and
+      it starts with the device, not the main thread. A bare eframe window does the same with every
+      present mode and frame latency tried (AutoVsync, Fifo, Mailbox, Immediate; latency 1, 2, 3),
+      so nothing in our frame pacing causes or avoids it; GL alone stays idle. Seen in the same way
+      with PdfCraft and PhotoCraft (pdfcraft#3255) — claimed: 00xJS, branch docs/r5.2-idle-cpu-amd
+- [ ] **decision** AMD's idle driver thread costs Radeon owners a core on DX12 and Vulkan. Say so
+      in the troubleshooting docs (with `WGPU_BACKEND=gl` as the way out, which loads AMD's OpenGL
+      driver), report it to AMD, or leave it
 
 ### R5.3 A builder that can't make progress stops
 Owner: open · Status: todo
@@ -291,8 +309,12 @@ been run live.
 - [ ] The model reads file paths from the project folder and commands from `app/` as one base:
       it ran `cargo init app` and `cd app && cargo build` after writing `app/Cargo.toml`. Say the
       folder in `build_command_run`'s result (or its description) so the two can't be mixed up
-- [ ] `usage.json` after a local build says about 4,200 input tokens and 6.5 s of work, while
-      Ollama logged about six requests of 4,000-5,000 tokens each: find what it leaves out
+- [x] `usage.json` after a local build says about 4,200 input tokens and 6.5 s of work, while
+      Ollama logged about six requests of 4,000-5,000 tokens each: find what it leaves out.
+      Cached tokens: Ollama 0.40 reports them apart (`cached_tokens`), and the built-in loop's
+      `TurnDone` left them out while coding agents count them. It counts them now; a live run on
+      Ollama 0.40.7 had recorded 5,323 input tokens of 75,014
+      — claimed: SoldierPePe, branch bugfix/r5.4-usage-cached-tokens
 - [x] An assistant turn with no text sends an empty string, not `content: null`, which Ollama
       refused as `invalid message content type: <nil>` (#403, #536)
 - [x] Understand a tool call a model writes as JSON in its text (#417; implementation `dfe9a4db2dcb3e27edbd67311cbb4202584e7af6`). The fallback protocol reads
@@ -329,8 +351,13 @@ Owner: open · Status: todo
       settings and prints "Using Claude Code (…)": `ensure_agent` (`rebuild_cmd.rs`) runs whenever no
       agent app is set up, though this run won't use one. Run it only when the build needs one
       — claimed: AlexJoaquimPereira, branch `bugfix/r5.5-no-agent-with-api-backend`
-- [ ] `--backend <a name that is turned off>` still builds with it: `builder_backend`'s named
-      branch doesn't check `enabled`, while Settings treats an AI that is off as unusable
+- [x] `--backend <a name that is turned off or unknown>` is refused with a specific message: a
+      turned-off backend is named and must be turned on, and a name that matches nothing is named
+      instead of saying to install an agent or add a key
+      — claimed: AlexJoaquimPereira, branch `bugfix/r5.5-disabled-backend-name`; commit a380b3e
+- [ ] When a project's saved builder was turned off, Start builds with the default AI without
+      saying so: the UI picker filters the stale name out (`ui-egui/src/builders.rs`) instead of
+      reporting that the chosen AI was replaced
 - [x] Bound accumulated data across all lines of one server-sent event, so short lines cannot
       grow a streamed API response without limit
       — claimed: Afloat16, branch bugfix/r5.5-bounded-sse-events-20261103
@@ -427,6 +454,12 @@ Owner: open · Status: in progress
 - [x] Find Chrome, Brave, Chromium and Edge installed as Flatpaks on Linux (system and per-user
       exports), and keep a Flatpak or Snap browser's private profile in the home folder its
       sandbox shares, since its /tmp is its own (#747). Unit-tested; not run on a real Flatpak
+- [x] Find browsers under their other Linux names, and say why one isn't found: a set path that
+      isn't there, or a Flatpak's sandbox (#841). Unit-tested; not run on Linux or in a real Flatpak
+- [ ] **decision** Let the Flatpak start browsers on the computer. It can't see system ones today;
+      a per-user Flatpak browser in `~/.local/share/flatpak/exports/bin` is found, but its start
+      script needs `flatpak`, which the sandbox doesn't have. `flatpak-spawn --host` would need
+      `--talk-name=org.freedesktop.Flatpak`, which lets the app run anything outside its sandbox (#841)
 - [ ] More pins once their hashes are checked against the publisher: Chromium (no published
       checksums found yet), Rizin for Linux (the tar.xz unpacks to ~800 MB, so it needs streaming
       extraction) and macOS (a .pkg)
@@ -675,6 +708,9 @@ Owner: maintainers · Status: in progress
 ### R2.9 Everyday use: typing, projects, settings
 Owner: maintainers · Status: in progress
 Gaps found while using the app for real projects.
+- [x] Keep New project's content column fixed while the vertical scrollbar animates in or out,
+      hiding it when there is nothing to scroll, so switching tabs never shifts the page horizontally
+      — claimed: Codex, branch bugfix/r2.9-home-scrollbar-gutter
 - [x] Agent paragraphs with glossary terms and long file links wrap together without pushing
       their card or later messages under the sidebar (#523); Project and Ask bounds checked at two sizes
       — claimed: carl-dourado, branch hotfix/r2.9-523-message-width
@@ -683,6 +719,8 @@ Gaps found while using the app for real projects.
 - [x] A prompt brought back with Up keeps its pictures (their paths are absolute, so they don't
       come back after the project is moved)
 - [ ] Change a project's builder from its page (a tool, so the CLI and MCP can too) — in PR #245
+- [ ] `chat --backend <a name that is turned off>` (and `compare`) still talks to it:
+      `AiHub::start` accepts a named backend without checking `enabled`, unlike a build
 - [x] Ctrl+V (Shift+Insert, Cmd+V) in a prompt box that takes pictures pastes a copied image (saved
       as a PNG) or copied picture files; attachments show as square picture tiles, the whole
       picture on hover, decoded on a worker
@@ -693,12 +731,20 @@ Gaps found while using the app for real projects.
 - [ ] A question's own cost: a forked Claude Code session reports the whole session's running
       total, so a forked answer shows none; count questions in the project's usage
 - [ ] "Make this change" on an answer that suggests one (sends it as a normal message)
+- [x] "Change it" knows what was just talked about in "Just ask": the next message tells the builder
+      the latest few questions and answers, once, and a Clean room build only those asked in Clean
+      room (#857). Not checked in a live build
+- [ ] A note sent while a build is running doesn't tell it what was asked in "Just ask" yet (#857)
+- [ ] Record which mode a builder's session ran in: `agent_session` is kept across modes, so a Clean
+      room build or question can resume a session from a Deep build and carry what it read, and such
+      a question's answer is recorded as asked in Clean room. Don't resume one for Clean room
 - [x] #504: the builder's plan card can be folded away with its X, or with `project_plan_fold`
       (between builds: a fold during a build can be overwritten by its next save). The steps stay
       in the conversation (`FEED_VERSION` 4, `FeedItem::PlanDismissed`), and a later run's
       checklist shows again — claimed: claude, branch bugfix/r2.9-plan-card-dismiss
-- [ ] A run that ends with steps still open marks them as stopped on its card, instead of
+- [x] A run that ends with steps still open marks them as stopped on its card, instead of
       showing "Doing" until someone folds it (#504: Claude's runs left the plan unticked)
+      — claimed: rust-craft, branch feature/R2.9-stop-open-steps; PR #876
 - [x] #666: a long line in a feed's tool-work row (a Deep-mode decompile, a status note) ran off
       the window and pushed the feed left; the header title can't wrap in egui, so it's the note's
       first line now, cut at 90 characters, and the full note wraps in the body — claimed: claude,
@@ -780,6 +826,10 @@ Gaps found while using the app for real projects.
       the system's Edit items need the text box to answer them, so they'd show greyed out today
 - [x] The Advanced console's prompt box starts tall enough to read what's typed (#942)
       — claimed: justinjohn0306, branch bugfix/942-console-input-height
+- [ ] Vietnamese letters with stacked marks (ạ ả ấ ế ơ ư ữ…) aren't in the bundled DM Sans or egui's
+      default fonts: without craft-fonts they show as boxes, and with it each such letter comes from
+      Noto Sans CJK while the rest of the word is DM Sans. Bundle a DM Sans build that has the
+      Vietnamese set (with its OFL notice) so Tiếng Việt renders in one face
 
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress
