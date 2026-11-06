@@ -135,19 +135,28 @@ fn framed_directory(directory: &[u8], count: u16, records_left: &mut usize) -> O
     Some(tail_reader.slice(0, 4) == Some(b"PK\x05\x05") && tail_reader.u16_le(4).is_some_and(|len| usize::from(len).checked_add(6) == Some(tail.len())))
 }
 
-fn find_eocd(data: &[u8]) -> Option<usize> {
-    // One input-sized pass plus the search window's allowance, shared by every candidate.
+struct EocdCandidate {
+    offset: usize,
+    directory: usize,
+    has_signer: bool,
+    ambiguous: bool,
+}
+
+fn find_eocd(data: &[u8]) -> Option<EocdCandidate> {
+    // One input-sized pass plus the search window's allowance, shared by every candidate's
+    // directory records, signing-block pairs and signer records.
     let records_left = (data.len() / CD_HEADER_LEN).checked_add(EOCD_SEARCH)?;
     find_eocd_with_budget(data, records_left)
 }
 
-fn find_eocd_with_budget(data: &[u8], mut records_left: usize) -> Option<usize> {
+fn find_eocd_with_budget(data: &[u8], mut records_left: usize) -> Option<EocdCandidate> {
     let r = Reader::new(data);
     let from = data.len().saturating_sub(EOCD_SEARCH);
     let mut i = data.len().checked_sub(22)?;
-    // Prefer the enclosing record when its comment contains another framed marker. A candidate
-    // must follow its complete central directory, with a readable signing block before it.
-    let mut found = None;
+    // Empty or unreadable blocks must not hide recoverable signers. Among equally readable
+    // candidates, retain the lowest offset and report distinct readable blocks as ambiguous.
+    let mut found: Option<EocdCandidate> = None;
+    let mut ambiguous = false;
     loop {
         if let Some(end) = r.slice(i, 22).map(Reader::new)
             && end.slice(0, 4) == Some(b"PK\x05\x06")
@@ -155,12 +164,18 @@ fn find_eocd_with_budget(data: &[u8], mut records_left: usize) -> Option<usize> 
             && let Some(cd) = end.u32_le(16).and_then(|n| usize::try_from(n).ok())
             && let Some(size) = end.u32_le(12).and_then(|n| usize::try_from(n).ok())
             && cd.checked_add(size) == Some(i)
-            && signing_block_extent(&r, cd).is_some()
+            && let Some((start, _)) = signing_block_extent(&r, cd)
             && let Some(count) = end.u16_le(10)
             && let Some(directory) = r.slice(cd, size)
             && framed_directory(directory, count, &mut records_left)?
         {
-            found = Some(i);
+            let has_signer = has_readable_signer(&r, start, cd, &mut records_left)?;
+            if let Some(previous) = &found {
+                ambiguous |= previous.has_signer && has_signer && previous.directory != cd;
+            }
+            if has_signer || found.as_ref().is_none_or(|previous| !previous.has_signer) {
+                found = Some(EocdCandidate { offset: i, directory: cd, has_signer, ambiguous });
+            }
         }
         if i == from {
             return found;
@@ -198,6 +213,46 @@ impl<'a> Lp<'a> {
         }
         out
     }
+}
+
+/// Match the parser's signer admission without allocating or requiring undamaged later fields.
+/// None means the shared record budget ran out; malformed framing only ends its current sequence.
+fn has_readable_signer(r: &Reader<'_>, start: usize, cd: usize, records_left: &mut usize) -> Option<bool> {
+    let Some(pairs_end) = cd.checked_sub(24) else { return Some(false) };
+    let Some(mut pos) = start.checked_add(8) else { return Some(false) };
+    for _ in 0..MAX_PAIRS {
+        if pos >= pairs_end {
+            break;
+        }
+        *records_left = records_left.checked_sub(1)?;
+        let Some(len) = r.u64_le(pos).and_then(|len| usize::try_from(len).ok()) else { break };
+        let Some(next) = pos.checked_add(8).and_then(|pos| pos.checked_add(len)) else { break };
+        if len < 4 || next > pairs_end {
+            break;
+        }
+        let Some(value_at) = pos.checked_add(12) else { break };
+        if matches!(r.u32_le(value_at - 4), Some(V2_ID | V3_ID | V31_ID))
+            && let Some(value) = r.slice(value_at, len - 4)
+            && let Some((signers, _)) = (Lp { data: value }).at(0)
+        {
+            let sequence = Lp { data: signers };
+            let mut signer_pos = 0;
+            for _ in 0..MAX_ITEMS {
+                if signer_pos >= signers.len() {
+                    break;
+                }
+                *records_left = records_left.checked_sub(1)?;
+                let Some((signer, next_signer)) = sequence.at(signer_pos) else { break };
+                // parse_signer only requires the signed-data LP; all later fields are optional.
+                if (Lp { data: signer }).at(0).is_some() {
+                    return Some(true);
+                }
+                signer_pos = next_signer;
+            }
+        }
+        pos = next;
+    }
+    Some(false)
 }
 
 fn hex(b: &[u8]) -> String {
@@ -273,9 +328,12 @@ fn parse_signer(scheme: &'static str, s: &[u8], warnings: &mut Vec<String>) -> O
 pub fn parse(data: &[u8]) -> Option<SigningBlock> {
     let r = Reader::new(data);
     let eocd = find_eocd(data)?;
-    let cd = r.u32_le(eocd + 16)? as usize;
+    let cd = r.u32_le(eocd.offset + 16)? as usize;
     let (start, size_footer) = signing_block_extent(&r, cd)?;
     let mut block = SigningBlock { offset: start as u64, size: size_footer, ..SigningBlock::default() };
+    if eocd.ambiguous {
+        block.warnings.push("multiple ZIP end records contain readable APK signers; signing metadata is ambiguous".into());
+    }
     if r.u64_le(start) != Some(size_footer) {
         block.warnings.push("the block's two size fields disagree".into());
     }
@@ -331,13 +389,79 @@ mod tests {
     }
 
     #[test]
-    fn eocd_lookup_rejects_an_exhausted_directory_budget() {
+    fn eocd_lookup_rejects_an_exhausted_record_budget() {
         let apk = fx::notes_apk();
         let eocd = apk.len() - 22;
         let count = usize::from(Reader::new(&apk).u16_le(eocd + 10).unwrap());
         assert!(count > 0);
-        assert_eq!(find_eocd_with_budget(&apk, count), Some(eocd));
-        assert_eq!(find_eocd_with_budget(&apk, count - 1), None);
+        assert_eq!(find_eocd_with_budget(&apk, count + 2).map(|candidate| candidate.offset), Some(eocd));
+        assert!(find_eocd_with_budget(&apk, count + 1).is_none());
+        assert!(find_eocd_with_budget(&apk, count - 1).is_none());
+    }
+
+    fn lp(value: &[u8]) -> Vec<u8> {
+        let mut out = (value.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn probe_fixture(pairs: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, value) in pairs {
+            body.extend_from_slice(&((value.len() + 4) as u64).to_le_bytes());
+            body.extend_from_slice(&id.to_le_bytes());
+            body.extend_from_slice(value);
+        }
+        let size = (body.len() + 24) as u64;
+        let mut block = size.to_le_bytes().to_vec();
+        block.extend_from_slice(&body);
+        block.extend_from_slice(&size.to_le_bytes());
+        block.extend_from_slice(MAGIC);
+        fx::with_signing_block(&craft_anything_testkit::electron::zip_stored(&[]), &block)
+    }
+
+    fn assert_probe_matches_parser(pairs: &[(u32, Vec<u8>)], expected: bool) {
+        let apk = probe_fixture(pairs);
+        let mut records_left = EOCD_SEARCH;
+        assert_eq!(has_readable_signer(&Reader::new(&apk), 0, apk.len() - 22, &mut records_left), Some(expected));
+        assert_eq!(!parse(&apk).unwrap().signers.is_empty(), expected);
+    }
+
+    #[test]
+    fn signer_probes_share_the_record_budget() {
+        let apk = fx::notes_apk();
+        let r = Reader::new(&apk);
+        let cd = r.u32_le(apk.len() - 6).unwrap() as usize;
+        let (start, _) = signing_block_extent(&r, cd).unwrap();
+        let mut records_left = 3;
+        assert_eq!(has_readable_signer(&r, start, cd, &mut records_left), Some(true));
+        assert_eq!(records_left, 1);
+        assert_eq!(has_readable_signer(&r, start, cd, &mut records_left), None);
+        assert_eq!(records_left, 0);
+    }
+
+    #[test]
+    fn signer_probe_matches_the_parsers_recovery_boundaries() {
+        let readable = lp(&lp(&lp(&[])));
+        let bad_item = lp(&[u32::MAX.to_le_bytes().to_vec(), lp(&lp(&[]))].concat());
+        for id in [V2_ID, V3_ID, V31_ID] {
+            assert_probe_matches_parser(&[(id, lp(&lp(&[])))], false);
+            assert_probe_matches_parser(&[(id, readable.clone())], true);
+            assert_probe_matches_parser(&[(id, lp(&[lp(&[]), lp(&lp(&[]))].concat()))], true);
+            assert_probe_matches_parser(&[(id, bad_item.clone())], false);
+        }
+        assert_probe_matches_parser(&[(V2_ID, vec![0xff; 4]), (V3_ID, readable.clone())], true);
+        assert_probe_matches_parser(&[(V2_ID, bad_item), (V31_ID, readable)], true);
+    }
+
+    #[test]
+    fn signer_probe_obeys_the_parsers_item_and_pair_limits() {
+        let mut signers = lp(&[]).repeat(MAX_ITEMS);
+        signers.extend_from_slice(&lp(&lp(&[])));
+        assert_probe_matches_parser(&[(V2_ID, lp(&signers))], false);
+        let mut pairs = vec![(0x1357_2468, Vec::new()); MAX_PAIRS];
+        pairs.push((V2_ID, lp(&lp(&lp(&[])))));
+        assert_probe_matches_parser(&pairs, false);
     }
 
     #[test]

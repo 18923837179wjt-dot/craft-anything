@@ -107,3 +107,124 @@ fn recoverable_size_and_pair_damage_still_returns_signing_evidence() {
     assert_eq!(found.entries.len(), 2);
     assert!(found.warnings.iter().any(|w| w.contains("malformed id-value pair")));
 }
+
+fn block_with_pairs(pairs: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (id, value) in pairs {
+        body.extend_from_slice(&((value.len() + 4) as u64).to_le_bytes());
+        body.extend_from_slice(&id.to_le_bytes());
+        body.extend_from_slice(value);
+    }
+    let size = (body.len() + 24) as u64;
+    let mut block = size.to_le_bytes().to_vec();
+    block.extend_from_slice(&body);
+    block.extend_from_slice(&size.to_le_bytes());
+    block.extend_from_slice(b"APK Sig Block 42");
+    block
+}
+
+fn empty_eocd(offset: usize, comment_len: usize) -> Vec<u8> {
+    let mut end = vec![0; 22];
+    end[..4].copy_from_slice(b"PK\x05\x06");
+    end[16..20].copy_from_slice(&u32::try_from(offset).unwrap().to_le_bytes());
+    end[20..22].copy_from_slice(&u16::try_from(comment_len).unwrap().to_le_bytes());
+    end
+}
+
+fn signed_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use craft_anything_testkit::{android, electron::zip_stored};
+    android::with_signing_block(&zip_stored(entries), &android::signing_block(&android::certificate_der("Craft Test", "Craft Org")))
+}
+
+fn with_nested_candidate(mut apk: Vec<u8>, fake_block: &[u8]) -> (Vec<u8>, apk_sign::SigningBlock) {
+    let mut expected = apk_sign::parse(&apk).unwrap();
+    let eocd = apk.len() - 22;
+    let cd = u32::from_le_bytes(apk[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let pair_at = cd - 24;
+    let marker_at = pair_at + 12 + fake_block.len();
+    let added = 12 + fake_block.len() + 22;
+    let mut value = fake_block.to_vec();
+    value.extend_from_slice(&empty_eocd(marker_at, apk.len() + added - marker_at - 22));
+    let mut pair = ((value.len() + 4) as u64).to_le_bytes().to_vec();
+    pair.extend_from_slice(&0x1357_2468u32.to_le_bytes());
+    pair.extend_from_slice(&value);
+    apk.splice(pair_at..pair_at, pair);
+
+    expected.size += added as u64;
+    expected.entries.push(apk_sign::BlockEntry { id: "0x13572468".into(), name: "unknown", size: value.len() as u64 });
+    let start = expected.offset as usize;
+    let new_cd = cd + added;
+    apk[start..start + 8].copy_from_slice(&expected.size.to_le_bytes());
+    apk[new_cd - 24..new_cd - 16].copy_from_slice(&expected.size.to_le_bytes());
+    apk[eocd + added + 16..eocd + added + 20].copy_from_slice(&(new_cd as u32).to_le_bytes());
+    (apk, expected)
+}
+
+fn assert_nested_candidate_keeps_signers(fake_block: &[u8]) {
+    for apk in [notes_apk(), signed_zip(&[])] {
+        let (apk, expected) = with_nested_candidate(apk, fake_block);
+        assert_eq!(apk_sign::parse(&apk).unwrap(), expected);
+    }
+}
+
+#[test]
+fn an_empty_block_inside_a_pair_cannot_hide_readable_signers() {
+    assert_nested_candidate_keeps_signers(&block_with_pairs(&[]));
+}
+
+#[test]
+fn an_unknown_pair_block_inside_a_pair_cannot_hide_readable_signers() {
+    assert_nested_candidate_keeps_signers(&block_with_pairs(&[(0x2468_1357, vec![1, 2, 3, 4])]));
+}
+
+#[test]
+fn an_unreadable_signature_pair_cannot_hide_readable_signers() {
+    assert_nested_candidate_keeps_signers(&block_with_pairs(&[(apk_sign::V2_ID, vec![0; 4])]));
+}
+
+#[test]
+fn a_framed_unknown_pair_spanning_the_original_directory_does_not_hide_signers() {
+    let mut apk = signed_zip(&[("pad", &[0; 64])]);
+    let original = apk_sign::parse(&apk).unwrap();
+    let len = apk.len();
+    let start = 30 + "pad".len();
+    let size = (len + 16 - start) as u64;
+    apk[start..start + 8].copy_from_slice(&size.to_le_bytes());
+    apk[start + 8..start + 16].copy_from_slice(&((len - start - 16) as u64).to_le_bytes());
+    apk[start + 16..start + 20].copy_from_slice(&0x1357_2468u32.to_le_bytes());
+    apk[len - 2..].copy_from_slice(&46u16.to_le_bytes());
+    apk.extend_from_slice(&size.to_le_bytes());
+    apk.extend_from_slice(b"APK Sig Block 42");
+    apk.extend_from_slice(&empty_eocd(len + 24, 0));
+
+    assert_eq!(apk_sign::parse(&apk).unwrap(), original);
+}
+
+#[test]
+fn different_readable_signing_blocks_report_ambiguous_metadata() {
+    use craft_anything_testkit::android;
+    let mut apk = notes_apk();
+    let original = apk_sign::parse(&apk).unwrap();
+    let eocd = apk.len() - 22;
+    let other = android::signing_block(&android::certificate_der("Other Signer", "Craft Org"));
+    let mut comment = other;
+    comment.extend_from_slice(&empty_eocd(apk.len() + comment.len(), 0));
+    apk[eocd + 20..eocd + 22].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+    apk.extend_from_slice(&comment);
+
+    let found = apk_sign::parse(&apk).unwrap();
+    assert_eq!((found.offset, found.size), (original.offset, original.size));
+    assert_eq!(found.entries, original.entries);
+    assert_eq!(found.signers, original.signers);
+    assert!(found.warnings.iter().any(|warning| warning.contains("signing metadata is ambiguous")));
+}
+
+#[test]
+fn a_single_empty_signing_block_remains_readable() {
+    let apk = craft_anything_testkit::android::with_signing_block(&craft_anything_testkit::electron::zip_stored(&[]), &block_with_pairs(&[]));
+    let found = apk_sign::parse(&apk).unwrap();
+    assert_eq!((found.offset, found.size), (0, 24));
+    assert!(found.entries.is_empty());
+    assert!(found.signers.is_empty());
+    assert!(found.warnings.is_empty());
+}
