@@ -1408,10 +1408,10 @@ impl CraftApp {
         match done {
             Done::Nothing => {}
             Done::Projects(mut p) => {
-                if let Some(ws) = &self.workspace {
-                    if !p.iter().any(|w| w.root == ws.root) {
-                        p.insert(0, ws.clone());
-                    }
+                if let Some(ws) = &self.workspace
+                    && !p.iter().any(|w| w.root == ws.root)
+                {
+                    p.insert(0, ws.clone());
                 }
                 self.projects = p;
                 self.refresh_pins();

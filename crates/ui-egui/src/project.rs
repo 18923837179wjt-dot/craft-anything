@@ -21,24 +21,7 @@ use std::path::{Path, PathBuf};
 
 impl CraftApp {
     pub fn refresh_projects(&mut self) {
-        if let Ok(text) = std::fs::read_to_string(craft_anything_engine::Settings::path()) {
-            if let Ok(s) = craft_anything_engine::settings::read_settings(&text) {
-                for f in s.project_folders {
-                    if !self.settings.project_folders.contains(&f) {
-                        self.settings.project_folders.push(f);
-                    }
-                }
-                if self.settings.projects_dir.is_none() && s.projects_dir.is_some() {
-                    self.settings.projects_dir = s.projects_dir;
-                }
-            }
-        }
-        let mut locations = self.settings.project_locations();
-        if let Some(ws) = &self.workspace {
-            if !locations.contains(&ws.root) && !self.settings.project_locations().iter().any(|l| l == &ws.root || ws.root.parent() == Some(l.as_path())) {
-                locations.push(ws.root.clone());
-            }
-        }
+        let locations = self.settings.project_locations();
         self.jobs.spawn("Read projects", false, move |_| Ok(Done::Projects(Workspace::list_in(&locations))));
     }
 
