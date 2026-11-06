@@ -1,7 +1,7 @@
 # Contributors
 
 Craft Anything is built by the people below and everyone in the repository's history. Anyone
-whose pull request is merged is a contributor; GitHub's contributor list counts commits on `main`.
+whose pull request is merged is a contributor.
 
 ## Before the public history (2026-10-12 to 2026-10-30)
 
@@ -50,4 +50,4 @@ architecture it has now:
 
 ## Since 2026-10-31
 
-Everything since is in the public history and on GitHub's contributor list.
+Everything since is in the public history, under each commit's author.
