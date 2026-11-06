@@ -36,7 +36,7 @@ fn main() -> eframe::Result {
     log_to_file();
     log::info!("starting {} (pid {})", env!("CARGO_PKG_VERSION"), std::process::id());
     // A driver that crashes natively leaves nothing behind but this mark (#74): the start after it
-    // draws without the graphics card, and the one after that is back to normal.
+    // draws another way (on Windows, the next renderer, which is kept once it works).
     let config = craft_anything_engine::settings::config_dir();
     let last_failed = start_guard::last_start_failed(&config);
     if last_failed {
@@ -130,7 +130,10 @@ fn main() -> eframe::Result {
             #[cfg(windows)]
             if !shown.load(std::sync::atomic::Ordering::Relaxed)
                 && let Some(next) = renderer.and_then(|r| renderer::relaunch_with(r, &e.to_string()))
-                && relaunch(&args)
+                && {
+                    start_guard::release();
+                    relaunch(&args)
+                }
             {
                 log::warn!("starting again with {}", next.title());
                 return run;
