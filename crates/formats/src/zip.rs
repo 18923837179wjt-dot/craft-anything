@@ -121,6 +121,11 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
     let expected_end = cd_offset.checked_add(cd_size).ok_or_else(|| ZipError::Corrupt("directory bounds overflow".into()))?;
     let prefix = eocd_record_start.saturating_sub(expected_end);
     let start = usize::try_from(cd_offset.saturating_add(prefix)).map_err(|_| ZipError::Corrupt("directory offset".into()))?;
+    let directory_end = (start as u64)
+        .checked_add(cd_size)
+        .filter(|&end| end <= eocd_record_start)
+        .and_then(|end| usize::try_from(end).ok())
+        .ok_or_else(|| ZipError::Corrupt("directory extends into its end record".into()))?;
     let mut entries = Vec::new();
     let mut pos = start;
     let mut truncated = false;
@@ -129,6 +134,9 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
         if entries.len() >= max_entries {
             truncated = true;
             break;
+        }
+        if pos.checked_add(46).is_none_or(|end| end > directory_end) {
+            return Err(ZipError::Truncated("directory entry"));
         }
         if r.slice(pos, 4) != Some(b"PK\x01\x02") {
             if entries.is_empty() {
@@ -145,6 +153,10 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
         let name_len = usize::from(r.u16_le(pos + 28).ok_or(ZipError::Truncated("directory entry"))?);
         let extra_len = usize::from(r.u16_le(pos + 30).ok_or(ZipError::Truncated("directory entry"))?);
         let comment_len = usize::from(r.u16_le(pos + 32).ok_or(ZipError::Truncated("directory entry"))?);
+        let entry_end = pos
+            .checked_add(46 + name_len + extra_len + comment_len)
+            .filter(|&end| end <= directory_end)
+            .ok_or(ZipError::Truncated("directory entry fields"))?;
         let host = r.slice(pos + 5, 1).and_then(|b| b.first().copied()).unwrap_or(0);
         let unix_mode = if host == 3 { r.u32_le(pos + 38).map(|a| a >> 16) } else { None };
         let mut local = u64::from(r.u32_le(pos + 42).ok_or(ZipError::Truncated("directory entry"))?);
@@ -196,7 +208,7 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
             unix_mode,
         });
         seen += 1;
-        pos = pos.checked_add(46 + name_len + extra_len + comment_len).ok_or_else(|| ZipError::Corrupt("directory overflow".into()))?;
+        pos = entry_end;
     }
     Ok(ZipArchive { entries, declared_entries: total, truncated, zip64, prefix_bytes: prefix })
 }
