@@ -74,6 +74,7 @@ impl TargetKind for GameKind {
                 " spiel",
                 "-spiel",
                 "gioco",
+                " trò chơi",
             ])
             || says_game_in_spanish(cx)
         {
