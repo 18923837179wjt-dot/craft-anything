@@ -54,7 +54,7 @@ fn trailing_bytes_too_short_for_a_field_header_are_padding() {
     for stray in 1..=3usize {
         let mut extra = vec![0xaa, 0xbb, 0, 0];
         extra.extend(std::iter::repeat_n(0u8, stray));
-        let data = archive(&extra, 34);
+        let data = archive(&extra, 36);
         let parsed = zip::parse(&data, 10).unwrap();
         assert_eq!(zip::read_entry(&data, &parsed.entries[0], 1).unwrap(), b"x", "stray {stray}");
     }
