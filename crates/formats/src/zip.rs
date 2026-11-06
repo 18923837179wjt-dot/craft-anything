@@ -193,7 +193,8 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<ZipArchive, ZipError> {
         let mut found_zip64 = false;
         let mut x = 0usize;
         let er = Reader::new(extra);
-        while x < extra.len() {
+        // Trailing bytes too short for a field header are padding, not truncation.
+        while x.saturating_add(4) <= extra.len() {
             let id = er.u16_le(x).ok_or(ZipError::Truncated("extra field header"))?;
             let len = usize::from(er.u16_le(x + 2).ok_or(ZipError::Truncated("extra field header"))?);
             let body = x + 4;
