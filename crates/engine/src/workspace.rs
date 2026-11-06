@@ -413,6 +413,10 @@ pub struct Manifest {
     /// (`Settings::questions`). The person's, like the budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub questions: Option<Questions>,
+    /// What the builder's approvals get in this project, by kind of action; a kind that isn't here
+    /// follows Auto mode ([`ActionKind::default_in`]). The person's, like the budget.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub approvals: std::collections::BTreeMap<ActionKind, Approval>,
     /// The builder finished its turn and the run's checks haven't reported on it yet, so a run
     /// that picks this up only needs to check: nothing is left to build.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -457,6 +461,7 @@ impl Manifest {
             start_files: Vec::new(),
             builder: None,
             questions: None,
+            approvals: Default::default(),
             awaiting_check: false,
             not_working_checks: 0,
         }
@@ -475,6 +480,7 @@ impl Manifest {
         self.allowed_actions = other.allowed_actions.clone();
         self.builder.clone_from(&other.builder);
         self.questions = other.questions;
+        self.approvals.clone_from(&other.approvals);
         self.name.clone_from(&other.name);
     }
 }
@@ -668,14 +674,15 @@ impl Workspace {
         // Ready stays ready; anything else can carry on (with a new conversation).
         copy.manifest.status = if m.status == Status::Ready { Status::Ready } else { Status::Stopped };
         copy.save()?;
-        let (budget, generate, builder, allowed, questions) =
-            (m.asset_budget_usd, m.generate_assets, m.builder.clone(), m.allowed_actions.clone(), m.questions);
+        let (budget, generate, builder, allowed, questions, approvals) =
+            (m.asset_budget_usd, m.generate_assets, m.builder.clone(), m.allowed_actions.clone(), m.questions, m.approvals.clone());
         copy.set_person(|c| {
             c.asset_budget_usd = budget;
             c.generate_assets = generate;
             c.builder = builder;
             c.allowed_actions = allowed;
             c.questions = questions;
+            c.approvals = approvals;
         })?;
         Ok(copy)
     }
@@ -1026,6 +1033,126 @@ pub enum Questions {
     Ask,
     /// Answered at once with "decide yourself and say what you chose".
     Decide,
+}
+
+/// A kind of builder action that asks for approval, which a project can decide about ahead of time
+/// (`Manifest::approvals`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// Reading websites and searching the web.
+    Web,
+    /// Commands outside the usual build commands.
+    Commands,
+    /// Changing files outside the project.
+    OutsideFiles,
+    /// Pushing to a git server or publishing anywhere (`git push`, `npm publish`, `gh pr create`…).
+    Publish,
+    /// Deleting anything outside the project or the temp folder.
+    DeleteOutside,
+    /// Changing the system, its settings or users, system files, or Craft Anything's own records.
+    System,
+    /// Tools with no rule of their own.
+    OtherTools,
+}
+
+/// What an action of one [`ActionKind`] gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Approval {
+    /// Done without asking.
+    Allow,
+    /// A card for the person, and the builder waits for the answer.
+    Ask,
+    /// Not done, without asking: the builder is told to find another way.
+    Refuse,
+}
+
+/// One row of [`ACTION_KINDS`].
+#[derive(Debug, Clone, Copy)]
+pub struct KindRow {
+    pub kind: ActionKind,
+    /// Its name in tools and slash commands.
+    pub name: &'static str,
+    /// What it covers, as the builder is told when it's refused ("pushing or publishing anything").
+    pub what: &'static str,
+    /// What it gets when the project hasn't chosen, with Auto mode on and off.
+    pub auto: Approval,
+    pub manual: Approval,
+}
+
+/// Every kind. Auto mode lets through what can be undone and refuses the rest; without it,
+/// everything but reading the web asks.
+pub const ACTION_KINDS: &[KindRow] = &[
+    KindRow { kind: ActionKind::Web, name: "web", what: "reading the web", auto: Approval::Allow, manual: Approval::Allow },
+    KindRow { kind: ActionKind::Commands, name: "commands", what: "commands outside the usual build commands", auto: Approval::Allow, manual: Approval::Ask },
+    KindRow { kind: ActionKind::OutsideFiles, name: "outside_files", what: "changing files outside the project", auto: Approval::Allow, manual: Approval::Ask },
+    KindRow { kind: ActionKind::Publish, name: "publish", what: "pushing or publishing anything", auto: Approval::Refuse, manual: Approval::Ask },
+    KindRow {
+        kind: ActionKind::DeleteOutside,
+        name: "delete_outside",
+        what: "deleting anything outside the project or the temp folder",
+        auto: Approval::Refuse,
+        manual: Approval::Ask,
+    },
+    KindRow {
+        kind: ActionKind::System,
+        name: "system",
+        what: "changing the system, its settings or users, system files, or Craft Anything's own records",
+        auto: Approval::Refuse,
+        manual: Approval::Ask,
+    },
+    KindRow {
+        kind: ActionKind::OtherTools,
+        name: "other_tools",
+        what: "tools with no approval rule of their own",
+        auto: Approval::Refuse,
+        manual: Approval::Ask,
+    },
+];
+
+impl ActionKind {
+    fn row(self) -> Option<&'static KindRow> {
+        ACTION_KINDS.iter().find(|r| r.kind == self)
+    }
+
+    /// Its name in tools and slash commands (`publish`).
+    pub fn name(self) -> &'static str {
+        self.row().map_or("", |r| r.name)
+    }
+
+    /// What it covers, in words for the builder.
+    pub fn what(self) -> &'static str {
+        self.row().map_or("", |r| r.what)
+    }
+
+    /// The kind named `name`, in any case.
+    pub fn named(name: &str) -> Option<ActionKind> {
+        ACTION_KINDS.iter().find(|r| r.name.eq_ignore_ascii_case(name)).map(|r| r.kind)
+    }
+
+    /// What it gets when the project hasn't chosen.
+    pub fn default_in(self, auto_mode: bool) -> Approval {
+        self.row().map_or(Approval::Ask, |r| if auto_mode { r.auto } else { r.manual })
+    }
+}
+
+impl Approval {
+    /// How much it holds back: allow, then ask, then refuse.
+    pub fn strictness(self) -> u8 {
+        match self {
+            Approval::Allow => 0,
+            Approval::Ask => 1,
+            Approval::Refuse => 2,
+        }
+    }
+}
+
+impl Manifest {
+    /// What an action of `kind` gets in this project.
+    pub fn approval(&self, kind: ActionKind, auto_mode: bool) -> Approval {
+        self.approvals.get(&kind).copied().unwrap_or_else(|| kind.default_in(auto_mode))
+    }
 }
 
 /// What the files already in a picked folder are to a new project.
