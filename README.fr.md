@@ -14,7 +14,7 @@
 <h1 align="center">Craft Anything</h1>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.ja.md">日本語</a> · <a href="README.zh.md">简体中文</a> · <a href="README.ko.md">한국어</a> · <b>Français</b>
+  <a href="README.md">English</a> · <a href="README.ja.md">日本語</a> · <a href="README.zh.md">简体中文</a> · <a href="README.zh-hant.md">繁體中文</a> · <a href="README.ko.md">한국어</a> · <a href="README.es.md">Español</a> · <b>Français</b>
 </p>
 
 <p align="center">
@@ -263,7 +263,7 @@ installer des paquets npm sans leurs scripts d’installation, exécutez `npm in
 
 ## <a id="downloads"></a>Téléchargements
 
-Sur GitHub, la [dernière release](https://github.com/storytold/craft-anything/releases/latest) contient chaque build listé ci-dessous, et [toutes les releases](https://github.com/storytold/craft-anything/releases) contient les versions antérieures et leurs notes. `<ver>` dans les noms de fichiers est le numéro de version, et `SHA256SUMS.txt` liste une somme de contrôle pour chaque fichier.
+Sur GitHub, la [dernière release](https://github.com/storytold/craft-anything/releases/latest) contient chaque build listé ci-dessous, et [toutes les releases](https://github.com/storytold/craft-anything/releases) contiennent les versions antérieures et leurs notes. `<ver>` dans les noms de fichiers est le numéro de version, et `SHA256SUMS.txt` liste une somme de contrôle pour chaque fichier.
 
 ### <a id="windows"></a>Windows
 
