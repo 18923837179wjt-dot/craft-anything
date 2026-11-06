@@ -861,6 +861,8 @@ Owner: open · Status: in progress
       bundle end for front-positioned tables, so bytes outside the data region cannot supply block contents.
 - [x] Reject Unity serialized objects outside their declared file.
       — claimed: Afloat16, branch bugfix/r3.12-unity-serialized-object-ranges-20261105
+- [x] Preserve compression method slots in Unreal pak indexes.
+      — claimed: Afloat16, branch bugfix/r3.12-unreal-pak-compression-slots-20261105
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
       area and reject unrepresentable widths, base64 (plists, source maps) refuses damaged tails
       and incomplete quanta through one shared decoder, OIDs must be minimally encoded, and string

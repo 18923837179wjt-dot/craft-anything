@@ -35,6 +35,7 @@ pub struct Footer {
     /// The key's GUID (all zero when the default key, or none, is used), from version 7.
     pub encryption_key_guid: Option<String>,
     /// Compression method names by index (index 0 means "none"; these are 1, 2, …), from version 8.
+    /// Empty slots before a later name stay in place; unused trailing slots are omitted.
     pub compression_methods: Vec<String>,
     /// How many method name slots the footer has: 4 in the first version-8 paks (Unreal 4.22),
     /// whose entries store the method index in one byte, else 5.
@@ -170,6 +171,7 @@ pub fn footer(tail: &[u8], file_len: u64) -> Result<Footer, FormatError> {
                 method_slots += 1;
                 let name = String::from_utf8_lossy(name).trim_end_matches('\0').to_string();
                 if !name.is_empty() {
+                    compression_methods.resize_with(method_slots - 1, String::new);
                     compression_methods.push(name);
                 }
             }
@@ -199,7 +201,7 @@ fn record_size(footer: &Footer, compressed: bool, blocks: usize) -> u64 {
 fn method_name(footer: &Footer, index: u32) -> String {
     match index {
         0 => "none".into(),
-        n => footer.compression_methods.get(n as usize - 1).cloned().unwrap_or_else(|| format!("method {n}")),
+        n => footer.compression_methods.get(n as usize - 1).filter(|name| !name.is_empty()).cloned().unwrap_or_else(|| format!("method {n}")),
     }
 }
 
