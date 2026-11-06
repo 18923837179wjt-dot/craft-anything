@@ -102,13 +102,30 @@ the engines its settings or store name.
 `a`, so `b`'s tests never ran; the rerun was filtered to the failing test, and a broken engine id
 reached `main`. Run with `--no-fail-fast`, and after a fix rerun the whole crates, not a filter.
 
+**A stopped server's port was no longer its identity.** A shutdown test connected to the old
+port and treated any listener there as the stopped server, although another fixture could reuse it.
+Observe the actual tool's registered server and a weak reference to its shared answerer; cancellation
+must release that resource and empty its registry. Do not reserve and release a port before startup.
+
 **A test that changes the whole process.** A UI test raised the process-wide stuck-lock banner; in
 CI the banner moved the layout under another test running beside it, and its click missed. It passed
 25 runs on a Mac. Anything a test sets for the whole process goes in a test program of its own.
 
+**A free port handed to another test.** For a negative TCP probe, a bound port stopped being
+ours as soon as its listener was dropped. Another fixture could acquire it before the probe.
+Use the unassigned loopback port zero to exercise a real connection refusal without borrowing
+and releasing a shared ephemeral port.
+
 **Fixtures that leak into each other.** A "nothing here" path sat beside a fake game folder in the
 same temp directory, and game detection walked up and found the game. Give each case its own
 `tempfile::tempdir()`.
+
+**A mock server closed on a partial request.** A loopback fixture read a request only once, then
+replied and closed. TCP can split even a short header; unread bytes made that close reset the
+connection. Consume the complete header before replying, with a size cap and an absolute deadline.
+Negative probes use loopback port zero so another fixture cannot acquire a released port.
+A controlled fragmented request reproduced the fixture defect; the old CI log did not preserve
+the probe's underlying error, so it does not establish that failure's cause.
 
 **A script written and run at once.** Tests that write a stand-in program and start it failed now
 and then on Linux with "Text file busy": another test thread was starting a child at that moment,
@@ -297,6 +314,10 @@ Node directly (`which::launch_target`); test a new program on Windows with a mul
 npm also writes an extensionless POSIX script beside each shim, and `which` returned that first,
 so OpenCode was offered and then every run said it wasn't installed (#41): look up the kinds
 Windows can start (`PATHEXT`) before the bare name.
+And when the shim's Node couldn't be found (nvm for Windows with no version in use, so its
+`C:\Program Files\nodejs` link was gone), we fell back to the `.cmd`, and Rust refused the
+multi-line prompt: "batch file arguments are invalid", which named neither Node nor nvm. Search
+nvm's version folders too, and when a shim's interpreter is missing, say so (`interpreter_missing`).
 
 **A first analysis that waited for a lock it could never take.** Ghidra's analysis lock is created
 with `create_new` in `ghidra-cache/`, which only existed on machines that had used it before; on a
@@ -420,6 +441,13 @@ builder preflight still checked ACP's helper and the native adapter never suppli
 Share transport selection between preflight and execution; reject unsupported native options
 before running a process rather than starting an agent without the tools its task requires.
 
+**A config route the installed version ignores.** OpenCode V2 (2.2.5) ignores
+`OPENCODE_CONFIG_CONTENT`, and `opencode run` hands the turn to a background service that never sees the
+run's environment, so the builder ran without our tools and fell back to calling the CLI from a shell.
+V2 also names a tool call `id` (V1: `callID`), so every tool event was dropped and the feed stayed empty
+for the whole turn. Use a file in `OPENCODE_CONFIG` with `run --standalone`, and confirm a live run
+reached the server (`mcp connected server=craft-anything` in OpenCode's log), not just that it started.
+
 **Keywords that only some code paths honour.** "…in Rust" picked Rust for apps but not for games, so
 a headless game rebuild stopped at once for want of Unity. It was found only by a live run. Run the
 real flow end to end after changing how requests are read, and add the case as a test.
@@ -454,6 +482,8 @@ The agent console's panel grows to fit its content, so it grew 17 points every f
 maximum, and then the top of its tabs was cut off. When a part is sized to fill what's left, count
 the item spacing and use `horizontal_top` for tall rows, and test that the panel's size holds still
 over several frames.
+Its first frame had no measure yet and guessed 48 points for a box of 84 or more, so the panel grew
+on that frame, and egui saved the larger size (#942). Where a panel grows to fit, guess too tall.
 
 **A library default that blinked over a text field.** egui's scroll areas fade their edge when
 there's more below; the prompt box's one measured a few points of overflow on the frame after each
