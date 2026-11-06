@@ -654,6 +654,10 @@ Owner: open · Status: in progress
       and hold it only to what it broke
 - [ ] A new project in Python, Go or the like still fails the build check ("No project to build
       found") and has no program for the screenshot check: `[[toolchain]]` could build it too
+- [x] "player" alone doesn't make a request a game: a video or music player is an app (#953)
+      — claimed: justinjohn0306, branch bugfix/953-player-not-a-game
+- [ ] Game words can't tell these apart from games: "a low level disk tool", "an MPEG 2 player",
+      "a single player app for movies". Telling them apart needs more than a list of words
 
 ### R2.8 Clean room means clean room
 Owner: maintainers · Status: in progress
@@ -759,6 +763,8 @@ Gaps found while using the app for real projects.
       — claimed: sanketdofe, branch feature/r2.9-macos-menu-bar
 - [ ] macOS: an Edit menu (Undo, Cut, Copy, Paste, Select All). The keys work in text boxes, but
       the system's Edit items need the text box to answer them, so they'd show greyed out today
+- [x] The Advanced console's prompt box starts tall enough to read what's typed (#942)
+      — claimed: justinjohn0306, branch bugfix/942-console-input-height
 
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress
