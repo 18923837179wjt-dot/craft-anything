@@ -832,6 +832,8 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-dns-question-class-review-20261104
 - [x] Reject impossible IPv4 header and total lengths.
       — claimed: Afloat16, branch bugfix/r3.12-ipv4-header-lengths-20261105
+- [x] Validate the version in IPv6 frames.
+      — claimed: Afloat16, branch bugfix/r3.12-ipv6-version-20261105
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
       area and reject unrepresentable widths, base64 (plists, source maps) refuses damaged tails
       and incomplete quanta through one shared decoder, OIDs must be minimally encoded, and string

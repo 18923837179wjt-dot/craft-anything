@@ -535,7 +535,12 @@ pub fn decode(link_type: u32, data: &[u8]) -> Decoded {
         }
         12 | 14 | 101 | 228 | 229 => {
             d.protocols.push("raw");
-            (r.u8(0).map(|b| if b >> 4 == 6 { 0x86dd } else { 0x0800 }), 0)
+            let ethertype = match link_type {
+                228 => Some(0x0800),
+                229 => Some(0x86dd),
+                _ => r.u8(0).map(|b| if b >> 4 == 6 { 0x86dd } else { 0x0800 }),
+            };
+            (ethertype, 0)
         }
         _ => {
             d.note = Some(format!("link type {link_type} ({}) is not decoded", link_name(link_type)));
@@ -595,6 +600,10 @@ fn ipv6(p: &[u8], d: &mut Decoded) {
         d.note = Some("IPv6 header cut short".into());
         return;
     };
+    if r.u8(0).is_none_or(|version| version >> 4 != 6) {
+        d.note = Some("not a valid IPv6 header".into());
+        return;
+    }
     d.protocols.push("ipv6");
     let ip6 = |b: &[u8]| IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(b).unwrap_or([0; 16])));
     let end = (40 + usize::from(plen)).min(p.len());
