@@ -255,3 +255,36 @@ fn comment_candidates_cannot_spend_the_genuine_directory_budget_repeatedly() {
     assert!(candidates * (usize::from(count) + 1) > apk.len() / 46 + 22 + usize::from(u16::MAX));
     assert_eq!(apk_sign::parse(&apk).expect("comment candidates must reuse directory boundaries"), original);
 }
+
+#[test]
+fn framed_comment_candidates_reuse_signer_probes_before_the_genuine_eocd() {
+    const CANDIDATES: usize = 300;
+    let mut apk = notes_apk();
+    let original = apk_sign::parse(&apk).unwrap();
+    assert_eq!(original.signers.len(), 2);
+    let shared_start = apk.len();
+
+    // Put a readable signer last: its sequence contains one signer with an empty signed-data field.
+    let mut pairs = vec![(0x1357_2468, Vec::new()); 255];
+    pairs.push((apk_sign::V2_ID, vec![8, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0]));
+    let block = block_with_pairs(&pairs);
+    apk.extend_from_slice(&block[..block.len() - 24]);
+    for index in 0..CANDIDATES {
+        // Each footer points back to the same 256 physical pairs. Its empty directory meets
+        // its EOCD exactly; the remaining footer/EOCD pairs constitute its ZIP comment.
+        let size = (apk.len() - shared_start + 16) as u64;
+        apk.extend_from_slice(&size.to_le_bytes());
+        apk.extend_from_slice(b"APK Sig Block 42");
+        let directory = apk.len();
+        apk.extend_from_slice(&empty_eocd(directory, (CANDIDATES - index - 1) * (24 + 22)));
+    }
+    let comment_len = u16::try_from(apk.len() - shared_start).unwrap();
+    apk[shared_start - 2..shared_start].copy_from_slice(&comment_len.to_le_bytes());
+    assert!(CANDIDATES * pairs.len() > apk.len() / 46 + 22 + usize::from(u16::MAX));
+
+    let found = apk_sign::parse(&apk).expect("repeated probes must leave enough work to read the genuine block");
+    assert_eq!((found.offset, found.size), (original.offset, original.size));
+    assert_eq!(found.signers, original.signers);
+    // The warning proves a comment candidate reached a readable signer, rather than failing directory framing.
+    assert!(found.warnings.iter().any(|warning| warning.contains("signing metadata is ambiguous")));
+}
