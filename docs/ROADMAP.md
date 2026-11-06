@@ -853,6 +853,11 @@ Owner: open · Status: in progress
       Shared-budget revision `29c48e03` passed [full Linux CI](https://github.com/storytold/craft-anything/actions/runs/41762780268).
       The merge with main `41d2175e` awaits a new CI run.
 
+- [x] Keep DNS answer names inside their declared RDATA, including compressed names and MX
+      exchanges, and report malformed records as incomplete instead of inventing answer values,
+      while preserving legal empty DNS UPDATE RRset prerequisites
+      — claimed: Afloat16, branch bugfix/r3.12-dns-rdata-names-review-20261104
+
 ### R3.13 Web inspection correctness
 Owner: open · Status: in progress
 - [x] The HTML scanner finds script preloads in `rel` token lists, decodes asset URLs once (numeric
