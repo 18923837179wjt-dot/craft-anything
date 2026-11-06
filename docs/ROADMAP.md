@@ -879,6 +879,8 @@ Owner: open · Status: in progress
       — claimed: Afloat16, branch bugfix/r3.12-apk-sign-eocd-comment-boundary-20261105
 - [x] Keep Mach-O load-command facts within their command.
       — claimed: Afloat16, branch bugfix/r3.12-macho-load-command-framing-20261105
+- [x] Keep Mach-O function starts within their declared payload.
+      — claimed: Afloat16, branch bugfix/r3.12-macho-function-starts-payload-boundary-20261105
 - [x] Parsers refuse what they used to half-read: binary plists keep objects inside their object
       area and reject unrepresentable widths, base64 (plists, source maps) refuses damaged tails
       and incomplete quanta through one shared decoder, OIDs must be minimally encoded, and string
