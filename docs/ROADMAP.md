@@ -296,6 +296,9 @@ been run live.
       tool, with only words before or between them, now runs them all (`fenced_calls`, ids
       `react_N` as other text calls); words after the last fence, other code, an unclosed fence or
       a tool that wasn't offered keep it text (#753)
+- [ ] A call followed by a summary isn't run, and the model isn't told: in a second live run of
+      #417's case both turns put "### Summary:" after their one `json` fence, nothing ran, and the
+      build stopped after two turns with no files. Say in the next message that it wasn't run
 - [ ] A local builder spends its rounds on the project file and never writes the app: run 4 had a
       compiling `Cargo.toml` by check 3, its last, with `main.rs` still "Hello, world!". See whether
       more rounds get there, or whether a small model needs the window and the `--screenshot`
@@ -315,6 +318,20 @@ been run live.
       `TurnDone` left them out while coding agents count them. It counts them now; a live run on
       Ollama 0.40.7 had recorded 5,323 input tokens of 75,014
       — claimed: SoldierPePe, branch bugfix/r5.4-usage-cached-tokens
+- [ ] Told that its `cargo new app` made `app/app/`, the model kept editing `app/app/Cargo.toml`
+      and running `cargo build` in `app/`, and checks 2 and 3 still found the project one folder
+      down (live, GPU). See whether naming the move gets it out, or whether the run should move it
+- [x] The model reads file paths from the project folder and commands from `app/` as one base:
+      it ran `cargo init app` and `cd app && cargo build` after writing `app/Cargo.toml`.
+      `build_command_run`'s result now says where it ran (`ran_in`), a command that makes a project
+      in `app/app/` is told it goes in `app/` itself, and one that starts with `cd app` where
+      there's none is told to leave it out. Live (Ollama, `qwen2.5-coder:14b`) the first command
+      was still `cargo new app`, before any result could say so. On a GPU (Ollama 0.40.7) the note
+      then reached the model; on the CPU a second run wrote the call with a summary after it, so
+      nothing ran (the open line on a call followed by a summary)
+      — claimed: SoldierPePe, branch bugfix/r5.4-build-command-folder
+- [ ] `usage.json` after a local build says about 4,200 input tokens and 6.5 s of work, while
+      Ollama logged about six requests of 4,000-5,000 tokens each: find what it leaves out
 - [x] An assistant turn with no text sends an empty string, not `content: null`, which Ollama
       refused as `invalid message content type: <nil>` (#403, #536)
 - [x] Understand a tool call a model writes as JSON in its text (#417; implementation `dfe9a4db2dcb3e27edbd67311cbb4202584e7af6`). The fallback protocol reads
