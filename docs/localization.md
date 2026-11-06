@@ -4,6 +4,9 @@ The desktop app offers **Čeština** (`cs`), **Deutsch** (`de`), **ქართ�
 and **繁體中文** (`zh-hant`), alongside English, French and Japanese, in **Settings → General → Language**. The choice is saved in the
 The desktop app offers **Čeština** (`cs`), **Deutsch** (`de`), **Español** (`es`), **한국어** (`ko`), **Русский** (`ru`),
 **简体中文** (`zh-hans`) and **繁體中文** (`zh-hant`), alongside English, French and Japanese, in **Settings → General → Language**. The choice is saved in the
+The desktop app offers **Čeština** (`cs`), **Deutsch** (`de`), **Français** (`fr`), **Italiano** (`it`), **日本語** (`ja`),
+**한국어** (`ko`), **Русский** (`ru`), **简体中文** (`zh-hans`) and **繁體中文** (`zh-hant`), alongside English, in
+**Settings → General → Language**. The choice is saved in the
 existing `language` setting. **System** uses the operating system's preferred
 supported language; if none matches, it uses English. An explicit choice takes
 precedence over the system language.
@@ -29,6 +32,14 @@ so a translated suggestion keeps its project kind.
 `crates/ui-egui/src/i18n/ka.tsv` has the same keys as the other catalogs. Written with Claude Code from the
 meaning of each English string; terminology and doubtful strings decided by a native Georgian speaker (@devius).
 Glyphs come from Noto Sans Georgian in craft-fonts, which the pinned craft-fonts already has; a test checks it.
+## Italian
+
+**Italiano** (`it`) uses the informal "tu". `it` and `it-IT` select it, as does the system language when it is
+Italian. `crates/ui-egui/src/i18n/it.tsv` has the same keys as the other catalogs, written from the English
+source strings. It was drafted with an AI and not yet reviewed by a native speaker; corrections are welcome.
+Product and technology names, tool ids and shortcuts keep their spelling. The kind detection that reads a
+request also knows *gioco* and *sito*, so a translated suggestion keeps its project kind. Clean room is
+*Camera bianca* and Deep mode is *modalità Approfondita*.
 
 ## Scope and format
 

@@ -157,6 +157,7 @@ impl TargetKind for WebsiteKind {
             " sitio web",
             " página web",
             " pagina web",
+            " sito ",
             "网站",
             "網站",
             "网页",

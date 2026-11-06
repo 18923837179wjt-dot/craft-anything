@@ -103,6 +103,16 @@ fn the_word_player_alone_is_not_a_game() {
 }
 
 #[test]
+fn italian_requests_keep_their_project_kind() {
+    for request in ["Un semplice gioco del serpente", "Per esempio: lo stesso gioco, con una classifica", "Fai un gioco che si gioca così"] {
+        assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
+    }
+    for request in ["Un sito per la mia panetteria", "Ricostruisci questo sito", "Per esempio: ricostruisci questo sito"] {
+        assert_eq!(choose(request, &TargetRef::None), ("website", stacks::BUILDERS_CHOICE), "{request}");
+    }
+}
+
+#[test]
 fn german_requests_keep_their_project_kind() {
     for request in ["Ein einfaches Snake-Spiel", "Dasselbe Spiel mit einer Bestenliste"] {
         assert_eq!(choose(request, &TargetRef::None), ("game", "Unity"), "{request}");
