@@ -817,6 +817,11 @@ Gaps found while using the app for real projects.
       — claimed: tanish2k09, branch feature/r2.9-project-approvals
 - [ ] Agents that don't ask our approval tool (OpenCode `--auto`, Hermes `-z`, Maki's `-p`) aren't
       held to a project's approval choices either; part of R2.2's approval decision
+- [ ] While "commands" are allowed (Auto mode's default), a builder can run any program. Commands
+      that name `craft.json`, the inbox or the approvals tool count as system changes, and our CLI
+      started inside an agent calls tools as an agent, but a script that builds the path, or
+      unsets `CRAFT_ANYTHING_AGENT`, isn't caught. Keep the person's choices where a builder's
+      shell can't write them, or say plainly that "commands: allow" trusts the builder
 - [ ] A typed note ("yes, push it") still reaches the builder only as text: say in the card's
       place, when the builder is refused, how the person can allow that kind
 - [ ] The project page and a slash command change those choices (like `/btw`)

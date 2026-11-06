@@ -1621,6 +1621,41 @@ mod tests {
     }
 
     #[test]
+    fn approval_choices_survive_an_old_manifest_a_stale_save_and_a_copy() {
+        // A version-2 craft.json (before approvals) opens with none chosen and is saved as version 3.
+        let dir = tempfile::tempdir().unwrap();
+        let v2 = MANIFEST_V0.replacen('{', r#"{ "version": 2,"#, 1);
+        std::fs::write(dir.path().join(MANIFEST), &v2).unwrap();
+        let mut run = Workspace::open(dir.path()).unwrap();
+        assert_eq!((run.manifest.version, run.manifest.approvals.is_empty(), run.is_read_only()), (3, true, false));
+        run.save().unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST)).unwrap()).unwrap();
+        assert_eq!(saved["version"], 3);
+        assert!(saved.get("approvals").is_none(), "nothing chosen, nothing written");
+        // The person chooses while a run holds an older copy; the run's save keeps the choice.
+        Workspace::open(dir.path())
+            .unwrap()
+            .set_person(|m| {
+                m.approvals.insert(ActionKind::Publish, Approval::Ask);
+                m.approvals.insert(ActionKind::Commands, Approval::Refuse);
+            })
+            .unwrap();
+        run.manifest.note = "Building".into();
+        run.save().unwrap();
+        let disk = Workspace::open(dir.path()).unwrap().manifest;
+        assert_eq!(disk.approvals.get(&ActionKind::Publish), Some(&Approval::Ask));
+        assert_eq!(disk.approval(ActionKind::Commands, true), Approval::Refuse);
+        let saved: Value = serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST)).unwrap()).unwrap();
+        assert_eq!(saved["approvals"], serde_json::json!({"commands": "refuse", "publish": "ask"}));
+        // A copy keeps them.
+        let copy = Workspace::open(dir.path()).unwrap().duplicate("Example copy").unwrap();
+        assert_eq!(Workspace::open(&copy.root).unwrap().manifest.approvals, disk.approvals);
+        // An unknown kind isn't read as something else.
+        let unknown = MANIFEST_V0.replacen('{', r#"{ "version": 3, "approvals": {"everything": "allow"},"#, 1);
+        assert!(read_manifest(unknown.as_bytes()).is_err());
+    }
+
+    #[test]
     fn newer_manifests_open_read_only_and_are_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let newer = MANIFEST_V0.replacen('{', r#"{ "version": 99, "a_field_from_the_future": [1, 2],"#, 1);

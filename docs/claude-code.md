@@ -29,7 +29,9 @@ integration does, why it is shaped this way, and what remains to confirm.
   refuse per kind (`project_approvals_set`), and an unchosen kind follows Auto mode. Asking shows
   a card in the app ("Allow once / Always for this project / Don't allow"); "Always" on a push,
   delete or system change allows that whole kind for the project. A builder's own call to
-  `project_approvals_set` can only make a kind stricter.
+  `project_approvals_set` can only make a kind stricter, also through `craft-anything-cli` run
+  from its shell (agents we start have `CRAFT_ANYTHING_AGENT` set), and a command that names
+  `craft.json`, the inbox or the approvals tool counts as a system change.
 - Questions: Claude Code's own question tool is disabled for these runs (`--disallowedTools
   AskUserQuestion`); the agent uses our `core_person_ask` tool, which shows a card with buttons.
 - Before a build starts, `claude auth status` is checked. If Claude Code isn't signed in, the run

@@ -578,7 +578,7 @@ pub fn kind_of(ws: Option<&Workspace>, tool: &str, input: &Value) -> ActionKind 
             let c = command.to_ascii_lowercase();
             if publishes(&c) {
                 ActionKind::Publish
-            } else if SYSTEM_COMMANDS.iter().any(|k| c.contains(k)) {
+            } else if SYSTEM_COMMANDS.iter().any(|k| c.contains(k)) || names_records(&c, ws) {
                 ActionKind::System
             // Paths keep their case: on a Mac or Linux `/Users/x` isn't `/users/x`.
             } else if DELETES.iter().any(|k| c.contains(k)) && deletes_outside(&command, ws) {
@@ -633,6 +633,14 @@ fn publishes(c: &str) -> bool {
         let words: Vec<&str> = part.split_whitespace().map(|w| w.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '$'))).filter(|w| !w.is_empty()).collect();
         words.iter().enumerate().any(|(i, w)| publishes_with(program_name(w), words.get(i + 1..).unwrap_or_default()))
     })
+}
+
+/// Whether a lower-cased command names what a builder mustn't change from the shell either: the
+/// project's manifest (where its approvals are kept), its inbox (where answers are written), or the
+/// tool that sets approvals (`craft-anything-cli` can call it). A command that reaches them without
+/// naming them (a script that builds the path) isn't caught here.
+fn names_records(c: &str, ws: Option<&Workspace>) -> bool {
+    c.contains("craft.json") || c.contains("approvals_set") || c.contains("approvals-set") || ws.is_some_and(|w| mentions(c, &w.inbox_dir()))
 }
 
 /// A program's name as typed, without its folder or a Windows extension (`/usr/bin/npm`, `npm.cmd`).
@@ -1129,6 +1137,24 @@ mod tests {
         assert!(matches!(outcome(Some(&w), true, "Bash", &cmd), Outcome::Refuse(_)));
         w.manifest.approvals.insert(ActionKind::Commands, Approval::Ask);
         assert_eq!(outcome(Some(&w), true, "Bash", &cmd), Outcome::Allow);
+    }
+
+    #[test]
+    fn a_shell_command_that_names_the_projects_records_is_a_system_change() {
+        // Commands are allowed in Auto mode; these would let a builder loosen its own approvals.
+        let (_d, w) = ws();
+        let inbox = w.inbox_dir().display().to_string();
+        for cmd in [
+            "craft-anything-cli call project_approvals_set --project . --kind publish --mode allow",
+            "craft-anything-cli project-approvals-set --kind publish --mode allow",
+            "python -c \"import json; d=json.load(open('craft.json'))\"",
+            "echo '{}' > ../craft.json",
+            &format!("echo yes > \"{inbox}/1.answer.json\""),
+        ] {
+            assert_eq!(kind_of(Some(&w), "Bash", &json!({"command": cmd})), ActionKind::System, "{cmd}");
+            assert!(matches!(outcome(Some(&w), true, "Bash", &json!({"command": cmd})), Outcome::Refuse(_)), "{cmd}");
+        }
+        assert_eq!(kind_of(Some(&w), "Bash", &json!({"command": "cat package.json"})), ActionKind::Commands);
     }
 
     #[test]
