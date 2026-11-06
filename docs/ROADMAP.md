@@ -767,6 +767,9 @@ Gaps found while using the app for real projects.
       Simple / Advanced, Clean room / Deep, the command palette, help); the system's menu bar
       showed only the app menu
       — claimed: sanketdofe, branch feature/r2.9-macos-menu-bar
+- [x] A Traditional Chinese README (`README.zh-hant.md`) translated from `README.md` and linked
+      from the language switcher in every README
+      — claimed: monarchsofchaos004-gif, branch docs/readme-zh-hant; PR #926
 - [ ] macOS: an Edit menu (Undo, Cut, Copy, Paste, Select All). The keys work in text boxes, but
       the system's Edit items need the text box to answer them, so they'd show greyed out today
 - [x] The Advanced console's prompt box starts tall enough to read what's typed (#942)
