@@ -4,10 +4,14 @@
 
 use crate::bytes::Reader;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 const MAGIC: &[u8; 16] = b"APK Sig Block 42";
 const EOCD_SEARCH: usize = 22 + 0xffff;
 const CD_HEADER_LEN: usize = 46;
+// Enough boundaries for a full classic ZIP directory plus the search window's allowance.
+// Keep cache allocation independent of the input payload size, including each directory's start.
+const MAX_DIRECTORY_BOUNDARIES: usize = EOCD_SEARCH + u16::MAX as usize;
 const MAX_PAIRS: usize = 256;
 const MAX_ITEMS: usize = 64;
 /// Most certificate bytes kept per certificate.
@@ -107,32 +111,84 @@ fn signing_block_extent(r: &Reader<'_>, cd: usize) -> Option<(usize, u64)> {
     Some((cd.checked_sub(total)?, size))
 }
 
-/// `None` means the scan-wide record budget ran out; `Some(false)` means bad framing.
-fn framed_directory(directory: &[u8], count: u16, records_left: &mut usize) -> Option<bool> {
-    if usize::from(count) > directory.len() / CD_HEADER_LEN {
-        return Some(false);
+#[derive(Default)]
+struct DirectoryPrefix {
+    boundaries: Vec<usize>,
+    stopped: bool,
+}
+
+impl DirectoryPrefix {
+    fn push(&mut self, boundary: usize, capacity_left: &mut usize) -> Option<()> {
+        if self.boundaries.len() == self.boundaries.capacity() {
+            let additional = self.boundaries.capacity().max(1).min(*capacity_left);
+            if additional == 0 {
+                return None;
+            }
+            let before = self.boundaries.capacity();
+            self.boundaries.try_reserve_exact(additional).ok()?;
+            *capacity_left = capacity_left.checked_sub(self.boundaries.capacity().checked_sub(before)?)?;
+        }
+        self.boundaries.push(boundary);
+        Some(())
     }
-    let r = Reader::new(directory);
-    let mut pos = 0usize;
-    for _ in 0..count {
-        *records_left = records_left.checked_sub(1)?;
-        let Some(header) = r.slice(pos, CD_HEADER_LEN).map(Reader::new) else { return Some(false) };
-        if header.slice(0, 4) != Some(b"PK\x01\x02") {
+}
+
+struct DirectoryCache {
+    prefixes: BTreeMap<usize, DirectoryPrefix>,
+    capacity_left: usize,
+}
+
+impl DirectoryCache {
+    fn new() -> Self {
+        Self { prefixes: BTreeMap::new(), capacity_left: MAX_DIRECTORY_BOUNDARIES }
+    }
+
+    /// `None` means a scan-wide work or cache limit ran out; `Some(false)` means bad framing.
+    fn framed(&mut self, r: &Reader<'_>, cd: usize, size: usize, count: u16, records_left: &mut usize) -> Option<bool> {
+        if usize::from(count) > size / CD_HEADER_LEN {
             return Some(false);
         }
-        let Some(len) = [28, 30, 32].into_iter().try_fold(CD_HEADER_LEN, |len, field| len.checked_add(usize::from(header.u16_le(field)?))) else {
+        let Some(end) = cd.checked_add(size) else { return Some(false) };
+        if r.slice(cd, size).is_none() {
             return Some(false);
-        };
-        let Some(next) = pos.checked_add(len).filter(|next| *next <= directory.len()) else { return Some(false) };
-        pos = next;
+        }
+        let prefix = self.prefixes.entry(cd).or_default();
+        if prefix.boundaries.is_empty() {
+            prefix.push(cd, &mut self.capacity_left)?;
+        }
+        // Only new header visits consume work. Inspect the immutable input, not this candidate's
+        // declared size: a short candidate must not poison a later request for a longer prefix.
+        while prefix.boundaries.len() <= usize::from(count) && !prefix.stopped {
+            let pos = *prefix.boundaries.last()?;
+            if pos >= end {
+                return Some(false);
+            }
+            *records_left = records_left.checked_sub(1)?;
+            if let Some(next) = directory_record_end(r, pos) {
+                prefix.push(next, &mut self.capacity_left)?;
+            } else {
+                prefix.stopped = true;
+            }
+        }
+        let Some(pos) = prefix.boundaries.get(usize::from(count)).copied().filter(|pos| *pos <= end) else { return Some(false) };
+        if pos == end {
+            return Some(true);
+        }
+        // The candidate's exact size still permits only one optional digital-signature record.
+        let Some(tail) = r.slice(pos, end - pos) else { return Some(false) };
+        let tail_reader = Reader::new(tail);
+        Some(tail_reader.slice(0, 4) == Some(b"PK\x05\x05") && tail_reader.u16_le(4).is_some_and(|len| usize::from(len).checked_add(6) == Some(tail.len())))
     }
-    if pos == directory.len() {
-        return Some(true);
+}
+
+fn directory_record_end(r: &Reader<'_>, pos: usize) -> Option<usize> {
+    let header = Reader::new(r.slice(pos, CD_HEADER_LEN)?);
+    if header.slice(0, 4) != Some(b"PK\x01\x02") {
+        return None;
     }
-    // Classic ZIP permits one digital-signature record after the directory's file headers.
-    let Some(tail) = directory.get(pos..) else { return Some(false) };
-    let tail_reader = Reader::new(tail);
-    Some(tail_reader.slice(0, 4) == Some(b"PK\x05\x05") && tail_reader.u16_le(4).is_some_and(|len| usize::from(len).checked_add(6) == Some(tail.len())))
+    let len = [28, 30, 32].into_iter().try_fold(CD_HEADER_LEN, |len, field| len.checked_add(usize::from(header.u16_le(field)?)))?;
+    r.slice(pos, len)?;
+    pos.checked_add(len)
 }
 
 struct EocdCandidate {
@@ -157,6 +213,7 @@ fn find_eocd_with_budget(data: &[u8], mut records_left: usize) -> Option<EocdCan
     // candidates, retain the lowest offset and report distinct readable blocks as ambiguous.
     let mut found: Option<EocdCandidate> = None;
     let mut ambiguous = false;
+    let mut directories = DirectoryCache::new();
     loop {
         if let Some(end) = r.slice(i, 22).map(Reader::new)
             && end.slice(0, 4) == Some(b"PK\x05\x06")
@@ -166,8 +223,7 @@ fn find_eocd_with_budget(data: &[u8], mut records_left: usize) -> Option<EocdCan
             && cd.checked_add(size) == Some(i)
             && let Some((start, _)) = signing_block_extent(&r, cd)
             && let Some(count) = end.u16_le(10)
-            && let Some(directory) = r.slice(cd, size)
-            && framed_directory(directory, count, &mut records_left)?
+            && directories.framed(&r, cd, size, count, &mut records_left)?
         {
             let has_signer = has_readable_signer(&r, start, cd, &mut records_left)?;
             if let Some(previous) = &found {
@@ -376,15 +432,75 @@ mod tests {
     use craft_anything_testkit::android as fx;
 
     #[test]
-    fn directory_checks_share_the_record_budget() {
+    fn directory_candidates_reuse_scanned_headers() {
+        let mut zip = craft_anything_testkit::electron::zip_stored(&[("a", b"a"), ("b", b"b")]);
+        let eocd = zip.len() - 22;
+        let cd = Reader::new(&zip).u32_le(eocd + 16).unwrap() as usize;
+        zip.extend_from_slice(&[0; CD_HEADER_LEN]);
+        let r = Reader::new(&zip);
+        let mut cache = DirectoryCache::new();
+        let mut records_left = 3;
+        assert_eq!(cache.framed(&r, cd, eocd - cd, 1, &mut records_left), Some(false));
+        assert_eq!(records_left, 2);
+        assert_eq!(cache.framed(&r, cd, eocd - cd, 2, &mut records_left), Some(true));
+        assert_eq!(records_left, 1);
+        assert_eq!(cache.framed(&r, cd, zip.len() - cd, 3, &mut records_left), Some(false));
+        assert_eq!(records_left, 0);
+        assert_eq!(cache.framed(&r, cd, zip.len() - cd, 3, &mut records_left), Some(false));
+        assert_eq!(cache.framed(&r, cd, eocd - cd, 2, &mut records_left), Some(true));
+        assert_eq!(records_left, 0);
+    }
+
+    #[test]
+    fn directory_cache_keeps_sizes_and_offsets_separate() {
+        let zip = craft_anything_testkit::electron::zip_stored(&[("a", b"a"), ("b", b"b")]);
+        let r = Reader::new(&zip);
+        let cd = r.u32_le(zip.len() - 6).unwrap() as usize;
+        let record_len = CD_HEADER_LEN + 1;
+        let mut cache = DirectoryCache::new();
+        let mut records_left = 1;
+        assert_eq!(cache.framed(&r, cd, CD_HEADER_LEN, 1, &mut records_left), Some(false));
+        assert_eq!(records_left, 0);
+        assert_eq!(cache.framed(&r, cd, record_len, 1, &mut records_left), Some(true));
+        assert_eq!(cache.framed(&r, cd + record_len, record_len, 1, &mut records_left), None);
+        records_left = 1;
+        assert_eq!(cache.framed(&r, cd + record_len, record_len, 1, &mut records_left), Some(true));
+        assert_eq!(records_left, 0);
+    }
+
+    #[test]
+    fn directory_cache_rechecks_optional_signature_tails() {
         let zip = craft_anything_testkit::electron::zip_stored(&[("a", b"a"), ("b", b"b")]);
         let eocd = zip.len() - 22;
         let cd = Reader::new(&zip).u32_le(eocd + 16).unwrap() as usize;
-        let directory = &zip[cd..eocd];
-        let mut records_left = 3;
-        assert_eq!(framed_directory(directory, 2, &mut records_left), Some(true));
-        assert_eq!(records_left, 1);
-        assert_eq!(framed_directory(directory, 2, &mut records_left), None);
+        let mut directory = zip[cd..eocd].to_vec();
+        let headers_len = directory.len();
+        directory.extend_from_slice(b"PK\x05\x05\x03\x00sig");
+        let signed_len = directory.len();
+        directory.push(0);
+        let r = Reader::new(&directory);
+        let mut cache = DirectoryCache::new();
+        let mut records_left = 2;
+        assert_eq!(cache.framed(&r, 0, signed_len, 2, &mut records_left), Some(true));
+        assert_eq!(cache.framed(&r, 0, headers_len, 2, &mut records_left), Some(true));
+        assert_eq!(cache.framed(&r, 0, signed_len - 1, 2, &mut records_left), Some(false));
+        assert_eq!(cache.framed(&r, 0, directory.len(), 2, &mut records_left), Some(false));
+        assert_eq!(records_left, 0);
+    }
+
+    #[test]
+    fn directory_cache_capacity_includes_each_start() {
+        let bytes = [0; 2];
+        let r = Reader::new(&bytes);
+        let mut cache = DirectoryCache::new();
+        cache.capacity_left = 2;
+        let mut records_left = 0;
+        assert_eq!(cache.framed(&r, 0, 0, 0, &mut records_left), Some(true));
+        assert_eq!(cache.framed(&r, 1, 0, 0, &mut records_left), Some(true));
+        assert_eq!(cache.capacity_left, 0);
+        assert_eq!(cache.framed(&r, 2, 0, 0, &mut records_left), None);
+        assert_eq!(cache.framed(&r, 0, 0, 0, &mut records_left), Some(true));
+        assert_eq!(cache.prefixes.values().map(|prefix| prefix.boundaries.capacity()).sum::<usize>(), 2);
         assert_eq!(records_left, 0);
     }
 

@@ -228,3 +228,30 @@ fn a_single_empty_signing_block_remains_readable() {
     assert!(found.signers.is_empty());
     assert!(found.warnings.is_empty());
 }
+
+#[test]
+fn comment_candidates_cannot_spend_the_genuine_directory_budget_repeatedly() {
+    let names: Vec<_> = (0..32).map(|index| format!("entry-{index}")).collect();
+    let entries: Vec<_> = names.iter().map(|name| (name.as_str(), b"x".as_slice())).collect();
+    let mut apk = signed_zip(&entries);
+    let original = apk_sign::parse(&apk).unwrap();
+    assert_eq!(original.signers.len(), 2);
+    let eocd = apk.len() - 22;
+    let cd = u32::from_le_bytes(apk[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let count = u16::from_le_bytes(apk[eocd + 10..eocd + 12].try_into().unwrap());
+    let candidates = usize::from(u16::MAX) / 22;
+    let comment_len = candidates * 22;
+    let mut fake = apk[eocd..].to_vec();
+    fake[8..10].copy_from_slice(&(count + 1).to_le_bytes());
+    fake[10..12].copy_from_slice(&(count + 1).to_le_bytes());
+    apk[eocd + 20..eocd + 22].copy_from_slice(&u16::try_from(comment_len).unwrap().to_le_bytes());
+    for index in 0..candidates {
+        fake[12..16].copy_from_slice(&u32::try_from(apk.len() - cd).unwrap().to_le_bytes());
+        fake[20..22].copy_from_slice(&u16::try_from(comment_len - (index + 1) * 22).unwrap().to_le_bytes());
+        apk.extend_from_slice(&fake);
+    }
+    // Every fake reaches the same real headers, then fails on the genuine EOCD. Rewalking
+    // that prefix for each comment candidate would spend the entire scan-wide allowance.
+    assert!(candidates * (usize::from(count) + 1) > apk.len() / 46 + 22 + usize::from(u16::MAX));
+    assert_eq!(apk_sign::parse(&apk).expect("comment candidates must reuse directory boundaries"), original);
+}
