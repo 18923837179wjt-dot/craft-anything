@@ -144,6 +144,17 @@ cheapest help we can give anyone, so nothing below should hold it up for long.
       skip hardware adapters; needs a different route (another renderer, or a helper that starts
       the app with only WARP visible)
 - [x] Add to `docs/releasing.md`: before publishing, a Deep build through Claude Code from the
+- [x] #794: on some systems DX12 refuses egui's own pipeline (`egui_pipeline`, 0x80070057 from
+      `CreatePipelineState`) on AMD, Intel and NVIDIA cards and on WARP too (lightcraft#812,
+      pdfcraft#1046, wgpu#10771), so the software retry failed the same way every start, and the
+      dialog only said to update the driver. Each failed start now moves on to the next renderer
+      (DX12 → WARP → Vulkan → GL, `apps/craft-anything/src/renderer.rs`), keeps the one that worked
+      for this app version, and starts again by itself after a wgpu error. Checked with a build
+      that failed every DX12 start; the real failure wasn't reproduced (STATUS.md)
+      — claimed: 00xJS, branch bugfix/r5.1-renderer-fallback
+- [ ] Live-check #794's fallback on a machine where DX12 refuses `egui_pipeline` (the reporter's
+      780M, or lightcraft#812's)
+- [ ] Add to `docs/releasing.md`: before publishing, a Deep build through Claude Code from the
       finished package, on a Mac and on Windows. Starting the CLI from the package (#91) doesn't
       show whether Claude Code accepts its tools — PR #982; claimed: doubektomas,
       branch docs/r5.1-packaged-deep-build-check. The checklist is documented; live package runs
@@ -592,6 +603,12 @@ Owner: open · Status: in progress
       explicit model/thinking execution: a config file in `OPENCODE_CONFIG` with `run --standalone`
       (verified live locally). — claimed: advokat11, branch bugfix/r2.2-opencode-native-mcp
 - [ ] Hand native OpenCode runs over SSH the Craft Anything MCP server (the config file is local).
+- [x] Hand native OpenCode runs over SSH the Craft Anything MCP server (the config file is local).
+      One `ssh` run checks `craft-anything-cli` is on the host's PATH and writes the config on the
+      host (`~/.cache/craft-anything/`, mode 600, atomic rename); the builder fails fast with the
+      fix if the helper is missing. Verified: POSIX-shell regression test (`the_remote_line_runs_on_a_posix_shell`)
+      and an SSH round-trip to localhost (probe, byte-exact write, mode, cleanup). Not run with a live
+      agent over SSH. — claimed: jelassiaymen94, branch feature/r2.2-opencode-remote-mcp
 - [ ] Verify OpenCode model discovery and an explicit thinking selection on a live SSH host,
       and complete a live generation with the selected model and variant (local catalogue verified).
 
@@ -680,6 +697,10 @@ Owner: open · Status: in progress
 - [x] Say plainly when what's found is the Claude desktop app rather than the `claude` program
       (#259, a guess at its cause)
 - [ ] macOS: check that `Claude.app` is where the desktop app is found (#259's hint is untried there)
+- [x] #259's hint, the gaps left in review of #781: it's hidden when only `~/.ssh/config` suggestions are
+      found, a Store install without its `claude-desktop` alias isn't seen, and a desktop app's
+      `claude.exe` on PATH is taken for Claude Code (#824) — claimed: FuryNocturn, branch
+      bugfix/r2.2-claude-desktop-hint-gaps
 - [x] macOS: `/Applications/Antigravity.app` ended up as the agent's command (#467). Found: the "Where is
       the program?" picker (`pick_file`) returns the bundle, and `set_command` saved any path. Refuse a
       folder or app bundle when it's saved (`set_command`), and don't run one that was saved before
@@ -731,7 +752,7 @@ Owner: open · Status: in progress
       used to ask for Unity even in a Godot project, and an app got the kind's default
       — claimed: xerenon, branch bugfix/r2.7-stack-from-files; PR #755
 - [x] A person's own project (edited in place, nothing to recreate) is judged by what it does for
-      itself: its own build, then its own tests, through `[[toolchain]]` in `stacks.toml` (Rust,
+      itself: its own build, then its own tests, through `[[toolchain]]` in `engine/src/toolchains.toml` (Rust,
       Node.js, Python, Go, .NET, Maven, Gradle, Make). Nothing is added to it for our sake: no
       `--screenshot`, `--self-test` or mechanics sheet. A site stack with nothing to recreate is a
       website, whatever the request says
@@ -743,8 +764,18 @@ Owner: open · Status: in progress
 - [ ] A person's own tests that already failed before their request fail the check too, so the
       builder is sent to fix them. If that proves a nuisance, run them once before the first turn
       and hold it only to what it broke
-- [ ] A new project in Python, Go or the like still fails the build check ("No project to build
-      found") and has no program for the screenshot check: `[[toolchain]]` could build it too
+- [x] New projects build through the shared `[[toolchain]]` catalogue. Python root entrypoints,
+      Go's root `main.go`, and one root `.csproj` also launch for screenshots, self-tests and Play;
+      existing packaged programs, Rust, Electron and game-engine paths keep priority — PR #950
+      — claimed: Codex, branch bugfix/r2.7-new-project-toolchains
+- [x] Runtime window capture follows runner descendants (including `go run`) and reads controls
+      from the same process that supplied the picture, without falling back to unrelated names — PR #950
+- [x] Shared toolchain commands make project-local executables absolute before changing the
+      working directory, preserving virtualenv paths for relative project placements — PR #950
+- [ ] Extend launch recipes beyond conventional root entrypoints: Python package scripts, Go
+      `cmd/` layouts, and Java build outputs; build checks already use their toolchain commands
+- [ ] Audit relative project placements in build, option-run and Play paths too: runtime window
+      capture now normalizes its request paths, but earlier runner paths can still be relative
 - [x] "player" alone doesn't make a request a game: a video or music player is an app (#953)
       — claimed: justinjohn0306, branch bugfix/953-player-not-a-game
 - [ ] Game words can't tell these apart from games: "a low level disk tool", "an MPEG 2 player",
@@ -856,6 +887,9 @@ Gaps found while using the app for real projects.
 - [x] Leaving "Work on my project" forgets a folder it would edit in place and drops a folder
       dialog that ends later, so a version made on Make can't edit that project, and an address
       in its request isn't read as an original to recreate (review of #686) — claimed: xerenon, branch bugfix/r2.9-own-project-review; PR #750
+- [x] `build_files_list` lists an edited-in-place project from the project folder itself, not a
+      missing or nested `app/`, and leaves Craft Anything's own records out
+      — claimed: AlexJoaquimPereira, branch `bugfix/r2.9-build-files-in-place`; commit 1ffeb40
 - [x] Choose Claude Code's folder (`CLAUDE_CONFIG_DIR`) per AI, so one computer can build with
       two Claude accounts; an app opened from the Dock never sees the shell's variable. Settings →
       AI (a typed folder, and Add another) and `ai folder`; live-checked from the CLI with an empty
