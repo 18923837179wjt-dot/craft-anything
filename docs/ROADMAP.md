@@ -754,7 +754,7 @@ Gaps found while using the app for real projects.
       — claimed: sanketdofe, branch feature/r2.9-macos-menu-bar
 - [x] A Traditional Chinese README (`README.zh-hant.md`) translated from `README.md` and linked
       from the language switcher in every README
-      — claimed: monarchsofchaos004-gif, branch docs/readme-zh-hant
+      — claimed: monarchsofchaos004-gif, branch docs/readme-zh-hant; PR #926
 - [ ] macOS: an Edit menu (Undo, Cut, Copy, Paste, Select All). The keys work in text boxes, but
       the system's Edit items need the text box to answer them, so they'd show greyed out today
 
