@@ -612,6 +612,11 @@ field what it counts, and test each producer with the case where they differ (he
 Update STATUS, the roadmap and generated docs (`cargo xtask tools`, `cargo xtask schemas`) in the
 same PR as the change.
 
+**A tool's title is a UI string.** A PR that added an engine tool and no UI passed every check run
+for it locally, and CI's `cargo xtask i18n-coverage` failed: the app shows tool titles, so each
+needs a translation in every catalog. Run `cargo xtask i18n-coverage` for any PR that adds a tool
+or changes a title, not only for UI changes.
+
 **A second lock in one statement.** `CliSpec { deep: !engine.session().clean_room(), logs: engine.session().config_dir(), … }`
 looked like two quick reads, but an unbound guard lives to the end of the statement, so the second
 waited on the first forever. Every build froze after studying its target while the card calmly

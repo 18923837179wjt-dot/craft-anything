@@ -197,6 +197,9 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
       by then made a cancelled run, not a hand-off. The test now waits for the launcher's mark, and
       a kill that finds the program already exited reports its exit, not a cancel
       — claimed: 00xJS, branch test/r5.2-hand-off-race
+- [ ] `website_tools::tests::a_browser_that_exits_at_once_is_reported_at_once` (engine) failed once
+      on Windows with the whole engine suite running (66 s under load) and passes alone, three
+      times in a row. Find what it times
 - [ ] `a_helper_is_judged_by_whether_it_runs` (ai crate) sometimes fails when several crates'
       tests run at once and passes alone: it writes a script and runs it straight away, which a
       busy machine can refuse while another test's child still holds the file open

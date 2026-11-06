@@ -434,10 +434,14 @@ fn project_approvals_set(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
                 ApprovalChoice::Default => None,
             };
             // A builder (or any agent) can't let itself do more: what it's held to is the person's
-            // to loosen, from the app or the CLI.
+            // to loosen, from the app or the CLI. Checked with Auto mode on and off, so switching it
+            // later doesn't hand over what the agent changed (an unchosen kind set to its default
+            // now, or a refusal given back to a default that asks).
             let agent = matches!(ctx.caller, crate::Caller::Mcp | crate::Caller::Agent);
-            let after = chosen.unwrap_or_else(|| kind.default_in(auto_mode));
-            if agent && after.strictness() < ws.manifest.approval(kind, auto_mode).strictness() {
+            let looser = [true, false]
+                .into_iter()
+                .any(|auto| chosen.unwrap_or_else(|| kind.default_in(auto)).strictness() < ws.manifest.approval(kind, auto).strictness());
+            if agent && looser {
                 return Err(ToolError::new(ErrorCode::NoPermission, format!("An agent can't loosen what \"{}\" gets in this project.", kind.name()))
                     .with_remediation("Ask the person to change it in the app (the project's approvals) or with the CLI."));
             }

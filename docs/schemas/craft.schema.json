@@ -36,6 +36,17 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/Approval"
+      },
+      "propertyNames": {
+        "enum": [
+          "web",
+          "commands",
+          "outside_files",
+          "publish",
+          "delete_outside",
+          "system",
+          "other_tools"
+        ]
       }
     },
     "asset_budget_usd": {

@@ -348,6 +348,18 @@ fn decide_command(cmd: &str, app: &Path) -> Decision {
     Decision::Allow
 }
 
+/// Where a file tool's `target` may be opened: as written when it's absolute; else from the project
+/// folder (where agents are started) and from app/ (where they may `cd`), so a check holds for
+/// both. `None` for a path that climbs above the root.
+fn opened_at(ws: Option<&Workspace>, target: &str) -> Vec<Option<PathBuf>> {
+    let bases = match ws {
+        Some(w) if Path::new(target).is_relative() => vec![w.root.clone(), w.app_dir()],
+        Some(w) => vec![w.app_dir()],
+        None => vec![PathBuf::from("/")],
+    };
+    bases.iter().map(|b| resolve_as_opened(b, target)).collect()
+}
+
 /// The policy for one action, before the project's choices and anything the person always allowed
 /// ([`approve_with`] applies those). `ws` is the workspace the agent works in, if known.
 pub fn decide(ws: Option<&Workspace>, tool: &str, input: &Value) -> Decision {
@@ -367,14 +379,16 @@ pub fn decide(ws: Option<&Workspace>, tool: &str, input: &Value) -> Decision {
             // approvals are answered), the manifest and the person's pictures stay out of reach,
             // also when the app is the project folder itself.
             let checks = ws.map(Workspace::checks_dir);
-            match (&app, resolve_as_opened(app.as_deref().unwrap_or(Path::new("/")), &target)) {
-                // Followed through links, so a link in app/ can't lead a write out of it.
-                (Some(app), Some(p))
-                    if (really_inside(app, &p) || checks.as_ref().is_some_and(|c| really_inside(c, &p))) && !ws.is_some_and(|w| w.is_own_record(&p)) =>
-                {
-                    Decision::Allow
-                }
-                _ => Decision::Ask { title: format!("Change a file outside the project: {target}"), kind },
+            // Followed through links, so a link in app/ can't lead a write out of it; and wherever
+            // the agent opens a relative path from, so `craft.json` isn't taken for app/craft.json.
+            let ours = |p: &Path| {
+                app.as_ref().is_some_and(|app| really_inside(app, p) || checks.as_ref().is_some_and(|c| really_inside(c, p)))
+                    && !ws.is_some_and(|w| w.is_own_record(p))
+            };
+            if opened_at(ws, &target).iter().all(|p| p.as_deref().is_some_and(ours)) {
+                Decision::Allow
+            } else {
+                Decision::Ask { title: format!("Change a file outside the project: {target}"), kind }
             }
         }
         "Bash" => match &app {
@@ -459,12 +473,12 @@ fn outcome(ws: Option<&Workspace>, auto_mode: bool, tool: &str, input: &Value) -
         Decision::Ask { title, kind } => (title, kind),
     };
     let kind = kind_of(ws, tool, input);
+    let chosen = ws.and_then(|w| w.manifest.approvals.get(&kind).copied());
     // "Always" on an earlier card, for kinds where that was one action rather than the whole kind
-    // (a `cd` before a push mustn't let the push through).
-    if remembers_actions(kind) && ws.is_some_and(|w| w.manifest.allowed_actions.contains(&action)) {
+    // (a `cd` before a push mustn't let the push through), unless the kind is refused now.
+    if remembers_actions(kind) && chosen != Some(Approval::Refuse) && ws.is_some_and(|w| w.manifest.allowed_actions.contains(&action)) {
         return Outcome::Allow;
     }
-    let chosen = ws.and_then(|w| w.manifest.approvals.get(&kind).copied());
     match chosen.unwrap_or_else(|| kind.default_in(auto_mode)) {
         Approval::Allow => Outcome::Allow,
         Approval::Refuse => Outcome::Refuse(refusal(kind, chosen.is_some())),
@@ -550,14 +564,14 @@ pub fn kind_of(ws: Option<&Workspace>, tool: &str, input: &Value) -> ActionKind 
     match tool {
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             let target = if tool == "NotebookEdit" { s("notebook_path") } else { s("file_path") };
-            let Some(p) = resolve_as_opened(ws.map(|w| w.root.clone()).as_deref().unwrap_or(Path::new("/")), &target) else {
-                return ActionKind::OutsideFiles;
+            let system = |p: &Path| {
+                // Followed through links: a link in app/ to a system folder is that folder.
+                SYSTEM_DIRS.iter().any(|d| may_reach(Path::new(d), p))
+                    // The inbox (where answers are written), the manifest and the other records
+                    // stay out of reach.
+                    || ws.is_some_and(|w| w.is_own_record(p))
             };
-            // Followed through links: a link in app/ to a system folder is that folder.
-            let system = SYSTEM_DIRS.iter().any(|d| may_reach(Path::new(d), &p));
-            // The inbox (where answers are written), the manifest and the other records stay out of reach.
-            let ours = ws.is_some_and(|w| w.is_own_record(&p));
-            if system || ours { ActionKind::System } else { ActionKind::OutsideFiles }
+            if opened_at(ws, &target).iter().flatten().any(|p| system(p)) { ActionKind::System } else { ActionKind::OutsideFiles }
         }
         "Bash" | "PowerShell" => {
             let command = s("command");
@@ -609,49 +623,73 @@ pub fn never_unasked(ws: Option<&Workspace>, tool: &str, input: &Value) -> Optio
     (kind.default_in(true) == Approval::Refuse).then(|| refusal(kind, false))
 }
 
-/// Whether a lower-cased command pushes or publishes: `git push` (also `git -C app push`),
-/// publishing a package or an image, and `gh` commands that change a repository, its pull requests
-/// or releases. `gh … view` and `list` only read, and are commands like any other.
+/// Whether a lower-cased command pushes or publishes anywhere in it: `git push` (also
+/// `git -C app push`), publishing a package or an image, and `gh` commands that change something
+/// on GitHub. Each command the shell would run is read on its own: after `;`, `&&`, `|`, a newline,
+/// inside `$(…)`, backticks or `bash -c "…"`. `gh … view`, `list`, `clone` and the like only read,
+/// and are commands like any other.
 fn publishes(c: &str) -> bool {
-    let words: Vec<&str> = c.split_whitespace().map(|w| w.trim_matches(|ch: char| matches!(ch, ';' | '|' | '&' | '(' | ')' | '"' | '\''))).collect();
-    let program = |w: &str, name: &str| {
-        let base = w.rsplit(['/', '\\']).next().unwrap_or(w);
-        base == name || base.strip_suffix(".exe") == Some(name)
-    };
-    words.iter().enumerate().any(|(i, w)| {
-        let rest = words.get(i + 1..).unwrap_or_default();
-        if program(w, "git") {
+    c.split([';', '&', '|', '\n', '(', ')', '`', '{', '}', '<', '>']).any(|part| {
+        let words: Vec<&str> = part.split_whitespace().map(|w| w.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '$'))).filter(|w| !w.is_empty()).collect();
+        words.iter().enumerate().any(|(i, w)| publishes_with(program_name(w), words.get(i + 1..).unwrap_or_default()))
+    })
+}
+
+/// A program's name as typed, without its folder or a Windows extension (`/usr/bin/npm`, `npm.cmd`).
+fn program_name(word: &str) -> &str {
+    let base = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    [".exe", ".cmd", ".bat", ".ps1"].iter().find_map(|x| base.strip_suffix(x)).unwrap_or(base)
+}
+
+/// Whether `program` followed by the words `rest` (to the end of its command) pushes or publishes.
+fn publishes_with(program: &str, rest: &[&str]) -> bool {
+    let has = |w: &str| rest.contains(&w);
+    match program {
+        "git" => {
             // Past git's own options to the subcommand; `-C dir` and `-c key=value` (both `-c`
             // here, lower-cased) take a value.
             let mut j = 0;
             while let Some(o) = rest.get(j).filter(|o| o.starts_with('-')) {
                 j += if *o == "-c" { 2 } else { 1 };
             }
-            return rest.get(j) == Some(&"push");
+            rest.get(j) == Some(&"push")
         }
-        if program(w, "gh") {
-            return match rest {
-                [area, verb, ..] if matches!(*area, "pr" | "repo" | "release") => !GH_READS.contains(verb),
-                // `gh api` writes when it sends a method other than GET or any fields (`-f` and
-                // `-F`, lower-cased here).
-                ["api", args @ ..] => {
-                    args.iter()
-                        .any(|a| matches!(*a, "-f" | "--field" | "--raw-field" | "--input") || a.starts_with("--field=") || a.starts_with("--raw-field="))
-                        || args.windows(2).any(|p| matches!(p, [flag, method] if matches!(*flag, "-x" | "--method") && *method != "get"))
-                        || args.iter().any(|a| a.strip_prefix("--method=").is_some_and(|m| m != "get"))
-                }
-                _ => false,
-            };
-        }
-        let next = rest.first().copied().unwrap_or_default();
-        (matches!(*w, "npm" | "pnpm" | "yarn" | "cargo") && next == "publish")
-            || (*w == "twine" && next == "upload")
-            || (matches!(*w, "docker" | "podman") && next == "push")
-    })
+        "gh" => gh_publishes(rest),
+        // Wherever the subcommand comes (`npm --registry x publish`, `cargo +nightly publish`).
+        "npm" | "pnpm" | "yarn" | "bun" | "cargo" => has("publish"),
+        "twine" => has("upload"),
+        "docker" | "podman" | "gem" => has("push"),
+        "dotnet" => has("nuget") && has("push"),
+        _ => false,
+    }
 }
 
-/// `gh` verbs that only read.
-const GH_READS: &[&str] = &["view", "list", "status", "checks", "diff", "download"];
+/// `gh` areas that don't change anything on GitHub.
+const GH_LOCAL: &[&str] = &["auth", "browse", "search", "help", "config", "alias", "completion", "status", "version", "--version", "--help"];
+
+/// `gh` verbs that only read, or only copy to this computer.
+const GH_READS: &[&str] = &["view", "list", "status", "checks", "diff", "download", "clone", "checkout", "watch"];
+
+/// Whether `gh` with these words changes something on GitHub: any verb that isn't one of
+/// [`GH_READS`] (`gh issue create`, `gh gist create`, `gh pr merge`…), and `gh api` with a method
+/// other than GET or any fields (`-f` and `-F`, lower-cased here, also written `-fkey=v`).
+fn gh_publishes(rest: &[&str]) -> bool {
+    match rest {
+        ["api", args @ ..] => {
+            let method = |m: &str| !m.is_empty() && m != "get";
+            args.iter().any(|a| {
+                (a.starts_with("-f") && !a.starts_with("--"))
+                    || matches!(*a, "--field" | "--raw-field" | "--input")
+                    || ["--field=", "--raw-field=", "--input="].iter().any(|p| a.starts_with(p))
+                    || a.strip_prefix("--method=").is_some_and(method)
+                    || a.strip_prefix("-x").is_some_and(method)
+            }) || args.windows(2).any(|p| matches!(p, [flag, m] if matches!(*flag, "-x" | "--method") && method(m)))
+        }
+        [area, ..] if GH_LOCAL.contains(area) => false,
+        [_, verbs @ ..] => verbs.iter().find(|v| !v.starts_with('-')).is_some_and(|v| !GH_READS.contains(v)),
+        [] => false,
+    }
+}
 
 const SYSTEM_DIRS: &[&str] =
     &["C:/Windows", "C:/Program Files", "C:/Program Files (x86)", "C:/ProgramData", "/etc", "/usr", "/bin", "/sbin", "/System", "/Library"];
@@ -1086,6 +1124,30 @@ mod tests {
         w.manifest.allowed_actions.push("bash:lsblk".into());
         assert_eq!(outcome(Some(&w), false, "Bash", &cmd), Outcome::Allow, "\"always for this project\" is remembered");
         assert_eq!(outcome(None, false, "Read", &json!({})), Outcome::Allow);
+        // A kind the person refuses later wins over what they always allowed before; asking keeps it.
+        w.manifest.approvals.insert(ActionKind::Commands, Approval::Refuse);
+        assert!(matches!(outcome(Some(&w), true, "Bash", &cmd), Outcome::Refuse(_)));
+        w.manifest.approvals.insert(ActionKind::Commands, Approval::Ask);
+        assert_eq!(outcome(Some(&w), true, "Bash", &cmd), Outcome::Allow);
+    }
+
+    #[test]
+    fn a_relative_path_is_judged_wherever_the_agent_opens_it() {
+        // Agents start in the project folder: `craft.json` there is the manifest, not app/craft.json.
+        let (_d, w) = ws();
+        let write = |p: &str| json!({"file_path": p});
+        for record in ["craft.json", "inbox/1.answer.json", "./craft.json"] {
+            assert!(matches!(decide(Some(&w), "Write", &write(record)), Decision::Ask { .. }), "{record}");
+            assert_eq!(kind_of(Some(&w), "Write", &write(record)), ActionKind::System, "{record}");
+            assert!(matches!(outcome(Some(&w), true, "Write", &write(record)), Outcome::Refuse(_)), "{record}");
+        }
+        // Inside app/ from either folder, or written in full, it's the builder's own work.
+        assert_eq!(decide(Some(&w), "Write", &write("app/src/main.rs")), Decision::Allow);
+        let full = w.app_dir().join("src/main.rs");
+        assert_eq!(decide(Some(&w), "Write", &write(&full.display().to_string())), Decision::Allow);
+        // A bare name could be the project folder's or app/'s: asked about, not refused.
+        assert!(matches!(decide(Some(&w), "Write", &write("src/main.rs")), Decision::Ask { .. }));
+        assert_eq!(kind_of(Some(&w), "Write", &write("src/main.rs")), ActionKind::OutsideFiles);
     }
 
     #[test]
@@ -1148,6 +1210,27 @@ mod tests {
             "gh api repos/o/r/issues -f title=x",
             "docker push img:1",
             "twine upload dist/*",
+            // Another command the shell runs, without spaces or inside another one.
+            "x;git push",
+            "cd app&&git push",
+            "echo $(git push)",
+            "echo `git push`",
+            "bash -c \"git push origin main\"",
+            "ls | git push",
+            // Packages and images however they're started.
+            "/usr/local/bin/npm publish",
+            "npm.cmd publish",
+            "npm --registry https://r.example publish",
+            "cargo +nightly publish",
+            "docker image push img:1",
+            "dotnet nuget push x.nupkg",
+            // Anything gh changes on GitHub, and gh api's attached flags.
+            "gh issue create --title x",
+            "gh issue comment 3 --body x",
+            "gh gist create --public notes.md",
+            "gh api repos/o/r/pulls/1/merge -XPUT",
+            "gh api repos/o/r/issues -ftitle=x",
+            "gh api repos/o/r/issues --method=POST",
         ] {
             assert_eq!(kind(publish), ActionKind::Publish, "{publish}");
         }
@@ -1163,6 +1246,13 @@ mod tests {
             "git log --oneline -5",
             "git status",
             "npm run publish-docs",
+            "gh repo clone storytold/craft-anything",
+            "gh pr checkout 12",
+            "gh run watch 42",
+            "gh api repos/o/r/pulls -XGET",
+            "gh pr",
+            "cd /d/repos/git && ls",
+            "npm install && echo published",
         ] {
             assert_eq!(kind(reads), ActionKind::Commands, "{reads}");
         }
@@ -1227,7 +1317,7 @@ mod tests {
         // A builder may make a kind stricter, not looser: not even back to a default that allows more.
         assert!(call(crate::Caller::Mcp, json!({"project": w.root, "kind": "publish", "mode": "ask"})).is_ok());
         call(crate::Caller::Ui, json!({"project": w.root, "kind": "commands", "mode": "refuse"})).unwrap();
-        for (kind, mode) in [("publish", "allow"), ("other_tools", "ask"), ("commands", "default")] {
+        for (kind, mode) in [("publish", "allow"), ("other_tools", "ask"), ("commands", "default"), ("outside_files", "allow")] {
             let err = call(crate::Caller::Mcp, json!({"project": w.root, "kind": kind, "mode": mode})).unwrap_err();
             assert_eq!(err.code, ErrorCode::NoPermission, "{kind} {mode}");
         }

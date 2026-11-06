@@ -78,10 +78,10 @@ fn copy_tree(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool, depth: usize)
 }
 
 /// The current `craft.json` format version. Bumping it means appending a step to [`MANIFEST_STEPS`].
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// The steps that bring an older `craft.json` forward; step `i` goes from version `i` to `i + 1`.
-const MANIFEST_STEPS: &[versioned::Step<Value>] = &[manifest_v0_to_v1, manifest_v1_to_v2];
+const MANIFEST_STEPS: &[versioned::Step<Value>] = &[manifest_v0_to_v1, manifest_v1_to_v2, manifest_v2_to_v3];
 const _: () = assert!(MANIFEST_STEPS.len() == MANIFEST_VERSION as usize, "one step per craft.json version");
 
 /// Version 0 (no `version` field) has the same shape as version 1; only the number is new.
@@ -93,6 +93,13 @@ fn manifest_v0_to_v1(doc: &mut Value) -> Result<(), String> {
 /// both default to a project made the usual way. The number is new so an older build, which would
 /// look for the app in app/, opens such a project read-only instead of saving over it.
 fn manifest_v1_to_v2(doc: &mut Value) -> Result<(), String> {
+    if doc.is_object() { Ok(()) } else { Err("the manifest isn't a JSON object".into()) }
+}
+
+/// Version 3 adds the person's approval choices (`approvals`), none by default. The number is new
+/// so an older build, which would drop them when it saves (a refused kind would then follow Auto
+/// mode again), opens such a project read-only instead.
+fn manifest_v2_to_v3(doc: &mut Value) -> Result<(), String> {
     if doc.is_object() { Ok(()) } else { Err("the manifest isn't a JSON object".into()) }
 }
 
@@ -416,6 +423,7 @@ pub struct Manifest {
     /// What the builder's approvals get in this project, by kind of action; a kind that isn't here
     /// follows Auto mode ([`ActionKind::default_in`]). The person's, like the budget.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[schemars(schema_with = "approvals_schema")]
     pub approvals: std::collections::BTreeMap<ActionKind, Approval>,
     /// The builder finished its turn and the run's checks haven't reported on it yet, so a run
     /// that picks this up only needs to check: nothing is left to build.
@@ -1066,6 +1074,17 @@ pub enum Approval {
     Ask,
     /// Not done, without asking: the builder is told to find another way.
     Refuse,
+}
+
+/// `Manifest::approvals` in the published schema: only the kinds' names as keys, which a map's
+/// own schema leaves open.
+fn approvals_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let names: Vec<&str> = ACTION_KINDS.iter().map(|r| r.name).collect();
+    schemars::json_schema!({
+        "type": "object",
+        "propertyNames": { "enum": names },
+        "additionalProperties": generator.subschema_for::<Approval>(),
+    })
 }
 
 /// One row of [`ACTION_KINDS`].
