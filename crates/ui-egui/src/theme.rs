@@ -667,8 +667,12 @@ mod tests {
             ("Arabic", "مرحبا بالعالم"),
             ("Hebrew", "שלום עולם"),
             ("Hindi", "नमस्ते दुनिया"),
-            // Every Vietnamese tone mark on every vowel shape, plus ơ, ư and đ (the UI catalog uses them all).
-            ("Vietnamese", "Tiếng Việt ơ ư Ư đ Đ ạ ả ấ ầ ẩ ẫ ậ ắ ằ ẳ ẵ ặ ẹ ẻ ẽ ề ể ễ ệ ỉ ị ọ ỏ ố ồ ổ ỗ ộ ớ ờ Ở ở ỡ ợ ụ ủ Ứ ứ ừ ử ữ ự ỳ ỹ"),
+            // All 12 Vietnamese vowels with each of the six tones, and đ, in both cases (146 letters):
+            // people type any of them, not just the ones the catalog uses.
+            (
+                "Vietnamese",
+                "Tiếng Việt a à á ả ã ạ ă ằ ắ ẳ ẵ ặ â ầ ấ ẩ ẫ ậ e è é ẻ ẽ ẹ ê ề ế ể ễ ệ i ì í ỉ ĩ ị o ò ó ỏ õ ọ ô ồ ố ổ ỗ ộ ơ ờ ớ ở ỡ ợ u ù ú ủ ũ ụ ư ừ ứ ử ữ ự y ỳ ý ỷ ỹ ỵ đ A À Á Ả Ã Ạ Ă Ằ Ắ Ẳ Ẵ Ặ Â Ầ Ấ Ẩ Ẫ Ậ E È É Ẻ Ẽ Ẹ Ê Ề Ế Ể Ễ Ệ I Ì Í Ỉ Ĩ Ị O Ò Ó Ỏ Õ Ọ Ô Ồ Ố Ổ Ỗ Ộ Ơ Ờ Ớ Ở Ỡ Ợ U Ù Ú Ủ Ũ Ụ Ư Ừ Ứ Ử Ữ Ự Y Ỳ Ý Ỷ Ỹ Ỵ Đ",
+            ),
             ("Russian", "Привет"),
             ("Greek", "Γειά σου"),
             ("arrows", "Settings → AI ← ↑ ↓"),
