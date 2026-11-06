@@ -49,6 +49,7 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("qwen-code", "qwen", "Qwen Code"),
     ("goose", "goose", "Goose"),
     ("maki", "maki", "Maki"),
+    ("dsh", "dsh", "DeepSeek Harness"),
 ];
 
 pub fn program_for(agent: &str) -> String {
@@ -59,21 +60,69 @@ pub fn program_for(agent: &str) -> String {
 /// that's gone from this computer is looked for again (#721): an agent that installs each version
 /// in a folder of its own (Codex's `bin/<build>/codex.exe`) moves on every update, so the same file
 /// in the newest folder beside the old one is used, else the usual name on PATH. On another
-/// computer (ssh) the chosen command is used as it is.
-pub fn program_of(config: &BackendConfig, options: &BackendOptions) -> String {
+/// computer (ssh) the chosen command is used as it is. Fails when the usual name would start only
+/// the Claude desktop app, which can't build.
+pub fn program_of(config: &BackendConfig, options: &BackendOptions) -> Result<String, ToolError> {
+    program_in(config, options, craft_anything_platform::which::search_path())
+}
+
+fn program_in(config: &BackendConfig, options: &BackendOptions, search: Option<std::ffi::OsString>) -> Result<String, ToolError> {
     let usual = program_for(&config.model);
-    let Some(chosen) = options.command.as_deref().map(str::trim).filter(|c| !c.is_empty()) else { return usual };
     let local = config.ssh_host.as_deref().is_none_or(|h| h.trim().is_empty());
+    let Some(chosen) = options.command.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+        return if local { Ok(usual_program(&usual, search)?.unwrap_or(usual)) } else { Ok(usual) };
+    };
     // A folder or app bundle saved before set_command refused it (#467) can't be started: the usual
     // program is used, as when none is chosen.
     if local && Path::new(chosen).is_dir() {
-        return usual;
+        return Ok(usual_program(&usual, search)?.unwrap_or(usual));
     }
     let path = Path::new(chosen);
     if !local || path.parent().is_none_or(|p| p.as_os_str().is_empty()) || path.exists() {
-        return chosen.to_string();
+        return Ok(chosen.to_string());
     }
-    moved_program(path).or_else(|| craft_anything_platform::which(&usual).map(|_| usual)).unwrap_or_else(|| chosen.to_string())
+    // Gone, and nothing beside it: the usual program if it's really here, else the saved path, so
+    // the error names it.
+    Ok(moved_program(path).or_else(|| usual_program(&usual, search).ok().flatten()).unwrap_or_else(|| chosen.to_string()))
+}
+
+/// How to start the usual program: its name, or the real program's path when the name alone would
+/// start something else that comes first on the search path (the Claude desktop app's
+/// `claude.exe`). `None` when nothing has that name; an error when only the desktop app does.
+fn usual_program(usual: &str, search: Option<std::ffi::OsString>) -> Result<Option<String>, ToolError> {
+    let first = craft_anything_platform::which::which_in(usual, search.clone()).into_iter().next();
+    match (first, find_program_in(usual, search)) {
+        (None, _) => Ok(None),
+        (Some(first), Some(real)) => Ok(Some(if first == real { usual.to_string() } else { real.display().to_string() })),
+        (Some(app), None) => Err(ToolError::new(
+            ErrorCode::EngineMissing,
+            format!("Claude Code isn't installed: the `claude` found ({}) is the Claude desktop app, which can't build.", app.display()),
+        )
+        .with_remediation("Install Claude Code apart from the desktop app, sign in to it once in a terminal, then try again.")),
+    }
+}
+
+/// Where an agent's program is on this computer: the first match on the search path that is
+/// really it. Detection, the desktop app hint and starting a run all look through this, so what's
+/// offered is what runs.
+pub fn find_program(program: &str) -> Option<PathBuf> {
+    find_program_in(program, craft_anything_platform::which::search_path())
+}
+
+fn find_program_in(program: &str, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    craft_anything_platform::which::which_in(program, path).into_iter().find(|p| program != "claude" || !is_claude_desktop(p))
+}
+
+/// A file inside the Claude desktop app, which can't build: its older installer names the app
+/// `claude.exe` (`AnthropicClaude\claude.exe`, `AnthropicClaude\app-<version>\claude.exe`), the
+/// Store package keeps it under `WindowsApps\Claude_<version>_<arch>__<publisher>`, and on macOS
+/// it's in `Claude.app`. Only names are compared; nothing is read.
+pub(crate) fn is_claude_desktop(path: &Path) -> bool {
+    path.ancestors().skip(1).take(4).any(|dir| {
+        let name = dir.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        let in_store = dir.parent().and_then(Path::file_name).is_some_and(|p| p.eq_ignore_ascii_case("WindowsApps"));
+        name == "anthropicclaude" || name == "claude.app" || (in_store && name.starts_with("claude_"))
+    })
 }
 
 /// The same file in the most recently changed sibling of its missing folder, if there is one.
@@ -545,7 +594,8 @@ fn acp_for(spec: &CliSpec) -> Option<AcpConversation> {
     }
     let local = spec.config.ssh_host.as_deref().is_none_or(|h| h.trim().is_empty());
     let acp_args = selected_acp_args(adapter.as_ref(), &agent, &spec.options).filter(|_| local)?;
-    let program = program_of(&spec.config, &spec.options);
+    // No program to start: the plain run reports why.
+    let program = program_of(&spec.config, &spec.options).ok()?;
     let access = match (spec.question, spec.deep, spec.builder.is_some()) {
         (true, true, _) => Access::Question,
         (true, false, _) => Access::CleanRoomQuestion,
@@ -748,7 +798,13 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     let RunState { session, verified, lost, failure } = state;
     let name = spec.config.name.clone();
     let agent = spec.config.model.clone();
-    let program = program_of(&spec.config, &spec.options);
+    let program = match program_of(&spec.config, &spec.options) {
+        Ok(program) => program,
+        Err(e) => {
+            let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
+            return nothing_done(&name);
+        }
+    };
     let remote = spec.config.ssh_host.clone().filter(|h| !h.trim().is_empty());
     // A folder chosen for it is on the computer it runs on: on another one, it's set below.
     let mut adapter = match remote {
@@ -821,6 +877,17 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     // 30 minutes and a background build at 10).
     let (turn, quiet) = if builder { (24 * 3600, 8 * 3600) } else { (30 * 60, 15 * 60) };
     let mut env = agent_env(builder, spec.options.effort);
+    let tool_env = match &remote {
+        None => adapter.mcp_env(&mcp),
+        Some(host) => adapter.remote_tool_server(host, &mcp),
+    };
+    match tool_env {
+        Ok(var) => env.extend(var),
+        Err(e) => {
+            let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
+            return nothing_done(&name);
+        }
+    }
     // Here the adapter's process runs the agent in its folder (`AgentAdapter::in_folder`); on
     // another computer over SSH it's the folder chosen there, else the agent keeps its own.
     if remote.is_some()
@@ -1119,18 +1186,77 @@ mod tests {
             enabled: true,
         };
         let chosen = |p: &Path| BackendOptions { command: Some(p.display().to_string()), ..Default::default() };
-        assert_eq!(program_of(&config(None), &chosen(&gone)), new.display().to_string(), "the same file in the newer build folder");
-        assert_eq!(program_of(&config(None), &chosen(&new)), new.display().to_string(), "a path that's there is used as it is");
-        assert_eq!(program_of(&config(Some("box")), &chosen(&gone)), gone.display().to_string(), "another computer's path isn't checked here");
-        assert_eq!(program_of(&config(None), &BackendOptions::default()), "codex", "nothing chosen: the usual name");
+        assert_eq!(program_of(&config(None), &chosen(&gone)).unwrap(), new.display().to_string(), "the same file in the newer build folder");
+        assert_eq!(program_of(&config(None), &chosen(&new)).unwrap(), new.display().to_string(), "a path that's there is used as it is");
+        assert_eq!(program_of(&config(Some("box")), &chosen(&gone)).unwrap(), gone.display().to_string(), "another computer's path isn't checked here");
+        assert_eq!(program_of(&config(None), &BackendOptions::default()).unwrap(), "codex", "nothing chosen: the usual name");
         // #467: a saved app bundle is never started; the usual name is looked up instead.
         let dir = tempfile::tempdir().unwrap();
         let bundle = dir.path().join("Codex.app");
         std::fs::create_dir_all(&bundle).unwrap();
-        assert_eq!(program_of(&config(None), &chosen(&bundle)), "codex", "an app bundle is not the program");
-        assert_eq!(program_of(&config(Some("box")), &chosen(&bundle)), bundle.display().to_string(), "another computer's path isn't checked here");
+        assert_eq!(program_of(&config(None), &chosen(&bundle)).unwrap(), "codex", "an app bundle is not the program");
+        assert_eq!(program_of(&config(Some("box")), &chosen(&bundle)).unwrap(), bundle.display().to_string(), "another computer's path isn't checked here");
         let bare = BackendOptions { command: Some("my-codex".into()), ..Default::default() };
-        assert_eq!(program_of(&config(None), &bare), "my-codex", "a bare name is left to PATH");
+        assert_eq!(program_of(&config(None), &bare).unwrap(), "my-codex", "a bare name is left to PATH");
+    }
+
+    /// The Claude desktop app's older installer names its app `claude.exe`; with its folder on
+    /// PATH, it was offered as Claude Code (review of #781).
+    #[test]
+    fn the_claude_desktop_app_is_never_taken_for_claude_code() {
+        for app in [
+            r"C:\Users\x\AppData\Local\AnthropicClaude\claude.exe",
+            r"C:\Users\x\AppData\Local\AnthropicClaude\app-0.10.0\claude.exe",
+            r"C:\Program Files\WindowsApps\Claude_4.4212.0.0_x64__pzs8sxrjxfjjc\app\Claude.exe",
+            "/Applications/Claude.app/Contents/MacOS/Claude",
+        ] {
+            let app = PathBuf::from(app.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            assert!(is_claude_desktop(&app), "{}", app.display());
+        }
+        for cli in [r"C:\Users\x\.local\bin\claude.exe", r"C:\Users\x\AppData\Roaming\npm\claude.cmd", "/Users/x/.claude/local/claude"] {
+            let cli = PathBuf::from(cli.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            assert!(!is_claude_desktop(&cli), "{}", cli.display());
+        }
+
+        let d = tempfile::tempdir().unwrap();
+        let file = if cfg!(windows) { "claude.exe" } else { "claude" };
+        let app = d.path().join("AnthropicClaude").join(file);
+        let cli = d.path().join("bin").join(file);
+        for p in [&app, &cli] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"").unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        }
+        let path = |dirs: &[&Path]| std::env::join_paths(dirs).ok();
+        let (app_dir, cli_dir) = (app.parent().unwrap(), cli.parent().unwrap());
+        assert_eq!(find_program_in("claude", path(&[app_dir, cli_dir])), Some(cli.clone()), "the desktop app is passed over");
+        assert_eq!(find_program_in("claude", path(&[app_dir])), None, "only the desktop app: no Claude Code");
+        // What a run starts (review of #858): never the desktop app.
+        let claude = BackendConfig {
+            name: "Claude Code".into(),
+            kind: crate::BackendKind::AgentCli,
+            model: "claude-code".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: true,
+        };
+        let none = BackendOptions::default();
+        let gone = BackendOptions { command: Some(d.path().join("old").join("claude").join(file).display().to_string()), ..Default::default() };
+        let real = cli.display().to_string();
+        assert_eq!(program_in(&claude, &none, path(&[app_dir, cli_dir])).unwrap(), real, "the real one, by path, when the app comes first");
+        assert_eq!(program_in(&claude, &gone, path(&[app_dir, cli_dir])).unwrap(), real, "a saved path that's gone falls back to the real one");
+        assert_eq!(program_in(&claude, &none, path(&[cli_dir, app_dir])).unwrap(), "claude", "the name, when it starts the real one");
+        let err = program_in(&claude, &none, path(&[app_dir])).unwrap_err();
+        assert_eq!(err.code, ErrorCode::EngineMissing);
+        assert!(err.message.contains("desktop app"), "{}", err.message);
+        assert_eq!(program_in(&claude, &gone, path(&[app_dir])).unwrap(), gone.command.clone().unwrap(), "only the app: the saved path, not the app");
+        // Another agent's program in such a folder is only filtered for Claude.
+        let other = app_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        std::fs::write(&other, b"").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&other, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(find_program_in("codex", path(&[app_dir])), Some(other));
     }
 
     #[test]
@@ -1277,61 +1403,21 @@ mod tests {
     }
     use crate::BackendKind;
 
-    /// Explicit OpenCode picks cannot pass ACP preflight then run natively without our MCP server.
+    /// Explicit OpenCode picks run natively, where the tool server comes through inline config.
     #[test]
-    fn explicit_opencode_picks_are_refused_before_native_chat_or_build() {
+    fn explicit_opencode_picks_run_natively_with_our_tools() {
         let adapter = adapter_for("opencode");
         let defaults = BackendOptions { acp: Some(true), ..Default::default() };
         assert!(selected_acp_args(adapter.as_ref(), "opencode", &defaults).is_some());
         for (model, thinking) in [(Some("test/model"), None), (None, Some(crate::Effort::High)), (Some("test/model"), Some(crate::Effort::Max))] {
             for acp in [false, true] {
-                let options = BackendOptions {
-                    command: Some("missing-test-opencode".into()),
-                    cli_model: model.map(str::to_string),
-                    cli_thinking: thinking,
-                    acp: Some(acp),
-                    ..Default::default()
-                };
-                let refused = check_builder_tools(adapter.as_ref(), "opencode", &options, &CancelToken::default()).unwrap_err();
-                assert_eq!(refused.code, ErrorCode::BadSettings);
-                assert!(refused.message.contains("cannot yet connect"));
-                for host in [None, Some("test-host")] {
-                    for building in [false, true] {
-                        let config = BackendConfig {
-                            name: "OpenCode".into(),
-                            kind: BackendKind::AgentCli,
-                            model: "opencode".into(),
-                            base_url: None,
-                            ssh_host: host.map(str::to_string),
-                            enabled: true,
-                        };
-                        let mut spec = CliSpec::new(config, options.clone(), false, None);
-                        if building {
-                            spec.builder = Some(Builder { investigation: None, inbox: PathBuf::from("test-inbox") });
-                        }
-                        assert!(acp_for(&spec).is_none());
-                        let mut c = if building { builder_conversation(spec, Arc::new(|_, _| false)) } else { conversation(spec) };
-                        c.send("test");
-                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                        let mut events = Vec::new();
-                        while !events.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
-                            assert!(std::time::Instant::now() < deadline, "missing terminal event: {events:?}");
-                            events.extend(c.poll());
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        assert!(!c.is_busy());
-                        events.extend(c.poll());
-                        assert!(
-                            matches!(events.as_slice(), [
-                            AgentEvent::Error { message, remediation: Some(_), log: None },
-                            AgentEvent::TurnDone { backend, input_tokens: 0, output_tokens: 0, cost_usd: None, cost_is_estimate: false }
-                        ] if message == &refused.message && backend == "OpenCode"),
-                            "{events:?}"
-                        );
-                    }
-                }
+                let options = BackendOptions { cli_model: model.map(str::to_string), cli_thinking: thinking, acp: Some(acp), ..Default::default() };
+                assert!(selected_acp_args(adapter.as_ref(), "opencode", &options).is_none());
+                assert!(adapter.check_native_options(&options).is_ok());
             }
         }
+        let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec![], notes: None };
+        assert!(adapter.mcp_env(&mcp).unwrap().is_some());
     }
 
     /// Validation failures finish exactly once, preserving cancellation status and other error details.
@@ -2305,7 +2391,10 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         assert!(reg.for_agent("claude").resumes() && !reg.for_agent("codex").resumes() && reg.for_agent("antigravity").resumes());
         // Registering an adapter for an existing id replaces that one.
         reg.register(Arc::new(EchoAgent));
-        assert_eq!(format!("{reg:?}"), r#"["claude-code", "codex", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "copilot", "echo-agent"]"#);
+        assert_eq!(
+            format!("{reg:?}"),
+            r#"["claude-code", "codex", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "copilot", "dsh", "echo-agent"]"#
+        );
     }
 
     #[test]
