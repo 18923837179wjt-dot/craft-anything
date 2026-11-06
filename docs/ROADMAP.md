@@ -650,6 +650,10 @@ Owner: open · Status: in progress
 - [x] Say plainly when what's found is the Claude desktop app rather than the `claude` program
       (#259, a guess at its cause)
 - [ ] macOS: check that `Claude.app` is where the desktop app is found (#259's hint is untried there)
+- [x] #259's hint, the gaps left in review of #781: it's hidden when only `~/.ssh/config` suggestions are
+      found, a Store install without its `claude-desktop` alias isn't seen, and a desktop app's
+      `claude.exe` on PATH is taken for Claude Code (#824) — claimed: FuryNocturn, branch
+      bugfix/r2.2-claude-desktop-hint-gaps
 - [x] macOS: `/Applications/Antigravity.app` ended up as the agent's command (#467). Found: the "Where is
       the program?" picker (`pick_file`) returns the bundle, and `set_command` saved any path. Refuse a
       folder or app bundle when it's saved (`set_command`), and don't run one that was saved before
