@@ -81,7 +81,7 @@
     </td>
     <td width="25%" valign="top">
       <h3>✅ Đã kiểm tra, không đoán mò</h3>
-      Mỗi bản dựng đều được đối chiếu với bản gốc (các trang ở ba độ rộng màn hình, bài tự kiểm tra của chính trò chơi, các lần chạy của ứng dụng) và tinh chỉnh đến khi khớp.
+      Mỗi bản dựng đều được đối chiếu với bản gốc (các trang ở ba độ rộng màn hình, bài tự kiểm tra của chính trò chơi, các lần chạy của ứng dụng) và tinh chỉnh đến khi gần giống bản gốc.
     </td>
     <td width="25%" valign="top">
       <h3>🤖 Sẵn sàng cho agent</h3>
