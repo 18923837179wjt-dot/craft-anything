@@ -666,11 +666,13 @@ fn publishes(c: &str) -> bool {
 /// `approv'als-set'`. A command that reaches them without naming them (a script that builds the
 /// path) isn't caught: with commands allowed, the builder is trusted that far.
 fn names_records(c: &str, ws: Option<&Workspace>) -> bool {
-    let joined: String = c.chars().filter(|ch| !matches!(ch, '"' | '\'' | '\\' | '`')).collect();
+    let without = |gone: &[char]| c.chars().filter(|ch| !gone.contains(ch)).collect::<String>();
+    // Names, with every escape out; a path, with only the quotes out, as its backslashes are
+    // separators on Windows (`C:\p\in'box'\x` is `C:\p\inbox\x`).
+    let (joined, path) = (without(&['"', '\'', '\\', '`']), without(&['"', '\'', '`']));
     let agent = crate::AGENT_ENV.to_ascii_lowercase();
     ["craft.json", "approvals_set", "approvals-set", agent.as_str()].iter().any(|n| joined.contains(n))
-        // Both as written (a Windows path keeps its backslashes) and joined (`in'box'`).
-        || ws.is_some_and(|w| mentions(c, &w.inbox_dir()) || mentions(&joined, &w.inbox_dir()))
+        || ws.is_some_and(|w| [c, path.as_str(), joined.as_str()].iter().any(|t| mentions(t, &w.inbox_dir())))
 }
 
 /// A program's name as typed, without its folder or a Windows extension (`/usr/bin/npm`, `npm.cmd`).
@@ -1223,6 +1225,10 @@ mod tests {
         let (head, tail) = inbox.split_at(inbox.len() - 3);
         let cmd = format!("echo yes > {head}'{tail}'/1.answer.json");
         assert_eq!(kind_of(Some(&w), "Bash", &json!({"command": cmd})), ActionKind::System, "{cmd}");
+        // With Windows' separators, as PowerShell writes it.
+        let (head, tail) = (head.replace('/', "\\"), tail.replace('/', "\\"));
+        let cmd = format!("Set-Content -Path {head}'{tail}'\\1.answer.json -Value yes");
+        assert_eq!(kind_of(Some(&w), "PowerShell", &json!({"command": cmd})), ActionKind::System, "{cmd}");
     }
 
     #[test]
