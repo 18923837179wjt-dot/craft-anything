@@ -806,6 +806,14 @@ Owner: maintainers · Status: in progress
 ### R2.9 Everyday use: typing, projects, settings
 Owner: maintainers · Status: in progress
 Gaps found while using the app for real projects.
+- [ ] Each project chooses, per kind of action, what the builder's approvals get (allow, ask or
+      refuse): reading the web, commands, files outside the project, pushing and publishing,
+      deleting outside the project, system changes, other tools. Unset kinds follow Auto mode as
+      today. Found when Auto mode refused every `git push` without a card, so the person's OK in
+      the prompt box never reached the check, and refused `gh repo view` as publishing too
+      — claimed: tanish2k09, branch feature/r2.9-project-approvals
+- [ ] The project page and a slash command change those choices (like `/btw`)
+      — claimed: tanish2k09, branch feature/r2.9-approvals-ui
 - [x] Keep New project's content column fixed while the vertical scrollbar animates in or out,
       hiding it when there is nothing to scroll, so switching tabs never shifts the page horizontally
       — claimed: Codex, branch bugfix/r2.9-home-scrollbar-gutter
