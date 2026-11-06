@@ -49,6 +49,7 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("qwen-code", "qwen", "Qwen Code"),
     ("goose", "goose", "Goose"),
     ("maki", "maki", "Maki"),
+    ("dsh", "dsh", "DeepSeek Harness"),
 ];
 
 pub fn program_for(agent: &str) -> String {
