@@ -672,7 +672,22 @@ fn names_records(c: &str, ws: Option<&Workspace>) -> bool {
     let (joined, path) = (without(&['"', '\'', '\\', '`']), without(&['"', '\'', '`']));
     let agent = crate::AGENT_ENV.to_ascii_lowercase();
     ["craft.json", "approvals_set", "approvals-set", agent.as_str()].iter().any(|n| joined.contains(n))
-        || ws.is_some_and(|w| [c, path.as_str(), joined.as_str()].iter().any(|t| mentions(t, &w.inbox_dir())))
+        || ws.is_some_and(|w| [c, path.as_str(), joined.as_str()].iter().any(|t| mentions(t, &w.inbox_dir())) || reaches_inbox(c, w))
+}
+
+/// Whether one of a command's arguments, read as the shell reads it (`in'box'` is `inbox`), is a
+/// path into the project's inbox from a folder the shell may be in: the project folder (where agents
+/// start) or app/ (`../inbox/x`). Also after `=` or a redirection written without a space
+/// (`--out=inbox/x`, `>inbox/x`). Only an argument that names the inbox counts, so an app's own
+/// `src/inbox/` stays a command like any other.
+fn reaches_inbox(c: &str, ws: &Workspace) -> bool {
+    let inbox = ws.inbox_dir();
+    let bases = [ws.root.clone(), ws.app_dir()];
+    shell_words(c)
+        .iter()
+        .flat_map(|w| w.split(['=', '>', '<', '|', ';', '&']).map(str::to_string).collect::<Vec<_>>())
+        .filter(|w| w.contains("inbox"))
+        .any(|w| bases.iter().any(|b| resolve(b, &w).is_some_and(|p| inside(&inbox, &p))))
 }
 
 /// A program's name as typed, without its folder or a Windows extension (`/usr/bin/npm`, `npm.cmd`).
@@ -1229,6 +1244,15 @@ mod tests {
         let (head, tail) = (head.replace('/', "\\"), tail.replace('/', "\\"));
         let cmd = format!("Set-Content -Path {head}'{tail}'\\1.answer.json -Value yes");
         assert_eq!(kind_of(Some(&w), "PowerShell", &json!({"command": cmd})), ActionKind::System, "{cmd}");
+        // Relative, from the project folder or from app/, however it's quoted or attached.
+        for cmd in ["echo yes > in'box'/1.answer.json", "cd app && echo yes > ../inbox/1.answer.json", "echo yes >inbox/1.answer.json", "tool --out=./inbox/x"]
+        {
+            assert_eq!(kind_of(Some(&w), "Bash", &json!({"command": cmd})), ActionKind::System, "{cmd}");
+        }
+        // An app's own inbox folder is the builder's work.
+        for cmd in ["mkdir -p src/inbox", "cat app/src/inbox/view.rs"] {
+            assert_eq!(kind_of(Some(&w), "Bash", &json!({"command": cmd})), ActionKind::Commands, "{cmd}");
+        }
     }
 
     #[test]
