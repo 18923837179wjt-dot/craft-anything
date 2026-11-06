@@ -683,11 +683,18 @@ fn names_records(c: &str, ws: Option<&Workspace>) -> bool {
 fn reaches_inbox(c: &str, ws: &Workspace) -> bool {
     let inbox = ws.inbox_dir();
     let bases = [ws.root.clone(), ws.app_dir()];
-    shell_words(c)
-        .iter()
-        .flat_map(|w| w.split(['=', '>', '<', '|', ';', '&']).map(str::to_string).collect::<Vec<_>>())
-        .filter(|w| w.contains("inbox"))
-        .any(|w| bases.iter().any(|b| resolve(b, &w).is_some_and(|p| inside(&inbox, &p))))
+    let pieces = shell_words(c).into_iter().flat_map(|w| w.split(['=', '>', '<', '|', ';', '&']).map(str::to_string).collect::<Vec<_>>());
+    // Each piece as written, with `\` as a separator (PowerShell's, on any system), with Bash's
+    // escapes out (`inb\ox`), and a PowerShell parameter's value after its colon (`-Path:inbox/x`;
+    // a drive's `C:` isn't one).
+    let readings = pieces.flat_map(|w| {
+        let value = w.strip_prefix('-').and_then(|p| p.split_once(':')).map(|(_, v)| v.to_string());
+        let mut out = vec![w.replace('\\', "/"), w.replace('\\', "")];
+        out.extend(value.map(|v| v.replace('\\', "/")));
+        out.push(w);
+        out
+    });
+    readings.filter(|w| w.contains("inbox")).any(|w| bases.iter().any(|b| resolve(b, &w).is_some_and(|p| inside(&inbox, &p))))
 }
 
 /// A program's name as typed, without its folder or a Windows extension (`/usr/bin/npm`, `npm.cmd`).
@@ -1245,9 +1252,17 @@ mod tests {
         let cmd = format!("Set-Content -Path {head}'{tail}'\\1.answer.json -Value yes");
         assert_eq!(kind_of(Some(&w), "PowerShell", &json!({"command": cmd})), ActionKind::System, "{cmd}");
         // Relative, from the project folder or from app/, however it's quoted or attached.
-        for cmd in ["echo yes > in'box'/1.answer.json", "cd app && echo yes > ../inbox/1.answer.json", "echo yes >inbox/1.answer.json", "tool --out=./inbox/x"]
-        {
+        for cmd in [
+            "echo yes > in'box'/1.answer.json",
+            "cd app && echo yes > ../inbox/1.answer.json",
+            "echo yes >inbox/1.answer.json",
+            "tool --out=./inbox/x",
+            "echo yes > inb\\ox/1.answer.json",
+            "Set-Content -Path:inbox/1.answer.json -Value yes",
+            "Set-Content -Path:..\\inbox\\1.answer.json -Value yes",
+        ] {
             assert_eq!(kind_of(Some(&w), "Bash", &json!({"command": cmd})), ActionKind::System, "{cmd}");
+            assert!(matches!(outcome(Some(&w), true, "Bash", &json!({"command": cmd})), Outcome::Refuse(_)), "{cmd}");
         }
         // An app's own inbox folder is the builder's work.
         for cmd in ["mkdir -p src/inbox", "cat app/src/inbox/view.rs"] {
