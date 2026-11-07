@@ -7,6 +7,7 @@
 //! This finds a craft-fonts checkout (or clones one) and prints the `CRAFT_FONTS_DIR` to build
 //! with. Releases and CI set the variable themselves; this is for people building from source.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// The craft-fonts commit the release and CI workflows pin. Changing it means changing those
@@ -18,8 +19,15 @@ const REPO: &str = "storytold/craft-fonts";
 /// Where a checkout is looked for, in order: the variable that is already set, then the
 /// directories next to this repository (the usual place for a sibling checkout).
 pub fn candidates(root: &Path) -> Vec<PathBuf> {
+    candidates_from(root, std::env::var_os("CRAFT_FONTS_DIR"))
+}
+
+/// The candidate list for a given `CRAFT_FONTS_DIR` value. The value is a parameter so a test
+/// can name one without changing the process environment (which the test harness runs in
+/// parallel with other tests).
+fn candidates_from(root: &Path, set: Option<OsString>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Some(set) = std::env::var_os("CRAFT_FONTS_DIR") {
+    if let Some(set) = set {
         out.push(PathBuf::from(set));
     }
     if let Some(parent) = root.parent() {
@@ -34,12 +42,18 @@ pub fn is_checkout(dir: &Path) -> bool {
     dir.join("fonts").join("manifest.txt").is_file()
 }
 
-/// `cargo xtask fonts [--check]`: find or fetch the fallbacks and print the variable to set.
-pub fn run(root: &Path, check: bool) -> bool {
+/// `cargo xtask fonts [--check] [--print]`: find or fetch the fallbacks and print the variable
+/// to set. `--check` only reports whether a checkout is there; `--print` prints the path alone,
+/// so a shell can put it in the variable.
+pub fn run(root: &Path, check: bool, print_path: bool) -> bool {
     for dir in candidates(root) {
         if is_checkout(&dir) {
-            println!("craft-fonts: {}", dir.display());
-            print_env(&dir);
+            if print_path {
+                println!("{}", dir.display());
+            } else {
+                println!("craft-fonts: {}", dir.display());
+                print_env(&dir);
+            }
             return true;
         }
     }
@@ -50,8 +64,12 @@ pub fn run(root: &Path, check: bool) -> bool {
     let target = root.parent().map(|p| p.join("craft-fonts")).unwrap_or_else(|| root.join("craft-fonts"));
     match fetch(&target) {
         Ok(()) => {
-            println!("craft-fonts: {}", target.display());
-            print_env(&target);
+            if print_path {
+                println!("{}", target.display());
+            } else {
+                println!("craft-fonts: {}", target.display());
+                print_env(&target);
+            }
             true
         }
         Err(e) => {
@@ -62,11 +80,16 @@ pub fn run(root: &Path, check: bool) -> bool {
     }
 }
 
-/// The line a developer pastes into their shell (and the build reads).
+/// The line a developer pastes into their shell (and the build reads). Windows gets the
+/// PowerShell form and the others the shell form, so pasting it works on every platform.
 fn print_env(dir: &Path) {
     println!();
     println!("Build with the fallbacks in:");
-    println!("  $env:CRAFT_FONTS_DIR = \"{}\"", dir.display());
+    if cfg!(windows) {
+        println!("  $env:CRAFT_FONTS_DIR = \"{}\"", dir.display());
+    } else {
+        println!("  export CRAFT_FONTS_DIR=\"{}\"", dir.display());
+    }
 }
 
 /// Fetch the pinned craft-fonts commit into `target` with `git`.
@@ -83,8 +106,14 @@ fn fetch(target: &Path) -> Result<(), String> {
     };
     println!("fetching {REPO} at {PINNED_REF}…");
     git(&["clone", "--quiet", "https://github.com/storytold/craft-fonts.git", &target.to_string_lossy()])?;
-    git(&["-C", &target.to_string_lossy(), "checkout", "--quiet", PINNED_REF])?;
+    // A clone that can't reach the pinned commit is not a checkout: leave it behind and the next
+    // run would take it for one, so take it away again.
+    if let Err(e) = git(&["-C", &target.to_string_lossy(), "checkout", "--quiet", PINNED_REF]) {
+        let _ = std::fs::remove_dir_all(target);
+        return Err(e);
+    }
     if !is_checkout(target) {
+        let _ = std::fs::remove_dir_all(target);
         return Err(format!("{} has no fonts/manifest.txt after checkout", target.display()));
     }
     Ok(())
@@ -93,7 +122,6 @@ fn fetch(target: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     /// A directory only counts when the manifest is there: a folder with a `fonts` directory but
     /// no manifest would make the build fail later, with a much less obvious message.
@@ -113,10 +141,15 @@ mod tests {
     fn the_set_variable_is_the_first_candidate() {
         let root = Path::new("/repo");
         let set = PathBuf::from("/somewhere/else");
-        // SAFETY: single-threaded test; the variable is read back right after.
-        unsafe { std::env::set_var("CRAFT_FONTS_DIR", &set) };
-        let found = candidates(root);
-        unsafe { std::env::remove_var("CRAFT_FONTS_DIR") };
+        let found = candidates_from(root, Some(set.clone().into_os_string()));
         assert_eq!(found.first().map(PathBuf::as_path), Some(set.as_path()));
+    }
+
+    /// Without the variable, the folders beside the repository are the candidates.
+    #[test]
+    fn a_sibling_checkout_is_the_next_candidate() {
+        let root = Path::new("/repo");
+        let found = candidates_from(root, None);
+        assert_eq!(found, vec![PathBuf::from("/craft-fonts"), PathBuf::from("/repo/craft-fonts")]);
     }
 }

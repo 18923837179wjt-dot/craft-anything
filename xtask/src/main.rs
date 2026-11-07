@@ -1,4 +1,4 @@
-//! `cargo xtask <layers | locks | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>... | fonts [--check]>`
+//! `cargo xtask <layers | locks | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>... | fonts [--check] [--print]>`
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ fn main() -> ExitCode {
             let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
             ico::run(&rest).map_err(|e| eprintln!("ico: {e}")).is_ok()
         }
-        Some("fonts") => fonts::run(&root, args.iter().any(|a| a == "--check")),
+        Some("fonts") => fonts::run(&root, args.iter().any(|a| a == "--check"), args.iter().any(|a| a == "--print")),
         Some("ci") => {
             layers(&root)
                 && locks::check(&root)
@@ -65,7 +65,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <layers | locks | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>... | fonts [--check]>"
+                "usage: cargo xtask <layers | locks | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>... | fonts [--check] [--print]>"
             );
             false
         }

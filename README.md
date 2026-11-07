@@ -201,14 +201,16 @@ Then:
 
 ```sh
 git clone https://github.com/storytold/craft-anything && cd craft-anything
-cargo xtask fonts                                   # the fallbacks for Chinese, Japanese, Korean…
+cargo xtask fonts                                   # fetches the fallbacks for Chinese, Japanese, Korean…
+export CRAFT_FONTS_DIR="$(cargo xtask fonts --print)"   # …and says where they are
 cargo run --release -p craft-anything                # the desktop app
 cargo install --path apps/craft-anything-cli         # the CLI, as `craft-anything-cli`
 craft-anything-cli doctor                            # checks the install, coding agents and engines
 ```
 
 `cargo xtask fonts` prints the `CRAFT_FONTS_DIR` to build with; set it in your shell before
-building. Without it the app has no glyphs for Chinese, Japanese, Korean, Thai, Arabic, Hebrew,
+building (the line above does that on macOS and Linux, on Windows use the `$env:` form it
+prints). Without it the app has no glyphs for Chinese, Japanese, Korean, Thai, Arabic, Hebrew,
 Devanagari or symbols, and shows boxes instead. Releases ship the fallbacks already.
 
 Building needs a coding agent signed in on your computer (see [AI](#ai)); `doctor` says what's

@@ -171,6 +171,7 @@ cheapest help we can give anyone, so nothing below should hold it up for long.
       build without the fallbacks cannot draw the scripts a translation needs). The Windows
       packaging step also passes its file list as a named argument: Windows PowerShell 5.1
       collapses a splat into one space-joined string, so `sign.ps1` never saw the paths.
+      — claimed: 18923837179wjt-dot, branch feature/r5.1-font-fallbacks-and-windows-packaging
 
 ### R5.2 Keeping contributions moving
 Owner: maintainers · Status: in progress

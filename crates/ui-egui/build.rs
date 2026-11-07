@@ -50,11 +50,13 @@ fn craft_fonts(dir: &std::path::Path) -> Result<String, String> {
     const WEB_FONTS: &[(&str, &str)] = &[("BIZ UDPGothic", "Regular")];
     let wasm = std::env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|a| a == "wasm32");
     let mut out = String::new();
+    let mut entries = 0usize;
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let f: Vec<&str> = line.split(" | ").map(str::trim).collect();
         let [family, style, file, scripts, ..] = f.as_slice() else {
             return Err(format!("malformed manifest line: {line}"));
         };
+        entries += 1;
         if wasm && !WEB_FONTS.contains(&(*family, *style)) {
             continue;
         }
@@ -67,6 +69,11 @@ fn craft_fonts(dir: &std::path::Path) -> Result<String, String> {
             scripts.join(", "),
             path.display().to_string(),
         );
+    }
+    // A manifest with no fonts at all means the checkout is not what it should be. Saying so beats
+    // an app that quietly shows boxes for every language but Latin.
+    if entries == 0 {
+        return Err(format!("{} has no font entries", manifest.display()));
     }
     Ok(out)
 }
